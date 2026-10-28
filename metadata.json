@@ -1,0 +1,6 @@
+{
+  "name": "Линейный Раскрой Про (CutMaster 1D)",
+  "description": "Оптимальный раскрой линейных заготовок (труб, профилей, балок) с наглядными картами раскроя, печатными бирками для цеха и экспортом в Excel.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

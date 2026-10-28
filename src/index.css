@@ -1,0 +1,63 @@
+@import "tailwindcss";
+
+@layer base {
+  /* Prevent browser or font engine from replacing character pairs with ligatures */
+  *, *::before, *::after {
+    font-variant-ligatures: none !important;
+    -webkit-font-variant-ligatures: none !important;
+    font-feature-settings: "liga" 0, "clig" 0, "calt" 0, "dlig" 0 !important;
+  }
+
+  html,
+  body {
+    /* Use rock-solid system Cyrillic fonts (Segoe UI on Windows, San Francisco on macOS, Roboto on Android) */
+    font-family: system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif !important;
+    text-rendering: optimizeLegibility;
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+  }
+
+  code, kbd, samp, pre, .font-mono {
+    font-family: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace !important;
+    font-variant-ligatures: none !important;
+    font-feature-settings: "liga" 0, "calt" 0 !important;
+  }
+}
+
+@media print {
+  @page {
+    size: A4 portrait;
+    margin: 10mm;
+  }
+
+  /* Completely eliminate website header, navigation, tabs, and buttons in print / PDF */
+  header,
+  nav,
+  .no-print,
+  button,
+  input,
+  select,
+  .no-print-area {
+    display: none !important;
+  }
+
+  body, html {
+    background: #ffffff !important;
+    color: #000000 !important;
+    padding: 0 !important;
+    margin: 0 !important;
+    font-size: 11pt !important;
+  }
+
+  main {
+    max-width: 100% !important;
+    width: 100% !important;
+    padding: 0 !important;
+    margin: 0 !important;
+  }
+
+  .print-break-inside-avoid {
+    page-break-inside: avoid !important;
+    break-inside: avoid !important;
+  }
+}
