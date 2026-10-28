@@ -5,7 +5,7 @@ import {defineConfig} from 'vite';
 
 export default defineConfig(() => {
   return {
-    base: './',
+    base: '/1DCM/',
     resolve: {
       alias: {
         '@': path.resolve(__dirname, '.'),
