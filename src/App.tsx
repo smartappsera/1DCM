@@ -3,7 +3,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-import React, { useState } from 'react';
+import React, { useState, useMemo } from 'react';
 import { Header } from './components/Header';
 import { SettingsHeader } from './components/SettingsHeader';
 import { DynamicInputBlock, DynamicRowItem } from './components/DynamicInputBlock';
@@ -85,6 +85,31 @@ export default function App() {
 
   // Solution is initially null: results page is NOT visible until calculate is pressed!
   const [solution, setSolution] = useState<FullOptimizationSolution | null>(null);
+
+  // Compute a deterministic signature of active stock and demand items
+  const inputSignature = useMemo(() => {
+    const activeStocks = stockItems
+      .filter((s) => s.isActive !== false && s.length > 0)
+      .map(
+        (s) =>
+          `${s.length}:${s.quantity}:${
+            s.isStandardUnlimited ||
+            ((s.length === 6000 || s.length === 12000) && s.quantity <= 0)
+              ? 'U'
+              : 'Q'
+          }`
+      )
+      .sort()
+      .join(';');
+
+    const activeDemands = demandItems
+      .filter((d) => d.length > 0 && d.quantity > 0)
+      .map((d) => `${d.length}:${d.quantity}`)
+      .sort()
+      .join(';');
+
+    return `${activeStocks}|${activeDemands}`;
+  }, [stockItems, demandItems]);
 
   const performSolve = (customSettings?: AppSettings) => {
     const currentSettings = customSettings || settings;
@@ -491,6 +516,7 @@ export default function App() {
         solution={solution}
         settings={settings}
         lastSolvedSettings={lastSolvedSettings}
+        inputSignature={inputSignature}
         savedRuns={savedRuns}
         onSaveRuns={setSavedRuns}
         onExecuteCalculation={(customSettings?: AppSettings) => performSolve(customSettings)}

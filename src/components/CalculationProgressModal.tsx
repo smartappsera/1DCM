@@ -21,6 +21,7 @@ export interface CalculationRun {
   timestamp: number;
   settings: AppSettings;
   solution: FullOptimizationSolution;
+  inputSignature?: string;
 }
 
 interface CalculationProgressModalProps {
@@ -29,6 +30,7 @@ interface CalculationProgressModalProps {
   solution: FullOptimizationSolution | null;
   settings: AppSettings;
   lastSolvedSettings?: AppSettings | null;
+  inputSignature?: string;
   savedRuns?: CalculationRun[];
   onSaveRuns?: (runs: CalculationRun[]) => void;
   onExecuteCalculation: (customSettings?: AppSettings) => FullOptimizationSolution;
@@ -42,6 +44,7 @@ export const CalculationProgressModal: React.FC<CalculationProgressModalProps> =
   solution,
   settings,
   lastSolvedSettings,
+  inputSignature,
   savedRuns,
   onSaveRuns,
   onExecuteCalculation,
@@ -74,7 +77,7 @@ export const CalculationProgressModal: React.FC<CalculationProgressModalProps> =
     );
   };
 
-  // Reset or run initial calculation on open, preserving prior results when settings changed
+  // Reset or run initial calculation on open, preserving prior results when settings and input conditions match
   useEffect(() => {
     if (!isOpen) {
       setPhase('calculating');
@@ -88,11 +91,16 @@ export const CalculationProgressModal: React.FC<CalculationProgressModalProps> =
     setHighlightedRunId(null);
     setDuplicateWarning(null);
 
-    // Scenario A: If savedRuns already exist
-    if (savedRuns && savedRuns.length > 0) {
-      const matchRun = savedRuns.find((r) => areSettingsEqual(r.settings, settings));
+    // Filter savedRuns to only those matching current input conditions (stocks + demands)
+    const validSavedRuns = (savedRuns || []).filter(
+      (r) => !r.inputSignature || !inputSignature || r.inputSignature === inputSignature
+    );
+
+    // Scenario A: If valid savedRuns exist for the current input conditions
+    if (validSavedRuns.length > 0) {
+      const matchRun = validSavedRuns.find((r) => areSettingsEqual(r.settings, settings));
       if (matchRun) {
-        setRuns(savedRuns);
+        setRuns(validSavedRuns);
         setActiveRunId(matchRun.id);
         setProgressPercent(100);
         setStatusText('Расчет успешно выполнен!');
@@ -100,7 +108,7 @@ export const CalculationProgressModal: React.FC<CalculationProgressModalProps> =
         return;
       }
 
-      // Settings changed! Keep previous saved runs and calculate new run
+      // Settings changed! Keep previous saved runs for this input condition and calculate new run
       setPhase('calculating');
       setProgressPercent(40);
       setStatusText('Расчет нового варианта с измененными настройками...');
@@ -109,14 +117,15 @@ export const CalculationProgressModal: React.FC<CalculationProgressModalProps> =
         try {
           const newSol = onExecuteCalculation(settings);
           const newRun: CalculationRun = {
-            id: `run_${Date.now()}_${savedRuns.length + 1}`,
-            index: savedRuns.length + 1,
-            title: `Расчет #${savedRuns.length + 1}`,
+            id: `run_${Date.now()}_${validSavedRuns.length + 1}`,
+            index: validSavedRuns.length + 1,
+            title: `Расчет #${validSavedRuns.length + 1}`,
             timestamp: Date.now(),
             settings: { ...settings },
             solution: newSol,
+            inputSignature,
           };
-          const updated = [...savedRuns, newRun];
+          const updated = [...validSavedRuns, newRun];
           setRuns(updated);
           setActiveRunId(newRun.id);
           if (onSaveRuns) onSaveRuns(updated);
@@ -133,7 +142,7 @@ export const CalculationProgressModal: React.FC<CalculationProgressModalProps> =
       return () => clearTimeout(timer);
     }
 
-    // Scenario B: Feature 4 - savedRuns is empty, but solution exists on page and lastSolvedSettings exists
+    // Scenario B: Feature 4 - validSavedRuns is empty, but solution exists on page and lastSolvedSettings exists
     if (solution && lastSolvedSettings && !areSettingsEqual(settings, lastSolvedSettings)) {
       setPhase('calculating');
       setProgressPercent(40);
@@ -148,6 +157,7 @@ export const CalculationProgressModal: React.FC<CalculationProgressModalProps> =
             timestamp: Date.now() - 1000,
             settings: { ...lastSolvedSettings },
             solution: solution,
+            inputSignature,
           };
 
           const newSol = onExecuteCalculation(settings);
@@ -158,6 +168,7 @@ export const CalculationProgressModal: React.FC<CalculationProgressModalProps> =
             timestamp: Date.now(),
             settings: { ...settings },
             solution: newSol,
+            inputSignature,
           };
 
           const updated = [prevRun, newRun];
@@ -177,7 +188,7 @@ export const CalculationProgressModal: React.FC<CalculationProgressModalProps> =
       return () => clearTimeout(timer);
     }
 
-    // Scenario C: First ever calculation or settings unchanged from solution
+    // Scenario C: Fresh calculation for current stock and demand configuration
     setPhase('calculating');
     setProgressPercent(20);
     setStatusText('Инициализация списков заготовок и склада...');
@@ -189,10 +200,7 @@ export const CalculationProgressModal: React.FC<CalculationProgressModalProps> =
 
     const timer2 = setTimeout(() => {
       try {
-        const initialSol =
-          solution && lastSolvedSettings && areSettingsEqual(settings, lastSolvedSettings)
-            ? solution
-            : onExecuteCalculation(settings);
+        const initialSol = onExecuteCalculation(settings);
         const firstRun: CalculationRun = {
           id: `run_${Date.now()}_1`,
           index: 1,
@@ -200,6 +208,7 @@ export const CalculationProgressModal: React.FC<CalculationProgressModalProps> =
           timestamp: Date.now(),
           settings: { ...settings },
           solution: initialSol,
+          inputSignature,
         };
         setRuns([firstRun]);
         setActiveRunId(firstRun.id);
@@ -218,7 +227,7 @@ export const CalculationProgressModal: React.FC<CalculationProgressModalProps> =
       clearTimeout(timer1);
       clearTimeout(timer2);
     };
-  }, [isOpen]);
+  }, [isOpen, inputSignature]);
 
   // Active run and solution
   const activeRun = useMemo(() => {
@@ -227,19 +236,17 @@ export const CalculationProgressModal: React.FC<CalculationProgressModalProps> =
 
   const activeSolution = activeRun ? activeRun.solution : solution;
 
-  // Recalculate avoiding duplicate runs
+  // Recalculate avoiding blocked calculations and respecting all parameters
   const handleRecalculate = () => {
+    // Check if an identical run exists in the current session
     const existingRun = runs.find(
       (r) =>
-        r.settings.searchSpeed === modalSettings.searchSpeed &&
-        r.settings.optimizationGoal === modalSettings.optimizationGoal &&
-        r.settings.dualProfileCut === modalSettings.dualProfileCut &&
-        (r.settings.fillControlEnabled ?? false) === (modalSettings.fillControlEnabled ?? false) &&
-        (r.settings.fillControlThreshold ?? 50) === (modalSettings.fillControlThreshold ?? 50) &&
-        r.settings.reusableRemnantMin === modalSettings.reusableRemnantMin
+        (!r.inputSignature || !inputSignature || r.inputSignature === inputSignature) &&
+        areSettingsEqual(r.settings, modalSettings)
     );
 
-    if (existingRun) {
+    // If matching run exists and is NOT currently active, switch to it with a floating notice
+    if (existingRun && existingRun.id !== activeRunId) {
       setActiveRunId(existingRun.id);
       setHighlightedRunId(existingRun.id);
       setDuplicateWarning(`Вариант с такими параметрами уже рассчитан (${existingRun.title})`);
@@ -248,7 +255,7 @@ export const CalculationProgressModal: React.FC<CalculationProgressModalProps> =
       setTimeout(() => {
         setHighlightedRunId(null);
         setDuplicateWarning(null);
-      }, 3000);
+      }, 3500);
 
       if (onApplySolutionAndSettings) {
         onApplySolutionAndSettings(existingRun.solution, existingRun.settings);
@@ -256,11 +263,28 @@ export const CalculationProgressModal: React.FC<CalculationProgressModalProps> =
       return;
     }
 
+    // Execute recalculation (new run or updating active run if re-executing)
     setDuplicateWarning(null);
     setIsRecalculating(true);
     setTimeout(() => {
       try {
         const newSol = onExecuteCalculation(modalSettings);
+
+        if (existingRun && existingRun.id === activeRunId) {
+          // Re-running current variant with fresh state
+          const updatedRuns = runs.map((r) =>
+            r.id === existingRun.id
+              ? { ...r, timestamp: Date.now(), solution: newSol, settings: { ...modalSettings }, inputSignature }
+              : r
+          );
+          setRuns(updatedRuns);
+          if (onSaveRuns) onSaveRuns(updatedRuns);
+          if (onApplySolutionAndSettings) onApplySolutionAndSettings(newSol, modalSettings);
+          setDuplicateWarning(`Параметры варианта «${existingRun.title}» обновлены`);
+          setTimeout(() => setDuplicateWarning(null), 3000);
+          return;
+        }
+
         const newRun: CalculationRun = {
           id: `run_${Date.now()}_${runs.length + 1}`,
           index: runs.length + 1,
@@ -268,6 +292,7 @@ export const CalculationProgressModal: React.FC<CalculationProgressModalProps> =
           timestamp: Date.now(),
           settings: { ...modalSettings },
           solution: newSol,
+          inputSignature,
         };
         const updatedRuns = [...runs, newRun];
         setRuns(updatedRuns);
@@ -494,7 +519,21 @@ export const CalculationProgressModal: React.FC<CalculationProgressModalProps> =
 
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-xs p-3 sm:p-4">
-      <div className="bg-white rounded-2xl shadow-2xl border border-slate-200 max-w-5xl w-full max-h-[92vh] flex flex-col overflow-hidden animate-in fade-in duration-100">
+      <div className="bg-white rounded-2xl shadow-2xl border border-slate-200 max-w-5xl w-full max-h-[92vh] flex flex-col overflow-hidden animate-in fade-in duration-100 relative">
+        {/* Floating toast notification for duplicate or status warning (zero layout shift) */}
+        {duplicateWarning && (
+          <div className="absolute top-16 right-6 z-30 flex items-center gap-2.5 px-3.5 py-2 bg-amber-600 text-white rounded-xl shadow-xl text-xs font-semibold animate-in fade-in slide-in-from-top-2 duration-150 border border-amber-500 max-w-md">
+            <AlertTriangle className="w-4 h-4 shrink-0 text-amber-200" />
+            <span className="flex-1">{duplicateWarning}</span>
+            <button
+              onClick={() => setDuplicateWarning(null)}
+              className="text-amber-200 hover:text-white p-0.5 rounded cursor-pointer"
+            >
+              <X className="w-3.5 h-3.5" />
+            </button>
+          </div>
+        )}
+
         {/* Header */}
         <div className="px-5 py-3.5 border-b border-slate-200 bg-slate-50 flex items-center justify-between shrink-0">
           <div className="flex items-center gap-2.5">
@@ -569,8 +608,8 @@ export const CalculationProgressModal: React.FC<CalculationProgressModalProps> =
                   </button>
                 </div>
 
-                {/* Point 2: Увеличенная ширина комбобокса Стратегия (sm:col-span-5) */}
-                <div className="grid grid-cols-1 sm:grid-cols-12 gap-2.5 text-xs">
+                {/* Sized inputs: Скорость (2 cols), Стратегия (4 cols), 2 Профиля (4 cols), Деловой (2 cols, max 4 chars) */}
+                <div className="grid grid-cols-1 sm:grid-cols-12 gap-2 text-xs">
                   {/* Скорость: 2 cols */}
                   <div className="sm:col-span-2">
                     <label className="block text-[10px] font-semibold text-slate-500 mb-0.5">
@@ -584,7 +623,7 @@ export const CalculationProgressModal: React.FC<CalculationProgressModalProps> =
                           searchSpeed: e.target.value as any,
                         }))
                       }
-                      className="w-full text-xs bg-white border border-slate-300 rounded-md px-2 py-1 font-medium text-slate-800 focus:outline-hidden cursor-pointer"
+                      className="w-full text-xs bg-white border border-slate-300 rounded-md px-2 py-1 font-medium text-slate-800 focus:outline-hidden cursor-pointer h-[30px]"
                     >
                       <option value="fast">Быстро</option>
                       <option value="standard">Стандарт</option>
@@ -592,8 +631,8 @@ export const CalculationProgressModal: React.FC<CalculationProgressModalProps> =
                     </select>
                   </div>
 
-                  {/* Стратегия: 5 cols (расширенный для полного отображения текста) */}
-                  <div className="sm:col-span-5">
+                  {/* Стратегия: 4 cols */}
+                  <div className="sm:col-span-4">
                     <label className="block text-[10px] font-semibold text-slate-500 mb-0.5">
                       Стратегия
                     </label>
@@ -605,7 +644,7 @@ export const CalculationProgressModal: React.FC<CalculationProgressModalProps> =
                           optimizationGoal: e.target.value as any,
                         }))
                       }
-                      className="w-full text-xs bg-white border border-slate-300 rounded-md px-2 py-1 font-medium text-slate-800 focus:outline-hidden cursor-pointer"
+                      className="w-full text-xs bg-white border border-slate-300 rounded-md px-2 py-1 font-medium text-slate-800 focus:outline-hidden cursor-pointer h-[30px]"
                     >
                       <option value="variants">Оптимизация вариантов</option>
                       <option value="min_waste">Минимум отходов</option>
@@ -615,10 +654,13 @@ export const CalculationProgressModal: React.FC<CalculationProgressModalProps> =
                     </select>
                   </div>
 
-                  {/* В два профиля и Контроль заполнения (единый фиксированный блок без изменения размеров) */}
-                  <div className="sm:col-span-3 flex flex-col justify-end">
-                    <div className="flex items-center gap-1.5 bg-white border border-slate-300 rounded-md px-2 py-1 h-[30px]">
-                      <label className="flex items-center gap-1 cursor-pointer select-none text-slate-800 shrink-0">
+                  {/* В два профиля и Контроль заполнения: 4 cols */}
+                  <div className="sm:col-span-4">
+                    <label className="block text-[10px] font-semibold text-slate-500 mb-0.5">
+                      Режим реза
+                    </label>
+                    <div className="flex items-center justify-between gap-1.5 bg-white border border-slate-300 rounded-md px-2.5 py-1 h-[30px]">
+                      <label className="flex items-center gap-1.5 cursor-pointer select-none text-slate-800 shrink-0">
                         <input
                           type="checkbox"
                           checked={modalSettings.dualProfileCut}
@@ -635,7 +677,7 @@ export const CalculationProgressModal: React.FC<CalculationProgressModalProps> =
 
                       <div className="w-px h-3.5 bg-slate-300 mx-0.5 shrink-0" />
 
-                      <div className={`flex items-center gap-1 transition-opacity duration-150 ${modalSettings.dualProfileCut ? 'opacity-100' : 'opacity-40 pointer-events-none'}`}>
+                      <div className={`flex items-center gap-1.5 transition-opacity duration-150 ${modalSettings.dualProfileCut ? 'opacity-100' : 'opacity-40 pointer-events-none'}`}>
                         <label className="flex items-center gap-1 cursor-pointer select-none text-slate-800 shrink-0">
                           <input
                             type="checkbox"
@@ -673,43 +715,36 @@ export const CalculationProgressModal: React.FC<CalculationProgressModalProps> =
                         </div>
 
                         <div
-                          className="cursor-help text-slate-400 hover:text-blue-600 transition-colors ml-auto"
+                          className="cursor-help text-slate-400 hover:text-blue-600 transition-colors shrink-0"
                           title="Контроль заполнения: если в крайней паре заготовок (в карте не более двух заготовок) КИМ без учета делового отхода ниже указанного значения (по умолчанию 50%), алгоритм автоматически перераскладывает эту карту без режима «В 2 профиля» со стратегией «Минимум отходов» для снижения расхода материала."
                         >
-                          <HelpCircle className="w-3 h-3" />
+                          <HelpCircle className="w-3.5 h-3.5" />
                         </div>
                       </div>
                     </div>
                   </div>
 
-                  {/* Деловой порог: 2 cols */}
+                  {/* Деловой порог: 2 cols, ограничено 4 символами */}
                   <div className="sm:col-span-2">
                     <label className="block text-[10px] font-semibold text-slate-500 mb-0.5">
                       Деловой (мм)
                     </label>
                     <input
-                      type="number"
-                      min="0"
-                      value={modalSettings.reusableRemnantMin}
+                      type="text"
+                      maxLength={4}
+                      value={modalSettings.reusableRemnantMin || ''}
                       onChange={(e) => {
-                        const val = parseInt(e.target.value, 10);
+                        const clean = e.target.value.replace(/[^0-9]/g, '').slice(0, 4);
                         setModalSettings((prev) => ({
                           ...prev,
-                          reusableRemnantMin: isNaN(val) ? 0 : val,
+                          reusableRemnantMin: clean === '' ? 0 : parseInt(clean, 10),
                         }));
                       }}
-                      className="w-full text-xs font-mono font-bold text-amber-700 bg-white border border-slate-300 rounded-md px-2 py-1 text-right focus:outline-hidden"
+                      placeholder="0"
+                      className="w-full text-xs font-mono font-bold text-amber-700 bg-white border border-slate-300 rounded-md px-2 py-1 text-right focus:outline-hidden h-[30px]"
                     />
                   </div>
                 </div>
-
-                {/* Point 5: Предупреждение о дубликате */}
-                {duplicateWarning && (
-                  <div className="flex items-center gap-2 p-2.5 bg-amber-50 border border-amber-300 text-amber-900 rounded-lg text-xs font-semibold animate-in fade-in duration-150">
-                    <AlertTriangle className="w-4 h-4 text-amber-600 shrink-0" />
-                    <span>{duplicateWarning}</span>
-                  </div>
-                )}
               </div>
 
               {/* Sub-tab navigation */}

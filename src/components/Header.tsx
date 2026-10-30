@@ -1,11 +1,11 @@
 import React from 'react';
-import { Play, Printer, Sparkles } from 'lucide-react';
+import { Play, Sparkles } from 'lucide-react';
 
 interface HeaderProps {
   activeTab: 'workspace' | 'visualizer' | 'reports';
   setActiveTab: (tab: 'workspace' | 'visualizer' | 'reports') => void;
   onCalculate: () => void;
-  onPrint: () => void;
+  onPrint?: () => void;
   onExportExcel?: () => void;
   hasResults: boolean;
   onLoadBenchmarkExample?: () => void;
@@ -81,16 +81,7 @@ export const Header: React.FC<HeaderProps> = ({
             </button>
           )}
 
-          {hasResults && (
-            <button
-              onClick={onPrint}
-              title="Печать отчетов и карт раскроя"
-              className="flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold text-slate-100 bg-slate-800 hover:bg-slate-700 border border-slate-700 rounded-lg transition-colors whitespace-nowrap shrink-0 cursor-pointer"
-            >
-              <Printer className="w-3.5 h-3.5 text-blue-400" />
-              <span>Печать</span>
-            </button>
-          )}
+
           <button
             onClick={onCalculate}
             className="flex items-center gap-2 px-3.5 sm:px-4 py-2 text-xs font-semibold text-white bg-blue-600 hover:bg-blue-500 rounded-lg shadow-sm transition-colors whitespace-nowrap shrink-0 cursor-pointer"
