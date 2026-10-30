@@ -23,6 +23,22 @@ import { Play } from 'lucide-react';
 
 export default function App() {
   const [activeTab, setActiveTab] = useState<'workspace' | 'visualizer' | 'reports'>('workspace');
+  const [slideDirection, setSlideDirection] = useState<'left' | 'right'>('right');
+
+  const TAB_ORDER: Record<'workspace' | 'visualizer' | 'reports', number> = {
+    workspace: 0,
+    visualizer: 1,
+    reports: 2,
+  };
+
+  const handleTabChange = (newTab: 'workspace' | 'visualizer' | 'reports') => {
+    if (newTab === activeTab) return;
+    const currentIdx = TAB_ORDER[activeTab];
+    const nextIdx = TAB_ORDER[newTab];
+    setSlideDirection(nextIdx > currentIdx ? 'left' : 'right');
+    setActiveTab(newTab);
+  };
+
   const [isPasteModalOpen, setIsPasteModalOpen] = useState(false);
   const [pasteTarget, setPasteTarget] = useState<'stock' | 'demand'>('demand');
   const [isProgressModalOpen, setIsProgressModalOpen] = useState(false);
@@ -333,16 +349,20 @@ export default function App() {
       {/* Top Header Navigation */}
       <Header
         activeTab={activeTab}
-        setActiveTab={setActiveTab}
+        setActiveTab={handleTabChange}
         onCalculate={handleStartCalculation}
-        onPrint={() => setActiveTab('reports')}
+        onPrint={() => handleTabChange('reports')}
         onExportExcel={handleExportExcel}
         hasResults={Boolean(solution && solution.rows.length > 0)}
         onLoadBenchmarkExample={handleLoadBenchmarkExample}
       />
 
       {/* Main Container */}
-      <main className="flex-1 max-w-7xl w-full mx-auto p-4 sm:p-6 lg:p-8 space-y-6">
+      <main className="flex-1 max-w-7xl w-full mx-auto p-4 sm:p-6 lg:p-8 space-y-6 overflow-x-hidden">
+        <div
+          key={activeTab}
+          className={`w-full ${slideDirection === 'left' ? 'animate-slide-left' : 'animate-slide-right'}`}
+        >
         {/* Workspace Tab: ONLY 3 BLOCKS + Calculate Button */}
         {activeTab === 'workspace' && (
           <div className="space-y-6">
@@ -419,7 +439,7 @@ export default function App() {
             }))}
             onApplySettings={handleApplySettings}
             onExportExcel={handleExportExcel}
-            onPrint={() => setActiveTab('reports')}
+            onPrint={() => handleTabChange('reports')}
           />
         )}
 
@@ -507,6 +527,7 @@ export default function App() {
             }))}
           />
         )}
+        </div>
       </main>
 
       {/* Progress, Comparison & Parameter Tuning Modal */}
@@ -525,7 +546,7 @@ export default function App() {
           setSettings(newSettings);
           setLastSolvedSettings(newSettings);
         }}
-        onGoToResults={() => setActiveTab('visualizer')}
+        onGoToResults={() => handleTabChange('visualizer')}
       />
 
       {/* Paste from Excel Clipboard Modal */}

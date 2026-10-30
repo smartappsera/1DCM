@@ -11,6 +11,13 @@ import {
   PackageCheck,
   AlertTriangle,
   HelpCircle,
+  ArrowUpDown,
+  ArrowUp,
+  ArrowDown,
+  Filter,
+  Search,
+  RotateCcw,
+  Trash2,
 } from 'lucide-react';
 import { FullOptimizationSolution, AppSettings } from '../types/cutting';
 
@@ -62,6 +69,25 @@ export const CalculationProgressModal: React.FC<CalculationProgressModalProps> =
   const [progressPercent, setProgressPercent] = useState<number>(15);
   const [statusText, setStatusText] = useState<string>('Инициализация параметров...');
 
+  const [sortField, setSortField] = useState<
+    | 'index'
+    | 'speed'
+    | 'strategy'
+    | 'dualProfile'
+    | 'fillControl'
+    | 'reusableMin'
+    | 'kim'
+    | 'cards'
+    | 'spent'
+    | 'reusable'
+    | 'waste'
+    | 'unplaced'
+  >('index');
+  const [sortDirection, setSortDirection] = useState<'asc' | 'desc'>('asc');
+  const [filterStatus, setFilterStatus] = useState<'all' | 'complete' | 'unplaced'>('all');
+  const [filterStrategy, setFilterStrategy] = useState<string>('all');
+  const [searchQuery, setSearchQuery] = useState<string>('');
+
   const areSettingsEqual = (a: AppSettings, b: AppSettings): boolean => {
     return (
       a.bladeWidth === b.bladeWidth &&
@@ -91,16 +117,33 @@ export const CalculationProgressModal: React.FC<CalculationProgressModalProps> =
     setHighlightedRunId(null);
     setDuplicateWarning(null);
 
-    // Filter savedRuns to only those matching current input conditions (stocks + demands)
-    const validSavedRuns = (savedRuns || []).filter(
-      (r) => !r.inputSignature || !inputSignature || r.inputSignature === inputSignature
-    );
+    // Gather all existing previous runs: from savedRuns, or synthesized from the completed solution on page
+    let existingRuns: CalculationRun[] = savedRuns && savedRuns.length > 0 ? [...savedRuns] : [];
+    if (existingRuns.length === 0 && solution) {
+      existingRuns = [
+        {
+          id: `run_prev_${Date.now()}`,
+          index: 1,
+          title: 'Расчет #1',
+          timestamp: Date.now() - 2000,
+          settings: { ...(lastSolvedSettings || settings) },
+          solution: solution,
+          inputSignature: undefined,
+        },
+      ];
+    }
 
-    // Scenario A: If valid savedRuns exist for the current input conditions
-    if (validSavedRuns.length > 0) {
-      const matchRun = validSavedRuns.find((r) => areSettingsEqual(r.settings, settings));
+    // If we have previous runs:
+    if (existingRuns.length > 0) {
+      // Check if an identical run matches BOTH settings AND inputSignature
+      const matchRun = existingRuns.find(
+        (r) =>
+          areSettingsEqual(r.settings, settings) &&
+          (!r.inputSignature || !inputSignature || r.inputSignature === inputSignature)
+      );
+
       if (matchRun) {
-        setRuns(validSavedRuns);
+        setRuns(existingRuns);
         setActiveRunId(matchRun.id);
         setProgressPercent(100);
         setStatusText('Расчет успешно выполнен!');
@@ -108,70 +151,26 @@ export const CalculationProgressModal: React.FC<CalculationProgressModalProps> =
         return;
       }
 
-      // Settings changed! Keep previous saved runs for this input condition and calculate new run
-      setPhase('calculating');
-      setProgressPercent(40);
-      setStatusText('Расчет нового варианта с измененными настройками...');
-
-      const timer = setTimeout(() => {
-        try {
-          const newSol = onExecuteCalculation(settings);
-          const newRun: CalculationRun = {
-            id: `run_${Date.now()}_${validSavedRuns.length + 1}`,
-            index: validSavedRuns.length + 1,
-            title: `Расчет #${validSavedRuns.length + 1}`,
-            timestamp: Date.now(),
-            settings: { ...settings },
-            solution: newSol,
-            inputSignature,
-          };
-          const updated = [...validSavedRuns, newRun];
-          setRuns(updated);
-          setActiveRunId(newRun.id);
-          if (onSaveRuns) onSaveRuns(updated);
-          if (onApplySolutionAndSettings) onApplySolutionAndSettings(newSol, settings);
-          setProgressPercent(100);
-          setStatusText('Расчет успешно выполнен!');
-          setPhase('done');
-        } catch (err) {
-          console.error('Calculation error:', err);
-          setPhase('done');
-        }
-      }, 150);
-
-      return () => clearTimeout(timer);
-    }
-
-    // Scenario B: Feature 4 - validSavedRuns is empty, but solution exists on page and lastSolvedSettings exists
-    if (solution && lastSolvedSettings && !areSettingsEqual(settings, lastSolvedSettings)) {
+      // User modified settings or changed input conditions (e.g. stocks / demands) and started a new calculation!
+      // Keep previous runs in the comparison table and add the new calculation as the next row!
       setPhase('calculating');
       setProgressPercent(40);
       setStatusText('Расчет нового варианта и сравнение с предыдущим...');
 
       const timer = setTimeout(() => {
         try {
-          const prevRun: CalculationRun = {
-            id: `run_${Date.now()}_1`,
-            index: 1,
-            title: 'Расчет #1 (Текущий)',
-            timestamp: Date.now() - 1000,
-            settings: { ...lastSolvedSettings },
-            solution: solution,
-            inputSignature,
-          };
-
           const newSol = onExecuteCalculation(settings);
+          const nextIndex = existingRuns.length + 1;
           const newRun: CalculationRun = {
-            id: `run_${Date.now()}_2`,
-            index: 2,
-            title: 'Расчет #2 (Новый)',
+            id: `run_${Date.now()}_${nextIndex}`,
+            index: nextIndex,
+            title: `Расчет #${nextIndex}`,
             timestamp: Date.now(),
             settings: { ...settings },
             solution: newSol,
             inputSignature,
           };
-
-          const updated = [prevRun, newRun];
+          const updated = [...existingRuns, newRun];
           setRuns(updated);
           setActiveRunId(newRun.id);
           if (onSaveRuns) onSaveRuns(updated);
@@ -188,7 +187,7 @@ export const CalculationProgressModal: React.FC<CalculationProgressModalProps> =
       return () => clearTimeout(timer);
     }
 
-    // Scenario C: Fresh calculation for current stock and demand configuration
+    // No previous runs or solution exist at all (first calculation ever):
     setPhase('calculating');
     setProgressPercent(20);
     setStatusText('Инициализация списков заготовок и склада...');
@@ -263,32 +262,23 @@ export const CalculationProgressModal: React.FC<CalculationProgressModalProps> =
       return;
     }
 
-    // Execute recalculation (new run or updating active run if re-executing)
+    if (existingRun && existingRun.id === activeRunId) {
+      setDuplicateWarning(`Вариант «${existingRun.title}» уже рассчитан с текущими параметрами`);
+      setTimeout(() => setDuplicateWarning(null), 3000);
+      return;
+    }
+
+    // Execute recalculation (new run added to comparison list)
     setDuplicateWarning(null);
     setIsRecalculating(true);
     setTimeout(() => {
       try {
         const newSol = onExecuteCalculation(modalSettings);
-
-        if (existingRun && existingRun.id === activeRunId) {
-          // Re-running current variant with fresh state
-          const updatedRuns = runs.map((r) =>
-            r.id === existingRun.id
-              ? { ...r, timestamp: Date.now(), solution: newSol, settings: { ...modalSettings }, inputSignature }
-              : r
-          );
-          setRuns(updatedRuns);
-          if (onSaveRuns) onSaveRuns(updatedRuns);
-          if (onApplySolutionAndSettings) onApplySolutionAndSettings(newSol, modalSettings);
-          setDuplicateWarning(`Параметры варианта «${existingRun.title}» обновлены`);
-          setTimeout(() => setDuplicateWarning(null), 3000);
-          return;
-        }
-
+        const nextIndex = runs.length + 1;
         const newRun: CalculationRun = {
-          id: `run_${Date.now()}_${runs.length + 1}`,
-          index: runs.length + 1,
-          title: `Расчет #${runs.length + 1}`,
+          id: `run_${Date.now()}_${nextIndex}`,
+          index: nextIndex,
+          title: `Расчет #${nextIndex}`,
           timestamp: Date.now(),
           settings: { ...modalSettings },
           solution: newSol,
@@ -309,6 +299,14 @@ export const CalculationProgressModal: React.FC<CalculationProgressModalProps> =
         setIsRecalculating(false);
       }
     }, 50);
+  };
+
+  const handleClearRuns = () => {
+    if (!activeRun) return;
+    const reset = [{ ...activeRun, index: 1, title: 'Расчет #1' }];
+    setRuns(reset);
+    setActiveRunId(reset[0].id);
+    if (onSaveRuns) onSaveRuns(reset);
   };
 
   const handleSelectRun = (run: CalculationRun) => {
@@ -515,11 +513,117 @@ export const CalculationProgressModal: React.FC<CalculationProgressModalProps> =
     return 'text-amber-700 font-bold font-mono'; // промежуточные значения - желтым
   };
 
+  const filteredAndSortedRuns = useMemo(() => {
+    let list = [...runs];
+
+    if (filterStatus === 'complete') {
+      list = list.filter(
+        (r) =>
+          !r.solution.unplacedDemand ||
+          r.solution.unplacedDemand.length === 0 ||
+          r.solution.unplacedDemand.every((u) => u.quantity === 0)
+      );
+    } else if (filterStatus === 'unplaced') {
+      list = list.filter(
+        (r) =>
+          r.solution.unplacedDemand &&
+          r.solution.unplacedDemand.some((u) => u.quantity > 0)
+      );
+    }
+
+    if (filterStrategy !== 'all') {
+      list = list.filter((r) => r.settings.optimizationGoal === filterStrategy);
+    }
+
+    if (searchQuery.trim()) {
+      const q = searchQuery.toLowerCase().trim();
+      list = list.filter((r) => {
+        const titleMatch = r.title.toLowerCase().includes(q);
+        const stratMatch = getStrategyLabel(r.settings.optimizationGoal).toLowerCase().includes(q);
+        const speedMatch = getSpeedLabel(r.settings.searchSpeed).toLowerCase().includes(q);
+        return titleMatch || stratMatch || speedMatch;
+      });
+    }
+
+    list.sort((a, b) => {
+      let diff = 0;
+      switch (sortField) {
+        case 'index':
+          diff = a.index - b.index;
+          break;
+        case 'speed':
+          diff = a.settings.searchSpeed.localeCompare(b.settings.searchSpeed);
+          break;
+        case 'strategy':
+          diff = a.settings.optimizationGoal.localeCompare(b.settings.optimizationGoal);
+          break;
+        case 'dualProfile':
+          diff = Number(a.settings.dualProfileCut) - Number(b.settings.dualProfileCut);
+          break;
+        case 'fillControl': {
+          const fcA = a.settings.dualProfileCut && a.settings.fillControlEnabled ? (a.settings.fillControlThreshold ?? 50) : 0;
+          const fcB = b.settings.dualProfileCut && b.settings.fillControlEnabled ? (b.settings.fillControlThreshold ?? 50) : 0;
+          diff = fcA - fcB;
+          break;
+        }
+        case 'reusableMin':
+          diff = a.settings.reusableRemnantMin - b.settings.reusableRemnantMin;
+          break;
+        case 'kim':
+          diff = a.solution.overallKIM - b.solution.overallKIM;
+          break;
+        case 'cards':
+          diff = a.solution.rows.length - b.solution.rows.length;
+          break;
+        case 'spent':
+          diff = (a.solution.totalStockLength || 0) - (b.solution.totalStockLength || 0);
+          break;
+        case 'reusable':
+          diff = (a.solution.totalReusableLength || 0) - (b.solution.totalReusableLength || 0);
+          break;
+        case 'waste':
+          diff = (a.solution.totalWasteLength || 0) - (b.solution.totalWasteLength || 0);
+          break;
+        case 'unplaced': {
+          const unpA = a.solution.unplacedDemand ? a.solution.unplacedDemand.reduce((s, u) => s + (u.quantity || 0), 0) : 0;
+          const unpB = b.solution.unplacedDemand ? b.solution.unplacedDemand.reduce((s, u) => s + (u.quantity || 0), 0) : 0;
+          diff = unpA - unpB;
+          break;
+        }
+        default:
+          diff = a.index - b.index;
+      }
+      return sortDirection === 'asc' ? diff : -diff;
+    });
+
+    return list;
+  }, [runs, filterStatus, filterStrategy, searchQuery, sortField, sortDirection]);
+
+  const handleSortToggle = (field: typeof sortField) => {
+    if (sortField === field) {
+      setSortDirection((prev) => (prev === 'asc' ? 'desc' : 'asc'));
+    } else {
+      setSortField(field);
+      setSortDirection('asc');
+    }
+  };
+
+  const renderSortIndicator = (field: typeof sortField) => {
+    if (sortField !== field) {
+      return <ArrowUpDown className="w-3 h-3 text-slate-400 opacity-40 group-hover:opacity-100 transition-opacity" />;
+    }
+    return sortDirection === 'asc' ? (
+      <ArrowUp className="w-3 h-3 text-blue-600" />
+    ) : (
+      <ArrowDown className="w-3 h-3 text-blue-600" />
+    );
+  };
+
   if (!isOpen) return null;
 
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-xs p-3 sm:p-4">
-      <div className="bg-white rounded-2xl shadow-2xl border border-slate-200 max-w-5xl w-full max-h-[92vh] flex flex-col overflow-hidden animate-in fade-in duration-100 relative">
+      <div className="bg-white rounded-2xl shadow-2xl border border-slate-200 max-w-6xl w-full max-h-[92vh] flex flex-col overflow-hidden animate-in fade-in duration-100 relative">
         {/* Floating toast notification for duplicate or status warning (zero layout shift) */}
         {duplicateWarning && (
           <div className="absolute top-16 right-6 z-30 flex items-center gap-2.5 px-3.5 py-2 bg-amber-600 text-white rounded-xl shadow-xl text-xs font-semibold animate-in fade-in slide-in-from-top-2 duration-150 border border-amber-500 max-w-md">
@@ -868,99 +972,411 @@ export const CalculationProgressModal: React.FC<CalculationProgressModalProps> =
 
                   {/* Comparative table if more than 1 run */}
                   {runs.length > 1 && (
-                    <div className="space-y-2">
-                      <div className="text-xs font-bold text-slate-800 flex items-center justify-between">
-                        <span>Сравнение рассчитанных вариантов:</span>
-                        <span className="text-[11px] text-slate-500 font-normal">
-                          Нажмите на строку, чтобы выбрать вариант
-                        </span>
+                    <div className="space-y-3 pt-1">
+                      {/* Comparison Toolbar: Title, Filtering, Search, and Clear */}
+                      <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2.5">
+                        <div className="flex items-center gap-2">
+                          <span className="text-xs font-bold text-slate-800">
+                            Сравнение рассчитанных вариантов ({runs.length}):
+                          </span>
+                          <span className="text-[11px] text-slate-500 font-normal hidden md:inline">
+                            Нажмите на заголовок для сортировки или на строку для выбора
+                          </span>
+                        </div>
+
+                        <div className="flex items-center gap-2 self-end sm:self-auto">
+                          <button
+                            type="button"
+                            onClick={handleClearRuns}
+                            title="Сбросить историю расчетов и оставить только выбранный"
+                            className="flex items-center gap-1 text-[11px] text-slate-500 hover:text-rose-600 px-2 py-1 rounded-lg hover:bg-rose-50 transition-colors cursor-pointer border border-transparent hover:border-rose-200"
+                          >
+                            <Trash2 className="w-3 h-3" />
+                            <span>Очистить историю</span>
+                          </button>
+                        </div>
                       </div>
 
-                      <div className="border border-slate-200 rounded-xl overflow-x-auto text-xs">
+                      {/* Filter Bar */}
+                      <div className="flex flex-wrap items-center justify-between gap-2 bg-slate-50 p-2 rounded-xl border border-slate-200">
+                        <div className="flex flex-wrap items-center gap-1.5 text-xs">
+                          <span className="text-[11px] font-bold text-slate-500 mr-1 flex items-center gap-1">
+                            <Filter className="w-3 h-3 text-slate-400" />
+                            Фильтр:
+                          </span>
+
+                          <button
+                            type="button"
+                            onClick={() => setFilterStatus('all')}
+                            className={`px-2.5 py-1 rounded-lg text-xs font-semibold cursor-pointer transition-colors ${
+                              filterStatus === 'all'
+                                ? 'bg-blue-600 text-white shadow-xs'
+                                : 'bg-white text-slate-600 hover:bg-slate-100 border border-slate-200'
+                            }`}
+                          >
+                            Все ({runs.length})
+                          </button>
+
+                          <button
+                            type="button"
+                            onClick={() => setFilterStatus('complete')}
+                            className={`px-2.5 py-1 rounded-lg text-xs font-semibold cursor-pointer transition-colors ${
+                              filterStatus === 'complete'
+                                ? 'bg-emerald-600 text-white shadow-xs'
+                                : 'bg-white text-slate-600 hover:bg-slate-100 border border-slate-200'
+                            }`}
+                          >
+                            Без дефицита (
+                            {
+                              runs.filter(
+                                (r) =>
+                                  !r.solution.unplacedDemand ||
+                                  r.solution.unplacedDemand.length === 0 ||
+                                  r.solution.unplacedDemand.every((u) => u.quantity === 0)
+                              ).length
+                            }
+                            )
+                          </button>
+
+                          <button
+                            type="button"
+                            onClick={() => setFilterStatus('unplaced')}
+                            className={`px-2.5 py-1 rounded-lg text-xs font-semibold cursor-pointer transition-colors flex items-center gap-1 ${
+                              filterStatus === 'unplaced'
+                                ? 'bg-rose-600 text-white shadow-xs'
+                                : 'bg-white text-slate-600 hover:bg-slate-100 border border-slate-200'
+                            }`}
+                          >
+                            <AlertTriangle className="w-3 h-3 text-rose-500" />
+                            С дефицитом (
+                            {
+                              runs.filter(
+                                (r) =>
+                                  r.solution.unplacedDemand &&
+                                  r.solution.unplacedDemand.some((u) => u.quantity > 0)
+                              ).length
+                            }
+                            )
+                          </button>
+
+                          <select
+                            value={filterStrategy}
+                            onChange={(e) => setFilterStrategy(e.target.value)}
+                            className="bg-white border border-slate-200 rounded-lg text-xs text-slate-700 px-2 py-1 ml-1 cursor-pointer font-medium focus:outline-hidden"
+                          >
+                            <option value="all">Все стратегии</option>
+                            <option value="variants">Схемы (Кол-во вариантов)</option>
+                            <option value="min_waste">Мин. отход</option>
+                            <option value="min_bars">Мин. хлыстов</option>
+                            <option value="max_reusable">Деловой остаток</option>
+                            <option value="prioritize_remnants">Склад</option>
+                          </select>
+                        </div>
+
+                        <div className="flex items-center gap-2">
+                          <div className="relative">
+                            <Search className="w-3.5 h-3.5 absolute left-2.5 top-1/2 -translate-y-1/2 text-slate-400 pointer-events-none" />
+                            <input
+                              type="text"
+                              value={searchQuery}
+                              onChange={(e) => setSearchQuery(e.target.value)}
+                              placeholder="Поиск по названию..."
+                              className="w-36 sm:w-44 pl-7 pr-6 py-1 text-xs bg-white border border-slate-200 rounded-lg placeholder:text-slate-400 focus:outline-hidden focus:border-blue-500"
+                            />
+                            {searchQuery && (
+                              <button
+                                onClick={() => setSearchQuery('')}
+                                className="absolute right-2 top-1/2 -translate-y-1/2 text-slate-400 hover:text-slate-600 cursor-pointer"
+                              >
+                                <X className="w-3 h-3" />
+                              </button>
+                            )}
+                          </div>
+
+                          {(filterStatus !== 'all' || filterStrategy !== 'all' || searchQuery) && (
+                            <button
+                              onClick={() => {
+                                setFilterStatus('all');
+                                setFilterStrategy('all');
+                                setSearchQuery('');
+                              }}
+                              title="Сбросить фильтры"
+                              className="p-1.5 rounded-lg text-slate-400 hover:text-slate-700 hover:bg-slate-200 transition-colors cursor-pointer"
+                            >
+                              <RotateCcw className="w-3.5 h-3.5" />
+                            </button>
+                          )}
+                        </div>
+                      </div>
+
+                      {/* Interactive Table with Split Columns and Column Sorting */}
+                      <div className="border border-slate-200 rounded-xl overflow-x-auto text-xs shadow-2xs">
                         <table className="w-full border-collapse whitespace-nowrap">
                           <thead>
-                            <tr className="bg-slate-100 text-slate-700 border-b border-slate-200 text-left text-[11px] whitespace-nowrap">
-                              <th className="py-2.5 px-3 w-28 whitespace-nowrap">Вариант</th>
-                              <th className="py-2.5 px-3 min-w-[280px] whitespace-nowrap">Параметры</th>
-                              <th className="py-2.5 px-3 text-right w-20 whitespace-nowrap">КИМ</th>
-                              <th className="py-2.5 px-3 text-right w-20 whitespace-nowrap">Карт</th>
-                              <th className="py-2.5 px-3 text-right w-28 whitespace-nowrap">Расход (м)</th>
-                              <th className="py-2.5 px-3 text-right w-28 whitespace-nowrap">Деловой (м)</th>
-                              <th className="py-2.5 px-3 text-right w-24 whitespace-nowrap">Отход (м)</th>
-                              <th className="py-2.5 px-3 text-center w-28 whitespace-nowrap">Выбор</th>
+                            <tr className="bg-slate-100 text-slate-700 border-b border-slate-200 text-left text-[11px] whitespace-nowrap select-none">
+                              <th
+                                onClick={() => handleSortToggle('index')}
+                                className="py-2 px-2.5 cursor-pointer hover:bg-slate-200 transition-colors group whitespace-nowrap w-28"
+                              >
+                                <div className="flex items-center gap-1">
+                                  <span>Вариант</span>
+                                  {renderSortIndicator('index')}
+                                </div>
+                              </th>
+
+                              <th
+                                onClick={() => handleSortToggle('speed')}
+                                className="py-2 px-2.5 cursor-pointer hover:bg-slate-200 transition-colors group whitespace-nowrap"
+                              >
+                                <div className="flex items-center gap-1">
+                                  <span>Скорость</span>
+                                  {renderSortIndicator('speed')}
+                                </div>
+                              </th>
+
+                              <th
+                                onClick={() => handleSortToggle('strategy')}
+                                className="py-2 px-2.5 cursor-pointer hover:bg-slate-200 transition-colors group whitespace-nowrap"
+                              >
+                                <div className="flex items-center gap-1">
+                                  <span>Стратегия</span>
+                                  {renderSortIndicator('strategy')}
+                                </div>
+                              </th>
+
+                              <th
+                                onClick={() => handleSortToggle('dualProfile')}
+                                className="py-2 px-2.5 cursor-pointer hover:bg-slate-200 transition-colors group whitespace-nowrap"
+                              >
+                                <div className="flex items-center gap-1">
+                                  <span>2 проф.</span>
+                                  {renderSortIndicator('dualProfile')}
+                                </div>
+                              </th>
+
+                              <th
+                                onClick={() => handleSortToggle('fillControl')}
+                                className="py-2 px-2.5 cursor-pointer hover:bg-slate-200 transition-colors group whitespace-nowrap"
+                              >
+                                <div className="flex items-center gap-1">
+                                  <span>Контроль</span>
+                                  {renderSortIndicator('fillControl')}
+                                </div>
+                              </th>
+
+                              <th
+                                onClick={() => handleSortToggle('reusableMin')}
+                                className="py-2 px-2.5 cursor-pointer hover:bg-slate-200 transition-colors group whitespace-nowrap"
+                              >
+                                <div className="flex items-center gap-1">
+                                  <span>Деловой (мм)</span>
+                                  {renderSortIndicator('reusableMin')}
+                                </div>
+                              </th>
+
+                              <th
+                                onClick={() => handleSortToggle('kim')}
+                                className="py-2 px-2.5 text-right cursor-pointer hover:bg-slate-200 transition-colors group whitespace-nowrap w-20"
+                              >
+                                <div className="flex items-center justify-end gap-1">
+                                  <span>КИМ</span>
+                                  {renderSortIndicator('kim')}
+                                </div>
+                              </th>
+
+                              <th
+                                onClick={() => handleSortToggle('cards')}
+                                className="py-2 px-2.5 text-right cursor-pointer hover:bg-slate-200 transition-colors group whitespace-nowrap w-16"
+                              >
+                                <div className="flex items-center justify-end gap-1">
+                                  <span>Карт</span>
+                                  {renderSortIndicator('cards')}
+                                </div>
+                              </th>
+
+                              <th
+                                onClick={() => handleSortToggle('spent')}
+                                className="py-2 px-2.5 text-right cursor-pointer hover:bg-slate-200 transition-colors group whitespace-nowrap w-24"
+                              >
+                                <div className="flex items-center justify-end gap-1">
+                                  <span>Расход (м)</span>
+                                  {renderSortIndicator('spent')}
+                                </div>
+                              </th>
+
+                              <th
+                                onClick={() => handleSortToggle('reusable')}
+                                className="py-2 px-2.5 text-right cursor-pointer hover:bg-slate-200 transition-colors group whitespace-nowrap w-24"
+                              >
+                                <div className="flex items-center justify-end gap-1">
+                                  <span>Деловой (м)</span>
+                                  {renderSortIndicator('reusable')}
+                                </div>
+                              </th>
+
+                              <th
+                                onClick={() => handleSortToggle('waste')}
+                                className="py-2 px-2.5 text-right cursor-pointer hover:bg-slate-200 transition-colors group whitespace-nowrap w-22"
+                              >
+                                <div className="flex items-center justify-end gap-1">
+                                  <span>Отход (м)</span>
+                                  {renderSortIndicator('waste')}
+                                </div>
+                              </th>
+
+                              <th className="py-2 px-3 text-center w-24 whitespace-nowrap">
+                                Выбор
+                              </th>
                             </tr>
                           </thead>
                           <tbody>
-                            {runs.map((r) => {
-                              const isActive = r.id === activeRunId;
-                              const isHighlighted = r.id === highlightedRunId;
-                              const kimTheme = getKimTheme(r.solution.overallKIM);
-                              const remnantTheme = getRemnantTheme(r.solution.totalReusableLength);
-                              const spentMeters = Number(((r.solution.totalStockLength || 0) / 1000).toFixed(2));
-                              const wasteMeters = Number(((r.solution.totalWasteLength || 0) / 1000).toFixed(2));
+                            {filteredAndSortedRuns.length > 0 ? (
+                              filteredAndSortedRuns.map((r) => {
+                                const isActive = r.id === activeRunId;
+                                const isHighlighted = r.id === highlightedRunId;
+                                const kimTheme = getKimTheme(r.solution.overallKIM);
+                                const remnantTheme = getRemnantTheme(r.solution.totalReusableLength);
+                                const spentMeters = Number(((r.solution.totalStockLength || 0) / 1000).toFixed(2));
+                                const wasteMeters = Number(((r.solution.totalWasteLength || 0) / 1000).toFixed(2));
+                                const hasUnplaced = Boolean(
+                                  r.solution.unplacedDemand &&
+                                  r.solution.unplacedDemand.some((u) => u.quantity > 0)
+                                );
+                                const unplacedCount = r.solution.unplacedDemand
+                                  ? r.solution.unplacedDemand.reduce((sum, u) => sum + (u.quantity || 0), 0)
+                                  : 0;
 
-                              return (
-                                <tr
-                                  key={r.id}
-                                  onClick={() => handleSelectRun(r)}
-                                  className={`border-b border-slate-100 transition-all duration-300 cursor-pointer whitespace-nowrap h-10 ${
-                                    isHighlighted
-                                      ? 'bg-amber-100 ring-2 ring-amber-400 font-bold'
-                                      : isActive
-                                      ? 'bg-blue-50/80 font-bold text-blue-950'
-                                      : 'hover:bg-slate-50 text-slate-800'
-                                  }`}
-                                >
-                                  <td className="py-2 px-3 whitespace-nowrap">
-                                    <div className="flex items-center gap-1.5 whitespace-nowrap">
-                                      <span
-                                        className={`w-2 h-2 rounded-full shrink-0 ${
-                                          isActive ? 'bg-blue-600' : 'bg-slate-300'
-                                        }`}
-                                      />
-                                      <span className="whitespace-nowrap">{r.title}</span>
-                                    </div>
-                                  </td>
-                                  <td className={`py-2 px-3 text-[11px] whitespace-nowrap ${isActive ? 'text-blue-900 font-semibold' : 'text-slate-600'}`}>
-                                    {getStrategyLabel(r.settings.optimizationGoal)} ·{' '}
-                                    {getSpeedLabel(r.settings.searchSpeed)}
-                                    {r.settings.dualProfileCut ? ' · 2 проф.' : ''}
-                                    {r.settings.dualProfileCut && r.settings.fillControlEnabled ? ` (Контроль ${r.settings.fillControlThreshold ?? 50}%)` : ''}
-                                  </td>
-                                  <td className={`py-2 px-3 text-right font-mono whitespace-nowrap ${kimTheme.tableText}`}>
-                                    {r.solution.overallKIM.toFixed(2)}%
-                                  </td>
-                                  {/* Feature 2: Колонка с количеством карт и цветовой индикацией */}
-                                  <td className={`py-2 px-3 text-right whitespace-nowrap ${getCardsTheme(r.solution.rows.length)}`}>
-                                    {r.solution.rows.length}
-                                  </td>
-                                  {/* Feature 3: Расход в метрах с цветовой индикацией */}
-                                  <td className={`py-2 px-3 text-right whitespace-nowrap ${getSpentTheme(spentMeters)}`}>
-                                    {((r.solution.totalStockLength || 0) / 1000).toFixed(1)} м
-                                  </td>
-                                  {/* Деловой остаток */}
-                                  <td className={`py-2 px-3 text-right font-mono whitespace-nowrap ${remnantTheme.tableText}`}>
-                                    {(r.solution.totalReusableLength / 1000).toFixed(2)}
-                                  </td>
-                                  {/* Feature 3: Отход с цветовой индикацией */}
-                                  <td className={`py-2 px-3 text-right whitespace-nowrap ${getWasteTheme(wasteMeters)}`}>
-                                    {(r.solution.totalWasteLength / 1000).toFixed(2)}
-                                  </td>
-                                  <td className="py-2 px-3 text-center whitespace-nowrap">
-                                    {isActive ? (
-                                      <span className="inline-flex items-center gap-1 px-2.5 py-0.5 bg-blue-600 text-white text-[10px] font-bold rounded-md whitespace-nowrap">
-                                        <Check className="w-3 h-3" />
-                                        Активен
-                                      </span>
-                                    ) : (
-                                      <span className="text-[11px] text-slate-400 hover:text-blue-600 whitespace-nowrap">
-                                        Выбрать
-                                      </span>
-                                    )}
-                                  </td>
-                                </tr>
-                              );
-                            })}
+                                return (
+                                  <tr
+                                    key={r.id}
+                                    onClick={() => handleSelectRun(r)}
+                                    className={`border-b border-slate-100 transition-all duration-200 cursor-pointer whitespace-nowrap h-10 ${
+                                      isHighlighted
+                                        ? 'bg-amber-100 ring-2 ring-amber-400 font-bold'
+                                        : isActive
+                                        ? 'bg-blue-50/80 font-bold text-blue-950'
+                                        : 'hover:bg-slate-50 text-slate-800'
+                                    }`}
+                                  >
+                                    {/* Вариант с кругом либо красным треугольником при дефиците деталей */}
+                                    <td className="py-2 px-2.5 whitespace-nowrap">
+                                      <div className="flex items-center gap-2 whitespace-nowrap">
+                                        {hasUnplaced ? (
+                                          <div
+                                            className="flex items-center text-rose-600 shrink-0 cursor-help"
+                                            title={`Не все детали вошли в раскрой! Не разложено: ${unplacedCount} шт.`}
+                                          >
+                                            <AlertTriangle className="w-4 h-4 fill-rose-100 text-rose-600 shrink-0" />
+                                          </div>
+                                        ) : (
+                                          <span
+                                            className={`w-2.5 h-2.5 rounded-full shrink-0 ${
+                                              isActive ? 'bg-blue-600 ring-2 ring-blue-300' : 'bg-slate-300'
+                                            }`}
+                                          />
+                                        )}
+                                        <span className={`font-semibold ${isActive ? 'text-blue-950' : 'text-slate-900'}`}>
+                                          {r.title}
+                                        </span>
+                                        {hasUnplaced && (
+                                          <span className="text-[10px] text-rose-600 font-bold bg-rose-50 px-1 py-0.2 rounded border border-rose-200">
+                                            -{unplacedCount}
+                                          </span>
+                                        )}
+                                      </div>
+                                    </td>
+
+                                    {/* Скорость */}
+                                    <td className="py-2 px-2.5 text-[11px] whitespace-nowrap text-slate-600">
+                                      {getSpeedLabel(r.settings.searchSpeed)}
+                                    </td>
+
+                                    {/* Стратегия */}
+                                    <td className="py-2 px-2.5 text-[11px] whitespace-nowrap font-medium text-slate-800">
+                                      {getStrategyLabel(r.settings.optimizationGoal)}
+                                    </td>
+
+                                    {/* 2 профиля */}
+                                    <td className="py-2 px-2.5 text-[11px] whitespace-nowrap">
+                                      {r.settings.dualProfileCut ? (
+                                        <span className="text-blue-700 font-semibold bg-blue-50 px-1.5 py-0.5 rounded border border-blue-200">
+                                          Да
+                                        </span>
+                                      ) : (
+                                        <span className="text-slate-400 font-normal">Нет</span>
+                                      )}
+                                    </td>
+
+                                    {/* Контроль заполнения */}
+                                    <td className="py-2 px-2.5 text-[11px] whitespace-nowrap font-mono">
+                                      {r.settings.dualProfileCut && r.settings.fillControlEnabled ? (
+                                        <span className="text-blue-800 font-medium">
+                                          {r.settings.fillControlThreshold ?? 50}%
+                                        </span>
+                                      ) : (
+                                        <span className="text-slate-400 font-normal">—</span>
+                                      )}
+                                    </td>
+
+                                    {/* Деловой отход (порог) */}
+                                    <td className="py-2 px-2.5 text-[11px] whitespace-nowrap font-mono">
+                                      {r.settings.reusableRemnantMin > 0 ? (
+                                        <span className="text-amber-800 font-semibold">
+                                          {r.settings.reusableRemnantMin} мм
+                                        </span>
+                                      ) : (
+                                        <span className="text-slate-400 font-normal">0 мм</span>
+                                      )}
+                                    </td>
+
+                                    {/* КИМ */}
+                                    <td className={`py-2 px-2.5 text-right font-mono whitespace-nowrap ${kimTheme.tableText}`}>
+                                      {r.solution.overallKIM.toFixed(2)}%
+                                    </td>
+
+                                    {/* Карт раскроя */}
+                                    <td className={`py-2 px-2.5 text-right whitespace-nowrap ${getCardsTheme(r.solution.rows.length)}`}>
+                                      {r.solution.rows.length}
+                                    </td>
+
+                                    {/* Расход хлыстов (м) */}
+                                    <td className={`py-2 px-2.5 text-right whitespace-nowrap ${getSpentTheme(spentMeters)}`}>
+                                      {((r.solution.totalStockLength || 0) / 1000).toFixed(1)} м
+                                    </td>
+
+                                    {/* Деловой остаток (м) */}
+                                    <td className={`py-2 px-2.5 text-right font-mono whitespace-nowrap ${remnantTheme.tableText}`}>
+                                      {(r.solution.totalReusableLength / 1000).toFixed(2)}
+                                    </td>
+
+                                    {/* Отход и резы (м) */}
+                                    <td className={`py-2 px-2.5 text-right whitespace-nowrap ${getWasteTheme(wasteMeters)}`}>
+                                      {(r.solution.totalWasteLength / 1000).toFixed(2)}
+                                    </td>
+
+                                    {/* Выбор */}
+                                    <td className="py-2 px-2.5 text-center whitespace-nowrap">
+                                      {isActive ? (
+                                        <span className="inline-flex items-center gap-1 px-2.5 py-0.5 bg-blue-600 text-white text-[10px] font-bold rounded-md whitespace-nowrap shadow-xs">
+                                          <Check className="w-3 h-3" />
+                                          Активен
+                                        </span>
+                                      ) : (
+                                        <span className="text-[11px] text-slate-500 hover:text-blue-600 font-medium whitespace-nowrap">
+                                          Выбрать
+                                        </span>
+                                      )}
+                                    </td>
+                                  </tr>
+                                );
+                              })
+                            ) : (
+                              <tr>
+                                <td colSpan={12} className="py-6 text-center text-slate-400 text-xs">
+                                  Нет вариантов, соответствующих выбранным фильтрам
+                                </td>
+                              </tr>
+                            )}
                           </tbody>
                         </table>
                       </div>
