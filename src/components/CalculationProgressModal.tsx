@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useMemo } from 'react';
+import React, { useState, useEffect, useMemo, useRef } from 'react';
 import {
   CheckCircle2,
   ArrowRight,
@@ -45,6 +45,7 @@ interface CalculationProgressModalProps {
   onApplySolutionAndSettings?: (sol: FullOptimizationSolution, newSettings: AppSettings) => void;
   onGoToResults: () => void;
   isSettingsOpen?: boolean;
+  calcTriggerNonce?: number;
 }
 
 export const CalculationProgressModal: React.FC<CalculationProgressModalProps> = ({
@@ -60,6 +61,7 @@ export const CalculationProgressModal: React.FC<CalculationProgressModalProps> =
   onApplySolutionAndSettings,
   onGoToResults,
   isSettingsOpen = true,
+  calcTriggerNonce,
 }) => {
   const [phase, setPhase] = useState<'calculating' | 'done'>('calculating');
   const [activeSubTab, setActiveSubTab] = useState<'summary' | 'remnants'>('summary');
@@ -239,12 +241,12 @@ export const CalculationProgressModal: React.FC<CalculationProgressModalProps> =
   const activeSolution = activeRun ? activeRun.solution : solution;
 
   // Recalculate avoiding blocked calculations and respecting all parameters
-  const handleRecalculate = () => {
+  const executeRecalculateWithSettings = (settingsToUse: AppSettings) => {
     // Check if an identical run exists in the current session
     const existingRun = runs.find(
       (r) =>
         (!r.inputSignature || !inputSignature || r.inputSignature === inputSignature) &&
-        areSettingsEqual(r.settings, modalSettings)
+        areSettingsEqual(r.settings, settingsToUse)
     );
 
     // If matching run exists and is NOT currently active, switch to it with a floating notice
@@ -276,14 +278,14 @@ export const CalculationProgressModal: React.FC<CalculationProgressModalProps> =
     setIsRecalculating(true);
     setTimeout(() => {
       try {
-        const newSol = onExecuteCalculation(modalSettings);
+        const newSol = onExecuteCalculation(settingsToUse);
         const nextIndex = runs.length + 1;
         const newRun: CalculationRun = {
           id: `run_${Date.now()}_${nextIndex}`,
           index: nextIndex,
           title: `Расчет #${nextIndex}`,
           timestamp: Date.now(),
-          settings: { ...modalSettings },
+          settings: { ...settingsToUse },
           solution: newSol,
           inputSignature,
         };
@@ -294,7 +296,7 @@ export const CalculationProgressModal: React.FC<CalculationProgressModalProps> =
           onSaveRuns(updatedRuns);
         }
         if (onApplySolutionAndSettings) {
-          onApplySolutionAndSettings(newSol, modalSettings);
+          onApplySolutionAndSettings(newSol, settingsToUse);
         }
       } catch (err) {
         console.error('Recalculation error:', err);
@@ -303,6 +305,20 @@ export const CalculationProgressModal: React.FC<CalculationProgressModalProps> =
       }
     }, 50);
   };
+
+  const handleRecalculate = () => {
+    executeRecalculateWithSettings(settings);
+  };
+
+  // Listen to calcTriggerNonce from App when user clicks "Рассчитать раскрой" in sidebar
+  const lastNonceRef = useRef<number | undefined>(calcTriggerNonce);
+  useEffect(() => {
+    if (!isOpen || phase !== 'done') return;
+    if (calcTriggerNonce !== undefined && calcTriggerNonce !== lastNonceRef.current) {
+      lastNonceRef.current = calcTriggerNonce;
+      executeRecalculateWithSettings(settings);
+    }
+  }, [calcTriggerNonce, isOpen, phase, settings]);
 
   const handleClearRuns = () => {
     if (!activeRun) return;
@@ -683,18 +699,10 @@ export const CalculationProgressModal: React.FC<CalculationProgressModalProps> =
               type="button"
               onClick={onClose}
               className="flex items-center gap-1.5 px-2.5 py-1 text-xs font-semibold text-slate-600 hover:text-blue-700 bg-white hover:bg-blue-50 border border-slate-200 hover:border-blue-200 rounded-lg transition-colors cursor-pointer"
-              title="Свернуть в вертикальный спойлер"
+              title="Свернуть"
             >
               <ChevronLeft className="w-3.5 h-3.5 text-blue-600" />
-              <span className="hidden sm:inline">Свернуть в спойлер</span>
-            </button>
-
-            <button
-              onClick={onClose}
-              className="w-7 h-7 flex items-center justify-center rounded-lg text-slate-400 hover:text-slate-700 hover:bg-slate-200/60 transition-colors cursor-pointer"
-              title="Закрыть"
-            >
-              <X className="w-4 h-4" />
+              <span>Свернуть</span>
             </button>
           </div>
         </div>
@@ -723,160 +731,23 @@ export const CalculationProgressModal: React.FC<CalculationProgressModalProps> =
             </div>
           ) : (
             <>
-              {/* Quick settings control bar inside the modal */}
-              <div className="bg-slate-50 border border-slate-200 rounded-xl p-3 shadow-2xs space-y-2.5">
-                <div className="flex items-center justify-between gap-2">
-                  <div className="flex items-center gap-1.5 text-xs font-bold text-slate-800">
-                    <Sliders className="w-3.5 h-3.5 text-blue-600" />
-                    <span>Параметры для расчета и сравнения</span>
-                  </div>
-                  <button
-                    onClick={handleRecalculate}
-                    disabled={isRecalculating}
-                    className="flex items-center gap-1.5 px-3 py-1.5 text-xs font-bold text-white bg-blue-600 hover:bg-blue-500 disabled:opacity-50 rounded-lg shadow-2xs transition-colors cursor-pointer"
-                  >
-                    <RefreshCw className={`w-3.5 h-3.5 ${isRecalculating ? 'animate-spin' : ''}`} />
-                    <span>Пересчитать вариант</span>
-                  </button>
+              {/* Left sidebar controller banner */}
+              <div className="bg-slate-50 border border-slate-200 rounded-xl px-3.5 py-2.5 text-xs flex flex-wrap items-center justify-between gap-3 shadow-2xs">
+                <div className="flex items-center gap-2 text-slate-700">
+                  <Sliders className="w-4 h-4 text-blue-600 shrink-0" />
+                  <span>
+                    Параметры расчета настраиваются в <strong>боковой панели слева</strong>. Измените параметры и нажмите «Рассчитать раскрой» для добавления нового варианта в сравнение.
+                  </span>
                 </div>
-
-                {/* Sized inputs: Скорость (2 cols), Стратегия (4 cols), 2 Профиля (4 cols), Деловой (2 cols, max 4 chars) */}
-                <div className="grid grid-cols-1 sm:grid-cols-12 gap-2 text-xs">
-                  {/* Скорость: 2 cols */}
-                  <div className="sm:col-span-2">
-                    <label className="block text-[10px] font-semibold text-slate-500 mb-0.5">
-                      Скорость
-                    </label>
-                    <select
-                      value={modalSettings.searchSpeed}
-                      onChange={(e) =>
-                        setModalSettings((prev) => ({
-                          ...prev,
-                          searchSpeed: e.target.value as any,
-                        }))
-                      }
-                      className="w-full text-xs bg-white border border-slate-300 rounded-md px-2 py-1 font-medium text-slate-800 focus:outline-hidden cursor-pointer h-[30px]"
-                    >
-                      <option value="fast">Быстро</option>
-                      <option value="standard">Стандарт</option>
-                      <option value="deep">Глубокий</option>
-                    </select>
-                  </div>
-
-                  {/* Стратегия: 4 cols */}
-                  <div className="sm:col-span-4">
-                    <label className="block text-[10px] font-semibold text-slate-500 mb-0.5">
-                      Стратегия
-                    </label>
-                    <select
-                      value={modalSettings.optimizationGoal}
-                      onChange={(e) =>
-                        setModalSettings((prev) => ({
-                          ...prev,
-                          optimizationGoal: e.target.value as any,
-                        }))
-                      }
-                      className="w-full text-xs bg-white border border-slate-300 rounded-md px-2 py-1 font-medium text-slate-800 focus:outline-hidden cursor-pointer h-[30px]"
-                    >
-                      <option value="variants">Оптимизация вариантов</option>
-                      <option value="min_waste">Минимум отходов</option>
-                      <option value="min_bars">Минимум хлыстов</option>
-                      <option value="max_reusable">Максимум делового</option>
-                      <option value="prioritize_remnants">Приоритет остатков</option>
-                    </select>
-                  </div>
-
-                  {/* В два профиля и Контроль заполнения: 4 cols */}
-                  <div className="sm:col-span-4">
-                    <label className="block text-[10px] font-semibold text-slate-500 mb-0.5">
-                      Режим реза
-                    </label>
-                    <div className="flex items-center justify-between gap-1.5 bg-white border border-slate-300 rounded-md px-2.5 py-1 h-[30px]">
-                      <label className="flex items-center gap-1.5 cursor-pointer select-none text-slate-800 shrink-0">
-                        <input
-                          type="checkbox"
-                          checked={modalSettings.dualProfileCut}
-                          onChange={(e) =>
-                            setModalSettings((prev) => ({
-                              ...prev,
-                              dualProfileCut: e.target.checked,
-                            }))
-                          }
-                          className="w-3.5 h-3.5 rounded text-blue-600 focus:ring-blue-500 cursor-pointer"
-                        />
-                        <span className="text-[11px] font-semibold whitespace-nowrap">2 проф.</span>
-                      </label>
-
-                      <div className="w-px h-3.5 bg-slate-300 mx-0.5 shrink-0" />
-
-                      <div className={`flex items-center gap-1.5 transition-opacity duration-150 ${modalSettings.dualProfileCut ? 'opacity-100' : 'opacity-40 pointer-events-none'}`}>
-                        <label className="flex items-center gap-1 cursor-pointer select-none text-slate-800 shrink-0">
-                          <input
-                            type="checkbox"
-                            disabled={!modalSettings.dualProfileCut}
-                            checked={modalSettings.dualProfileCut && (modalSettings.fillControlEnabled ?? false)}
-                            onChange={(e) =>
-                              setModalSettings((prev) => ({
-                                ...prev,
-                                fillControlEnabled: e.target.checked,
-                              }))
-                            }
-                            className="w-3 h-3 rounded text-blue-600 focus:ring-blue-500 cursor-pointer disabled:cursor-not-allowed"
-                          />
-                          <span className="text-[10px] font-semibold text-slate-800 whitespace-nowrap">Контроль</span>
-                        </label>
-
-                        <div className="flex items-center shrink-0">
-                          <input
-                            type="number"
-                            min="1"
-                            max="99"
-                            disabled={!modalSettings.dualProfileCut || !modalSettings.fillControlEnabled}
-                            value={modalSettings.fillControlThreshold ?? 50}
-                            onChange={(e) => {
-                              const val = parseInt(e.target.value, 10);
-                              const clamped = isNaN(val) ? 50 : Math.min(99, Math.max(1, val));
-                              setModalSettings((prev) => ({
-                                ...prev,
-                                fillControlThreshold: clamped,
-                              }));
-                            }}
-                            className="w-7 text-[11px] font-mono font-bold text-blue-700 px-0.5 py-0 border border-slate-300 rounded bg-white text-right focus:outline-hidden disabled:bg-slate-100 disabled:text-slate-400"
-                          />
-                          <span className="text-[10px] text-blue-700 font-mono ml-0.5">%</span>
-                        </div>
-
-                        <div
-                          className="cursor-help text-slate-400 hover:text-blue-600 transition-colors shrink-0"
-                          title="Контроль заполнения: если в крайней паре заготовок (в карте не более двух заготовок) КИМ без учета делового отхода ниже указанного значения (по умолчанию 50%), алгоритм автоматически перераскладывает эту карту без режима «В 2 профиля» со стратегией «Минимум отходов» для снижения расхода материала."
-                        >
-                          <HelpCircle className="w-3.5 h-3.5" />
-                        </div>
-                      </div>
-                    </div>
-                  </div>
-
-                  {/* Деловой порог: 2 cols, ограничено 4 символами */}
-                  <div className="sm:col-span-2">
-                    <label className="block text-[10px] font-semibold text-slate-500 mb-0.5">
-                      Деловой (мм)
-                    </label>
-                    <input
-                      type="text"
-                      maxLength={4}
-                      value={modalSettings.reusableRemnantMin || ''}
-                      onChange={(e) => {
-                        const clean = e.target.value.replace(/[^0-9]/g, '').slice(0, 4);
-                        setModalSettings((prev) => ({
-                          ...prev,
-                          reusableRemnantMin: clean === '' ? 0 : parseInt(clean, 10),
-                        }));
-                      }}
-                      placeholder="0"
-                      className="w-full text-xs font-mono font-bold text-amber-700 bg-white border border-slate-300 rounded-md px-2 py-1 text-right focus:outline-hidden h-[30px]"
-                    />
-                  </div>
-                </div>
+                <button
+                  type="button"
+                  onClick={handleRecalculate}
+                  disabled={isRecalculating}
+                  className="flex items-center gap-1.5 px-3 py-1.5 text-xs font-bold text-white bg-blue-600 hover:bg-blue-500 disabled:opacity-50 rounded-lg shadow-2xs transition-colors cursor-pointer shrink-0 ml-auto"
+                >
+                  <RefreshCw className={`w-3.5 h-3.5 ${isRecalculating ? 'animate-spin' : ''}`} />
+                  <span>Пересчитать вариант</span>
+                </button>
               </div>
 
               {/* Sub-tab navigation */}
@@ -1192,15 +1063,6 @@ export const CalculationProgressModal: React.FC<CalculationProgressModalProps> =
                                 </div>
                               </th>
 
-                              <th
-                                onClick={() => handleSortToggle('reusableMin')}
-                                className="py-2 px-2.5 cursor-pointer hover:bg-slate-200 transition-colors group whitespace-nowrap"
-                              >
-                                <div className="flex items-center gap-1">
-                                  <span>Деловой (мм)</span>
-                                  {renderSortIndicator('reusableMin')}
-                                </div>
-                              </th>
 
                               <th
                                 onClick={() => handleSortToggle('kim')}
@@ -1346,16 +1208,6 @@ export const CalculationProgressModal: React.FC<CalculationProgressModalProps> =
                                       )}
                                     </td>
 
-                                    {/* Деловой отход (порог) */}
-                                    <td className="py-2 px-2.5 text-[11px] whitespace-nowrap font-mono">
-                                      {r.settings.reusableRemnantMin > 0 ? (
-                                        <span className="text-amber-800 font-semibold">
-                                          {r.settings.reusableRemnantMin} мм
-                                        </span>
-                                      ) : (
-                                        <span className="text-slate-400 font-normal">0 мм</span>
-                                      )}
-                                    </td>
 
                                     {/* КИМ */}
                                     <td className={`py-2 px-2.5 text-right font-mono whitespace-nowrap ${kimTheme.tableText}`}>

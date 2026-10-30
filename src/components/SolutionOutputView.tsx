@@ -8,9 +8,6 @@ import {
   Printer,
   FileSpreadsheet,
   Layers,
-  Sliders,
-  Check,
-  RefreshCw,
   ChevronDown,
   ChevronUp,
   HelpCircle,
@@ -36,17 +33,18 @@ export const SolutionOutputView: React.FC<SolutionOutputViewProps> = ({
   onExportExcel,
   onPrint,
 }) => {
-  // Local settings for the solution view (changes apply on button click)
-  const [localSettings, setLocalSettings] = useState<AppSettings>({ ...settings });
-  // Spoiler state: settings collapsed by default as requested by user
-  const [isSettingsOpen, setIsSettingsOpen] = useState(false);
   const [isFormulaHelpOpen, setIsFormulaHelpOpen] = useState(false);
   const [highContrastMono, setHighContrastMono] = useState(false);
-  const [hasUnsavedChanges, setHasUnsavedChanges] = useState(false);
-  const [isAppliedAnimation, setIsAppliedAnimation] = useState(false);
 
-  // Point 3: Scale graphics relative to the actual max stock bar size USED in the solution!
-  // If only 6000 mm bars are used, scale is 6000 mm (100% width), not 12000 mm.
+  const handleToggleGraphics = (checked: boolean) => {
+    setSettings((prev) => ({ ...prev, showGraphics: checked }));
+  };
+
+  const handleToggleGroupSolutions = (checked: boolean) => {
+    setSettings((prev) => ({ ...prev, groupSolutions: checked }));
+  };
+
+  // Scale graphics relative to the actual max stock bar size USED in the solution
   const maxStockLength = useMemo(() => {
     if (!solution || solution.rows.length === 0) return 6000;
     return Math.max(...solution.rows.map((r) => r.barSize), 1000);
@@ -70,7 +68,7 @@ export const SolutionOutputView: React.FC<SolutionOutputViewProps> = ({
     return allUniquePieces.map((p) => p.length);
   }, [allUniquePieces]);
 
-  // Point 2: If groupSolutions is false, unroll rows so each individual bar is shown separately
+  // If groupSolutions is false, unroll rows so each individual bar is shown separately
   const displayedRows = useMemo(() => {
     if (!solution) return [];
     if (settings.groupSolutions !== false) {
@@ -92,21 +90,6 @@ export const SolutionOutputView: React.FC<SolutionOutputViewProps> = ({
     return expanded;
   }, [solution, settings.groupSolutions]);
 
-  const updateLocal = <K extends keyof AppSettings>(key: K, val: AppSettings[K]) => {
-    setLocalSettings((prev) => ({ ...prev, [key]: val }));
-    setHasUnsavedChanges(true);
-  };
-
-  const handleApply = () => {
-    setSettings(localSettings);
-    onApplySettings(localSettings);
-    setHasUnsavedChanges(false);
-    setIsAppliedAnimation(true);
-    setTimeout(() => {
-      setIsAppliedAnimation(false);
-    }, 1200);
-  };
-
   if (!solution || solution.rows.length === 0) {
     return (
       <div className="bg-white rounded-xl border border-slate-200 p-12 text-center shadow-xs">
@@ -120,280 +103,145 @@ export const SolutionOutputView: React.FC<SolutionOutputViewProps> = ({
   }
 
   return (
-    <div className="space-y-6">
-      {/* Top Action Header Bar with Settings Spoiler Toggle, Excel and Print */}
-      <div className="bg-white rounded-xl border border-slate-200 p-3.5 shadow-xs flex flex-wrap items-center justify-between gap-3">
-        <div className="flex items-center gap-3">
-          <div className="w-9 h-9 rounded-lg bg-blue-100 text-blue-700 flex items-center justify-center font-bold">
-            <Layers className="w-5 h-5" />
+    <div className="space-y-4">
+      {/* 1. ИТОГИ РАСКРОЯ - Непрокручиваемый (sticky) блок прямо под шапкой на всю ширину до правого края */}
+      <div className="sticky -top-4 sm:-top-6 lg:-top-8 z-20 bg-slate-100/95 backdrop-blur-xs pt-1 pb-2">
+        <div className="bg-slate-900 text-white rounded-xl p-4 sm:p-5 shadow-md border border-slate-800">
+          <div className="flex flex-wrap items-center justify-between gap-3 mb-3">
+            <div className="flex items-center gap-2.5">
+              <span className="text-lg font-black tracking-tight text-white uppercase">
+                Итоги раскроя
+              </span>
+              <span className="text-xs text-slate-400 font-mono">
+                Карт раскроя: <strong className="text-slate-200">{displayedRows.length}</strong>
+              </span>
+            </div>
           </div>
-          <div>
-            <h2 className="text-sm font-extrabold text-slate-900 tracking-tight">
-              Результаты оптимизации раскроя
-            </h2>
-            <p className="text-xs text-slate-500">
-              Материал: <strong className="text-slate-700">{settings.material || 'Профиль'}</strong> · Карт раскроя: <strong>{displayedRows.length}</strong>
-            </p>
+
+          {/* 4 Summary Cards strictly in requested order:
+              1. КИМ (заменил Использовано заготовок);
+              2. Суммарная длина материала;
+              3. Деловой отход;
+              4. Отход (лом) */}
+          <div className="grid grid-cols-2 lg:grid-cols-4 gap-3 text-xs">
+            {/* 1. КИМ */}
+            <div className="bg-slate-800/80 p-3 rounded-lg border border-slate-700/80">
+              <span className="text-slate-400 block text-[11px] mb-1">
+                1. КИМ:
+              </span>
+              <div className="flex items-baseline gap-2">
+                <strong className="font-mono text-xl font-black text-emerald-400">
+                  {solution.overallKIM.toFixed(2).replace('.', ',')}%
+                </strong>
+                <span className="text-[10px] text-slate-400 font-mono">
+                  ({solution.totalBarsUsed} хлыст.)
+                </span>
+              </div>
+            </div>
+
+            {/* 2. Суммарная длина материала */}
+            <div className="bg-slate-800/80 p-3 rounded-lg border border-slate-700/80">
+              <span className="text-slate-400 block text-[11px] mb-1">
+                2. Суммарная длина материала:
+              </span>
+              <strong className="font-mono text-base text-blue-400">
+                {solution.totalStockLength.toLocaleString('ru-RU')}{' '}
+                <span className="text-xs font-normal text-slate-400">мм</span>
+              </strong>
+              <span className="text-[10px] text-slate-400 block font-mono">
+                ({(solution.totalStockLength / 1000).toFixed(2)} м)
+              </span>
+            </div>
+
+            {/* 3. Деловой отход */}
+            <div className="bg-slate-800/80 p-3 rounded-lg border border-slate-700/80">
+              <span className="text-slate-400 block text-[11px] mb-1">
+                3. Деловой отход:
+              </span>
+              <strong className="font-mono text-base text-amber-400">
+                {solution.totalReusableLength.toLocaleString('ru-RU')}{' '}
+                <span className="text-xs font-normal text-slate-400">мм</span>
+              </strong>
+              <span className="text-[10px] text-slate-400 block font-mono">
+                ({(solution.totalReusableLength / 1000).toFixed(2)} м)
+              </span>
+            </div>
+
+            {/* 4. Отход (лом) */}
+            <div className="bg-slate-800/80 p-3 rounded-lg border border-slate-700/80">
+              <span className="text-slate-400 block text-[11px] mb-1">
+                4. Отход (лом):
+              </span>
+              <strong className="font-mono text-base text-rose-400">
+                {solution.totalWasteLength.toLocaleString('ru-RU')}{' '}
+                <span className="text-xs font-normal text-slate-400">мм</span>
+              </strong>
+              <span className="text-[10px] text-slate-400 block font-mono">
+                ({(solution.totalWasteLength / 1000).toFixed(2)} м)
+              </span>
+            </div>
           </div>
-        </div>
-
-        <div className="flex items-center gap-2">
-          {/* Spoiler toggle button */}
-          <button
-            onClick={() => setIsSettingsOpen(!isSettingsOpen)}
-            className={`flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold rounded-lg border transition-colors cursor-pointer ${
-              isSettingsOpen
-                ? 'bg-blue-50 text-blue-700 border-blue-300'
-                : 'bg-white text-slate-700 hover:bg-slate-50 border-slate-300'
-            }`}
-          >
-            <Sliders className="w-3.5 h-3.5 text-blue-600" />
-            <span>Параметры и настройки</span>
-            {isSettingsOpen ? (
-              <ChevronUp className="w-3.5 h-3.5 text-slate-500" />
-            ) : (
-              <ChevronDown className="w-3.5 h-3.5 text-slate-500" />
-            )}
-          </button>
-
-          <button
-            onClick={onExportExcel}
-            className="flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold text-emerald-800 bg-emerald-50 hover:bg-emerald-100 border border-emerald-300 rounded-lg transition-colors cursor-pointer"
-          >
-            <FileSpreadsheet className="w-3.5 h-3.5 text-emerald-600" />
-            <span>Excel (.xlsx)</span>
-          </button>
-
-          <button
-            onClick={onPrint}
-            className="flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold text-slate-800 bg-white hover:bg-slate-100 border border-slate-300 rounded-lg transition-colors cursor-pointer"
-          >
-            <Printer className="w-3.5 h-3.5 text-slate-600" />
-            <span>Печать</span>
-          </button>
         </div>
       </div>
 
-      {/* 1. Collapsible Settings Spoiler (Requirement: "Раздел настроек на странице раскроя убрать под спойлер") */}
-      {isSettingsOpen && (
-        <div className="bg-white rounded-xl border border-blue-200 p-4 shadow-sm space-y-4 animate-in fade-in duration-150">
-          <div className="flex flex-wrap items-center justify-between gap-3 border-b border-slate-100 pb-3">
-            <div className="flex items-center gap-2">
-              <Sliders className="w-4 h-4 text-blue-600" />
-              <h3 className="text-xs font-bold uppercase tracking-wider text-slate-800">
-                Параметры отображения и перерасчета
-              </h3>
-            </div>
+      {/* 2. Общий блок: Настройки отображения, легенда и пояснения - сразу за ИТОГАМИ */}
+      <div className="bg-white rounded-xl border border-slate-200 p-3.5 shadow-2xs space-y-3">
+        {/* Upper section: Настройки отображения + Кнопки действий */}
+        <div className="flex flex-wrap items-center justify-between gap-3 border-b border-slate-100 pb-2.5">
+          <div className="flex flex-wrap items-center gap-4 text-xs font-medium text-slate-700">
+            <label className="flex items-center gap-2 cursor-pointer select-none">
+              <input
+                type="checkbox"
+                checked={settings.showGraphics !== false}
+                onChange={(e) => handleToggleGraphics(e.target.checked)}
+                className="w-4 h-4 rounded text-blue-600 cursor-pointer"
+              />
+              <span className="font-semibold text-slate-800">Отображать графику</span>
+            </label>
+
+            <label className="flex items-center gap-2 cursor-pointer select-none">
+              <input
+                type="checkbox"
+                checked={settings.groupSolutions !== false}
+                onChange={(e) => handleToggleGroupSolutions(e.target.checked)}
+                className="w-4 h-4 rounded text-blue-600 cursor-pointer"
+              />
+              <span>Группировать решение</span>
+            </label>
+
+            <label className="flex items-center gap-2 cursor-pointer select-none text-slate-700">
+              <input
+                type="checkbox"
+                checked={highContrastMono}
+                onChange={(e) => setHighContrastMono(e.target.checked)}
+                className="w-4 h-4 rounded text-slate-900 cursor-pointer"
+              />
+              <span className="text-[11px] font-semibold text-slate-900">
+                Для Ч/Б печати (штриховка)
+              </span>
+            </label>
+          </div>
+
+          <div className="flex items-center gap-2">
+            <button
+              onClick={onExportExcel}
+              className="flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold text-emerald-800 bg-emerald-50 hover:bg-emerald-100 border border-emerald-300 rounded-lg transition-colors cursor-pointer"
+            >
+              <FileSpreadsheet className="w-3.5 h-3.5 text-emerald-600" />
+              <span>Excel (.xlsx)</span>
+            </button>
 
             <button
-              onClick={handleApply}
-              className={`flex items-center gap-1.5 px-4 py-2 text-xs font-bold rounded-lg transition-all shadow-xs cursor-pointer ${
-                isAppliedAnimation
-                  ? 'bg-emerald-600 text-white'
-                  : hasUnsavedChanges
-                  ? 'bg-blue-600 text-white hover:bg-blue-500 ring-2 ring-blue-300 animate-pulse'
-                  : 'bg-slate-900 text-white hover:bg-slate-800'
-              }`}
+              onClick={onPrint}
+              className="flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold text-slate-800 bg-white hover:bg-slate-100 border border-slate-300 rounded-lg transition-colors cursor-pointer"
             >
-              {isAppliedAnimation ? (
-                <>
-                  <Check className="w-3.5 h-3.5" />
-                  <span>Настройки применены!</span>
-                </>
-              ) : (
-                <>
-                  <RefreshCw className="w-3.5 h-3.5" />
-                  <span>Применить настройки</span>
-                </>
-              )}
+              <Printer className="w-3.5 h-3.5 text-slate-600" />
+              <span>Печать</span>
             </button>
           </div>
-
-          <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-4 gap-4 text-xs">
-            {/* Display Toggles */}
-            <div className="space-y-2">
-              <label className="flex items-center gap-2 cursor-pointer select-none font-medium text-slate-800">
-                <input
-                  type="checkbox"
-                  checked={localSettings.showGraphics}
-                  onChange={(e) => updateLocal('showGraphics', e.target.checked)}
-                  className="w-4 h-4 rounded text-blue-600 cursor-pointer"
-                />
-                <span className="font-semibold">Отображать графику</span>
-              </label>
-
-              <label className="flex items-center gap-2 cursor-pointer select-none font-medium text-slate-800">
-                <input
-                  type="checkbox"
-                  checked={localSettings.groupSolutions}
-                  onChange={(e) => updateLocal('groupSolutions', e.target.checked)}
-                  className="w-4 h-4 rounded text-blue-600 cursor-pointer"
-                />
-                <span>Группировать решение</span>
-              </label>
-            </div>
-
-            {/* B&W print toggle */}
-            <div className="space-y-2">
-              <label className="flex items-center gap-2 cursor-pointer select-none font-medium text-slate-700">
-                <input
-                  type="checkbox"
-                  checked={highContrastMono}
-                  onChange={(e) => setHighContrastMono(e.target.checked)}
-                  className="w-4 h-4 rounded text-slate-900 cursor-pointer"
-                />
-                <span className="text-[11px] font-semibold text-slate-900">
-                  Для Ч/Б печати (тонкая штриховка)
-                </span>
-              </label>
-            </div>
-
-            {/* Reusable Remnant Min threshold */}
-            <div>
-              <label className="block text-[10px] uppercase font-bold text-slate-500 mb-0.5">
-                Деловой остаток (мм)
-              </label>
-              <input
-                type="number"
-                min="0"
-                value={localSettings.reusableRemnantMin}
-                onChange={(e) =>
-                  updateLocal('reusableRemnantMin', parseFloat(e.target.value) || 0)
-                }
-                className="w-full text-xs font-mono font-bold text-amber-700 px-2.5 py-1.5 border border-slate-300 rounded bg-white text-right"
-              />
-            </div>
-
-            {/* Optimization Goal & Target KIM */}
-            <div>
-              <label className="block text-[10px] uppercase font-bold text-slate-500 mb-0.5">
-                Оптимизация
-              </label>
-              <select
-                value={localSettings.optimizationGoal}
-                onChange={(e) => updateLocal('optimizationGoal', e.target.value as any)}
-                className="w-full text-xs px-2.5 py-1.5 border border-slate-300 rounded bg-white font-medium cursor-pointer"
-              >
-                <option value="variants">По вариантам</option>
-                <option value="min_waste">По отходам</option>
-                <option value="min_bars">Минимум хлыстов</option>
-                <option value="max_reusable">Максимум делового остатка</option>
-                <option value="prioritize_remnants">Приоритет остатков со склада</option>
-              </select>
-
-              {localSettings.optimizationGoal === 'prioritize_remnants' && (
-                <div className="mt-2 pt-1.5 border-t border-slate-100 flex items-center justify-between gap-1">
-                  <span className="text-[10px] font-semibold text-slate-600">Целевой КИМ:</span>
-                  <div className="flex items-center w-20">
-                    <input
-                      type="number"
-                      min="1"
-                      max="99"
-                      value={localSettings.targetRemnantKIM ?? 75}
-                      onChange={(e) => {
-                        const val = parseInt(e.target.value, 10);
-                        const clamped = isNaN(val) ? 75 : Math.min(99, Math.max(1, val));
-                        updateLocal('targetRemnantKIM', clamped);
-                      }}
-                      className="w-full text-xs font-mono font-bold text-blue-700 px-1.5 py-1 border border-slate-300 rounded-l bg-white text-right"
-                    />
-                    <span className="bg-slate-100 border border-l-0 border-slate-300 px-1.5 py-1 text-[11px] text-slate-600 rounded-r font-mono">
-                      %
-                    </span>
-                  </div>
-                </div>
-              )}
-            </div>
-          </div>
-        </div>
-      )}
-
-      {/* 2. ИТОГИ РАСКРОЯ (Requirement: "ИТОГИ РАСКРОЯ вверху страницы.") */}
-      <div className="bg-slate-900 text-white rounded-xl p-5 shadow-sm border border-slate-800">
-        <div className="flex flex-wrap items-center justify-between gap-4 mb-4">
-          <div className="flex items-center gap-3">
-            <span className="text-xl font-black tracking-tight text-white uppercase">
-              Итоги раскроя
-            </span>
-            <span className="text-xs text-slate-400 font-mono">
-              Материал: <strong className="text-slate-200">{settings.material || 'Профиль'}</strong>
-            </span>
-          </div>
-
-          <div className="flex items-center gap-4">
-            <div className="text-right">
-              <span className="text-[10px] text-slate-400 uppercase block font-semibold">
-                Коэффициент использования материала (КИМ)
-              </span>
-              <span className="text-2xl font-black font-mono text-emerald-400">
-                {solution.overallKIM.toFixed(2).replace('.', ',')}%
-              </span>
-            </div>
-          </div>
         </div>
 
-        {/* 4 Summary Cards strictly in requested order:
-            1. Использовано заготовок;
-            2. Суммарная длина материала;
-            3. Деловой отход;
-            4. Отход (лом) */}
-        <div className="grid grid-cols-2 lg:grid-cols-4 gap-4 pt-4 border-t border-slate-800 text-xs">
-          {/* 1. Использовано заготовок */}
-          <div className="bg-slate-800/60 p-3 rounded-lg border border-slate-700/60">
-            <span className="text-slate-400 block text-[11px] mb-1">
-              1. Использовано заготовок:
-            </span>
-            <strong className="font-mono text-base text-slate-100">
-              {solution.totalBarsUsed} <span className="text-xs font-normal text-slate-400">шт.</span>
-            </strong>
-          </div>
-
-          {/* 2. Суммарная длина материала */}
-          <div className="bg-slate-800/60 p-3 rounded-lg border border-slate-700/60">
-            <span className="text-slate-400 block text-[11px] mb-1">
-              2. Суммарная длина материала:
-            </span>
-            <strong className="font-mono text-base text-blue-400">
-              {solution.totalStockLength.toLocaleString('ru-RU')}{' '}
-              <span className="text-xs font-normal text-slate-400">мм</span>
-            </strong>
-            <span className="text-[10px] text-slate-400 block font-mono">
-              ({(solution.totalStockLength / 1000).toFixed(2)} м)
-            </span>
-          </div>
-
-          {/* 3. Деловой отход */}
-          <div className="bg-slate-800/60 p-3 rounded-lg border border-slate-700/60">
-            <span className="text-slate-400 block text-[11px] mb-1">
-              3. Деловой отход:
-            </span>
-            <strong className="font-mono text-base text-amber-400">
-              {solution.totalReusableLength.toLocaleString('ru-RU')}{' '}
-              <span className="text-xs font-normal text-slate-400">мм</span>
-            </strong>
-            <span className="text-[10px] text-slate-400 block font-mono">
-              ({(solution.totalReusableLength / 1000).toFixed(2)} м)
-            </span>
-          </div>
-
-          {/* 4. Отход (лом) */}
-          <div className="bg-slate-800/60 p-3 rounded-lg border border-slate-700/60">
-            <span className="text-slate-400 block text-[11px] mb-1">
-              4. Отход (лом):
-            </span>
-            <strong className="font-mono text-base text-rose-400">
-              {solution.totalWasteLength.toLocaleString('ru-RU')}{' '}
-              <span className="text-xs font-normal text-slate-400">мм</span>
-            </strong>
-            <span className="text-[10px] text-slate-400 block font-mono">
-              ({(solution.totalWasteLength / 1000).toFixed(2)} м)
-            </span>
-          </div>
-        </div>
-      </div>
-
-      {/* 3. ЦВЕТА ЗАГОТОВОК (Requirement: "ЦВЕТА ЗАГОТОВОК (легенда) - под ИТОГАМИ. Расшифровка формулы делаем под спойлером, рядом с цветами заготовок.") */}
-      <div className="bg-white rounded-xl border border-slate-200 p-3.5 shadow-xs space-y-3">
+        {/* Lower section: Легенда цветов / штриховок + Сворачиваемая расшифровка формулы */}
         <div className="flex flex-wrap items-center justify-between gap-3">
           {/* B&W Hatch Pattern Legend */}
           {highContrastMono && allUniqueLengths.length > 0 && (
@@ -420,7 +268,7 @@ export const SolutionOutputView: React.FC<SolutionOutputViewProps> = ({
             </div>
           )}
 
-          {/* Color Legend (under Итоги) */}
+          {/* Color Legend */}
           {!highContrastMono && allUniquePieces.length > 0 && (
             <div className="flex flex-wrap items-center gap-2 text-xs">
               <span className="text-[11px] font-bold text-slate-700 uppercase tracking-wider">
@@ -501,14 +349,8 @@ export const SolutionOutputView: React.FC<SolutionOutputViewProps> = ({
         )}
       </div>
 
-      {/* 4. ДЕТАЛИЗИРОВАННЫЕ КАРТЫ РАСКРОЯ: ONLY 2-ROW LAYOUT */}
-      {/* Requirement: "Убираем однострочный вариант из результатов... Оставляем двухстрочный, делаем его основным."
-          "Для двухстрочного варианта ДЕЛОВОЙ и ОТХОД расположить в конце строки." */}
-      <div
-        className={`space-y-4 transition-all duration-200 ${
-          isAppliedAnimation ? 'opacity-70 scale-[0.998]' : 'opacity-100 scale-100'
-        }`}
-      >
+      {/* 3. ДЕТАЛИЗИРОВАННЫЕ КАРТЫ РАСКРОЯ: ONLY 2-ROW LAYOUT */}
+      <div className="space-y-4">
         {displayedRows.map((row) => {
           // Proportional width relative to maximum stock length from «Есть»
           const barWidthPercent = (row.barSize / maxStockLength) * 100;
@@ -693,7 +535,7 @@ export const SolutionOutputView: React.FC<SolutionOutputViewProps> = ({
               </div>
 
               {/* ROW 2: Proportional Graphic Bar across full width */}
-              {localSettings.showGraphics && (
+              {settings.showGraphics !== false && (
                 <div className="pt-1">{renderGraphicBar()}</div>
               )}
             </div>

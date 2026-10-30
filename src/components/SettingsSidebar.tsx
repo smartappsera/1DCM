@@ -103,8 +103,16 @@ export const SettingsSidebar: React.FC<SettingsSidebarProps> = ({
       <div className="flex-1 overflow-y-auto p-3.5 space-y-3.5 text-xs">
         {/* Block 1: Заказ и материал */}
         <div className="bg-slate-50/70 border border-slate-200 rounded-xl p-3 space-y-2.5">
-          <div className="text-[11px] font-bold text-slate-800 uppercase tracking-wider">
-            Заказ и материал
+          <div className="flex items-center justify-between">
+            <div className="text-[11px] font-bold text-slate-800 uppercase tracking-wider">
+              Заказ и материал
+            </div>
+            <div
+              className="cursor-help text-slate-400 hover:text-blue-600 transition-colors"
+              title={"• Номер заказа: идентификатор заказа для накладных, отчетов и бирок деталей.\n• Наименование материала: марка или тип профиля (напр. Труба 60х40х2) для ведомостей раскроя и складского учета."}
+            >
+              <HelpCircle className="w-3.5 h-3.5" />
+            </div>
           </div>
 
           <div className="space-y-2">
@@ -133,25 +141,21 @@ export const SettingsSidebar: React.FC<SettingsSidebarProps> = ({
                 className="w-full text-xs font-medium px-2.5 py-1.5 border border-slate-300 rounded-lg bg-white focus:outline-hidden focus:ring-1 focus:ring-blue-500"
               />
             </div>
-
-            {/* Example benchmark loader button */}
-            {!hasResults && onLoadBenchmarkExample && (
-              <button
-                type="button"
-                onClick={onLoadBenchmarkExample}
-                className="w-full mt-1 flex items-center justify-center gap-1.5 px-2.5 py-1.5 bg-amber-50 hover:bg-amber-100 text-amber-800 border border-amber-200 rounded-lg text-[11px] font-bold transition-colors cursor-pointer"
-              >
-                <Sparkles className="w-3.5 h-3.5 text-amber-600 shrink-0" />
-                <span>Заполнить пример</span>
-              </button>
-            )}
           </div>
         </div>
 
         {/* Block 2: Геометрия и параметры реза */}
         <div className="bg-slate-50/70 border border-slate-200 rounded-xl p-3 space-y-2.5">
-          <div className="text-[11px] font-bold text-slate-800 uppercase tracking-wider">
-            Геометрия реза
+          <div className="flex items-center justify-between">
+            <div className="text-[11px] font-bold text-slate-800 uppercase tracking-wider">
+              Геометрия реза
+            </div>
+            <div
+              className="cursor-help text-slate-400 hover:text-blue-600 transition-colors"
+              title={"• Рез (пропил): ширина режущего диска пилы (вычитается при каждом резе).\n• Кромка: длина технологической торцовки краев хлыста (0–50 мм).\n• Порог делового остатка: минимальная длина годного обрезка для возврата на склад (все что короче — лом).\n• Рез под углом 45°: учет косых резов на торцах профилей."}
+            >
+              <HelpCircle className="w-3.5 h-3.5" />
+            </div>
           </div>
 
           <div className="grid grid-cols-2 gap-2">
@@ -243,8 +247,16 @@ export const SettingsSidebar: React.FC<SettingsSidebarProps> = ({
 
         {/* Block 3: Режим раскроя (В 2 профиля + Контроль заполнения) */}
         <div className="bg-slate-50/70 border border-slate-200 rounded-xl p-3 space-y-2.5">
-          <div className="text-[11px] font-bold text-slate-800 uppercase tracking-wider">
-            Парный раскрой
+          <div className="flex items-center justify-between">
+            <div className="text-[11px] font-bold text-slate-800 uppercase tracking-wider">
+              Парный раскрой
+            </div>
+            <div
+              className="cursor-help text-slate-400 hover:text-blue-600 transition-colors"
+              title={"• Раскрой в 2 профиля: одновременный раскрой двух одинаковых хлыстов на пиле за один проход для удвоения производительности цеха.\n• Контроль заполнения: если в крайней неполной паре хлыстов КИМ падает ниже указанного порога, алгоритм автоматически раскладывает эту пару раздельно по 1 профилю со стратегией «Минимум отходов»."}
+            >
+              <HelpCircle className="w-3.5 h-3.5" />
+            </div>
           </div>
 
           <div className="space-y-2.5">
@@ -281,13 +293,6 @@ export const SettingsSidebar: React.FC<SettingsSidebarProps> = ({
                     Контроль заполнения:
                   </span>
                 </label>
-
-                <div
-                  className="cursor-help text-slate-400 hover:text-blue-600 transition-colors"
-                  title="Контроль заполнения: если в крайней паре заготовок КИМ ниже указанного порога, карта автоматически перераскладывается в 1 профиль со стратегией «Минимум отходов»."
-                >
-                  <HelpCircle className="w-3.5 h-3.5" />
-                </div>
               </div>
 
               <div className="flex items-center gap-1.5">
@@ -313,8 +318,16 @@ export const SettingsSidebar: React.FC<SettingsSidebarProps> = ({
 
         {/* Block 4: Алгоритм и стратегия */}
         <div className="bg-slate-50/70 border border-slate-200 rounded-xl p-3 space-y-2.5">
-          <div className="text-[11px] font-bold text-slate-800 uppercase tracking-wider">
-            Оптимизация и скорость
+          <div className="flex items-center justify-between">
+            <div className="text-[11px] font-bold text-slate-800 uppercase tracking-wider">
+              Оптимизация и скорость
+            </div>
+            <div
+              className="cursor-help text-slate-400 hover:text-blue-600 transition-colors"
+              title={"• Скорость расчета: «Быстро» — быстрый эвристический перебор; «Стандарт» — многопроходная оптимизация; «Глубокий» — максимальный перебор перестановок.\n• Стратегия оптимизации: «Схемы» — минимум разных карт раскроя; «Минимум отходов» — наивысший КИМ; «Минимум хлыстов» — экономия исходного проката; «Максимум делового» — получение крупных полезных обрезков; «Приоритет остатков» — первоочередной раскрой коротких складских заготовок.\n• Целевой КИМ: желаемый уровень плотности раскроя деловых обрезков."}
+            >
+              <HelpCircle className="w-3.5 h-3.5" />
+            </div>
           </div>
 
           <div className="space-y-2.5">

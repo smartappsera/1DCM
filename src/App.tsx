@@ -44,6 +44,7 @@ export default function App() {
   const [isPasteModalOpen, setIsPasteModalOpen] = useState(false);
   const [pasteTarget, setPasteTarget] = useState<'stock' | 'demand'>('demand');
   const [isProgressModalOpen, setIsProgressModalOpen] = useState(false);
+  const [calcTriggerNonce, setCalcTriggerNonce] = useState(0);
   const [lastSolvedSettings, setLastSolvedSettings] = useState<AppSettings | null>(null);
   const [savedRuns, setSavedRuns] = useState<CalculationRun[]>([]);
 
@@ -174,7 +175,8 @@ export default function App() {
   };
 
   const handleStartCalculation = () => {
-    // Open progress modal immediately with 0 delay for seamless UX
+    // Increment calc trigger nonce to notify comparison modal if already open
+    setCalcTriggerNonce((prev) => prev + 1);
     setIsProgressModalOpen(true);
   };
 
@@ -428,17 +430,6 @@ export default function App() {
                 setIsPasteModalOpen(true);
               }}
             />
-
-            {/* Prominent Calculation Action Button */}
-            <div className="flex justify-center pt-2 pb-6">
-              <button
-                onClick={handleStartCalculation}
-                className="flex items-center gap-3 px-8 py-4 text-base font-extrabold text-white bg-blue-600 hover:bg-blue-500 rounded-2xl shadow-lg hover:shadow-xl transition-all transform hover:-translate-y-0.5 active:translate-y-0 cursor-pointer"
-              >
-                <Play className="w-5 h-5 fill-current" />
-                <span>Рассчитать оптимальный раскрой</span>
-              </button>
-            </div>
           </div>
         )}
 
@@ -566,6 +557,7 @@ export default function App() {
         }}
         onGoToResults={() => handleTabChange('visualizer')}
         isSettingsOpen={isSettingsOpen}
+        calcTriggerNonce={calcTriggerNonce}
       />
 
       {/* Paste from Excel Clipboard Modal */}
