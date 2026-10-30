@@ -63,6 +63,7 @@
   /* Completely eliminate website header, navigation, tabs, and buttons in print / PDF */
   header,
   nav,
+  aside,
   .no-print,
   button,
   input,

@@ -5,7 +5,8 @@
 
 import React, { useState, useMemo } from 'react';
 import { Header } from './components/Header';
-import { SettingsHeader } from './components/SettingsHeader';
+import { SettingsSidebar } from './components/SettingsSidebar';
+import { CalculationSpoiler } from './components/CalculationSpoiler';
 import { DynamicInputBlock, DynamicRowItem } from './components/DynamicInputBlock';
 import { SolutionOutputView } from './components/SolutionOutputView';
 import { PrintReports } from './components/PrintReports';
@@ -24,6 +25,7 @@ import { Play } from 'lucide-react';
 export default function App() {
   const [activeTab, setActiveTab] = useState<'workspace' | 'visualizer' | 'reports'>('workspace');
   const [slideDirection, setSlideDirection] = useState<'left' | 'right'>('right');
+  const [isSettingsOpen, setIsSettingsOpen] = useState(true);
 
   const TAB_ORDER: Record<'workspace' | 'visualizer' | 'reports', number> = {
     workspace: 0,
@@ -345,7 +347,7 @@ export default function App() {
   };
 
   return (
-    <div className="min-h-screen bg-slate-100 flex flex-col font-sans text-slate-900 selection:bg-blue-600 selection:text-white notranslate" translate="no">
+    <div className="h-screen bg-slate-100 flex flex-col font-sans text-slate-900 selection:bg-blue-600 selection:text-white notranslate overflow-hidden" translate="no">
       {/* Top Header Navigation */}
       <Header
         activeTab={activeTab}
@@ -357,28 +359,43 @@ export default function App() {
         onLoadBenchmarkExample={handleLoadBenchmarkExample}
       />
 
-      {/* Main Container */}
-      <main className="flex-1 max-w-7xl w-full mx-auto p-4 sm:p-6 lg:p-8 space-y-6 overflow-x-hidden">
-        <div
-          key={activeTab}
-          className={`w-full ${slideDirection === 'left' ? 'animate-slide-left' : 'animate-slide-right'}`}
-        >
-        {/* Workspace Tab: ONLY 3 BLOCKS + Calculate Button */}
-        {activeTab === 'workspace' && (
-          <div className="space-y-6">
-            {/* Block 1: Parameters (SettingsHeader) */}
-            <SettingsHeader
-              settings={settings}
-              setSettings={setSettings}
-              onLoadBenchmarkExample={handleLoadBenchmarkExample}
-            />
+      {/* Main Workbench Layout: Left Persistent Sidebar + Optional Calculation Spoiler + Main Workspace */}
+      <div className="flex-1 flex overflow-hidden relative">
+        {/* Left: Full-Height Settings Sidebar (or collapsed vertical spoiler) */}
+        <SettingsSidebar
+          settings={settings}
+          setSettings={setSettings}
+          isOpen={isSettingsOpen}
+          setIsOpen={setIsSettingsOpen}
+          onCalculate={handleStartCalculation}
+          onLoadBenchmarkExample={handleLoadBenchmarkExample}
+          hasResults={Boolean(solution && solution.rows.length > 0)}
+        />
 
-            {/* Block 2: «Есть» (Склад) + «Осталось» */}
-            <DynamicInputBlock
-              title="Есть"
-              companionTitle="Осталось"
-              items={stockItems}
-              setItems={setStockItems}
+        {/* Calculation Comparison Vertical Spoiler (visible when calculations exist and panel is collapsed) */}
+        {Boolean(solution || savedRuns.length > 0) && !isProgressModalOpen && (
+          <CalculationSpoiler
+            runsCount={savedRuns.length > 0 ? savedRuns.length : (solution ? 1 : 0)}
+            activeKIM={solution?.overallKIM}
+            onOpen={() => setIsProgressModalOpen(true)}
+          />
+        )}
+
+        {/* Main Content Pane */}
+        <main className="flex-1 overflow-y-auto overflow-x-hidden p-4 sm:p-6 lg:p-8 space-y-6">
+          <div
+            key={activeTab}
+            className={`w-full max-w-7xl mx-auto ${slideDirection === 'left' ? 'animate-slide-left' : 'animate-slide-right'}`}
+          >
+            {/* Workspace Tab: ONLY Tables «Есть»/«Осталось» and «Нужно»/«Не сделано» + Calculate Button */}
+            {activeTab === 'workspace' && (
+              <div className="space-y-6">
+                {/* Block 1: «Есть» (Склад) + «Осталось» */}
+                <DynamicInputBlock
+                  title="Есть"
+                  companionTitle="Осталось"
+                  items={stockItems}
+                  setItems={setStockItems}
               companionItems={solution?.remainingWarehouseStock || []}
               usedOrPlacedColHeader="Использовано"
               remainingColHeader="Не использов."
@@ -527,10 +544,11 @@ export default function App() {
             }))}
           />
         )}
-        </div>
-      </main>
+          </div>
+        </main>
+      </div>
 
-      {/* Progress, Comparison & Parameter Tuning Modal */}
+      {/* Progress, Comparison & Parameter Tuning Modal (Docked alongside Settings Sidebar) */}
       <CalculationProgressModal
         isOpen={isProgressModalOpen}
         onClose={() => setIsProgressModalOpen(false)}
@@ -547,6 +565,7 @@ export default function App() {
           setLastSolvedSettings(newSettings);
         }}
         onGoToResults={() => handleTabChange('visualizer')}
+        isSettingsOpen={isSettingsOpen}
       />
 
       {/* Paste from Excel Clipboard Modal */}
