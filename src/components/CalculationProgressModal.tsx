@@ -424,7 +424,16 @@ export const CalculationProgressModal: React.FC<CalculationProgressModalProps> =
   };
 
   // Point 3: Цвета КИМ (98%+ зеленый, 92%-97.99% желтый, <92% красный)
-  const getKimTheme = (kim: number) => {
+  const getKimTheme = (kim: number, isDeficit?: boolean) => {
+    if (isDeficit) {
+      return {
+        cardBg: 'bg-rose-50/80 border-rose-300 text-rose-950',
+        labelColor: 'text-rose-800',
+        valueColor: 'text-rose-600',
+        subColor: 'text-rose-600',
+        tableText: 'text-rose-600 font-bold font-mono',
+      };
+    }
     if (kim >= 98) {
       return {
         cardBg: 'bg-emerald-50/80 border-emerald-300 text-emerald-950',
@@ -453,7 +462,16 @@ export const CalculationProgressModal: React.FC<CalculationProgressModalProps> =
   };
 
   // Point 4: Цвета Делового остатка (серый если 0, желтый если > 0)
-  const getRemnantTheme = (reusableMeters: number) => {
+  const getRemnantTheme = (reusableMeters: number, isDeficit?: boolean) => {
+    if (isDeficit) {
+      return {
+        cardBg: 'bg-slate-50 border-slate-200 text-slate-600',
+        labelColor: 'text-slate-500',
+        valueColor: 'text-slate-400',
+        subColor: 'text-slate-400',
+        tableText: 'text-slate-400 font-mono',
+      };
+    }
     if (reusableMeters > 0) {
       return {
         cardBg: 'bg-amber-50/80 border-amber-300 text-amber-950',
@@ -472,13 +490,26 @@ export const CalculationProgressModal: React.FC<CalculationProgressModalProps> =
     };
   };
 
-  // Feature 2: Color theme for Cards count column
-  const cardsList = useMemo(() => runs.map((r) => r.solution.rows.length), [runs]);
-  const minCards = useMemo(() => (cardsList.length > 0 ? Math.min(...cardsList) : 0), [cardsList]);
-  const maxCards = useMemo(() => (cardsList.length > 0 ? Math.max(...cardsList) : 0), [cardsList]);
+  // Runs WITHOUT material deficit (unplaced parts) - only these participate in comparative color scaling
+  const validRuns = useMemo(() => {
+    return runs.filter(
+      (r) =>
+        !r.solution.unplacedDemand ||
+        r.solution.unplacedDemand.length === 0 ||
+        r.solution.unplacedDemand.every((u) => (u.quantity || 0) === 0)
+    );
+  }, [runs]);
 
-  const getCardsTheme = (cardsCount: number) => {
-    if (runs.length <= 1 || minCards === maxCards) {
+  // Color theme for Cards count column (runs with deficit do not participate in sample)
+  const cardsList = useMemo(() => validRuns.map((r) => r.solution.rows.length), [validRuns]);
+  const minCards = useMemo(() => (cardsList.length > 0 ? Math.min(...cardsList) : null), [cardsList]);
+  const maxCards = useMemo(() => (cardsList.length > 0 ? Math.max(...cardsList) : null), [cardsList]);
+
+  const getCardsTheme = (cardsCount: number, isDeficit: boolean) => {
+    if (isDeficit) {
+      return 'text-slate-400 font-mono font-normal';
+    }
+    if (validRuns.length <= 1 || minCards === null || maxCards === null || minCards === maxCards) {
       return 'text-slate-800 font-mono font-medium';
     }
     if (cardsCount === minCards) {
@@ -490,16 +521,19 @@ export const CalculationProgressModal: React.FC<CalculationProgressModalProps> =
     return 'text-amber-700 font-bold font-mono'; // промежуточные значения - желтым
   };
 
-  // Feature 3: Color theme for Spent (Расход) column
+  // Color theme for Spent (Расход) column (runs with deficit do not participate in sample)
   const spentList = useMemo(
-    () => runs.map((r) => Number(((r.solution.totalStockLength || 0) / 1000).toFixed(2))),
-    [runs]
+    () => validRuns.map((r) => Number(((r.solution.totalStockLength || 0) / 1000).toFixed(2))),
+    [validRuns]
   );
-  const minSpent = useMemo(() => (spentList.length > 0 ? Math.min(...spentList) : 0), [spentList]);
-  const maxSpent = useMemo(() => (spentList.length > 0 ? Math.max(...spentList) : 0), [spentList]);
+  const minSpent = useMemo(() => (spentList.length > 0 ? Math.min(...spentList) : null), [spentList]);
+  const maxSpent = useMemo(() => (spentList.length > 0 ? Math.max(...spentList) : null), [spentList]);
 
-  const getSpentTheme = (spentMeters: number) => {
-    if (runs.length <= 1 || minSpent === maxSpent) {
+  const getSpentTheme = (spentMeters: number, isDeficit: boolean) => {
+    if (isDeficit) {
+      return 'text-slate-400 font-mono font-normal';
+    }
+    if (validRuns.length <= 1 || minSpent === null || maxSpent === null || minSpent === maxSpent) {
       return 'text-slate-800 font-mono font-medium';
     }
     if (spentMeters === minSpent) {
@@ -511,16 +545,19 @@ export const CalculationProgressModal: React.FC<CalculationProgressModalProps> =
     return 'text-amber-700 font-bold font-mono'; // промежуточные значения - желтым
   };
 
-  // Feature 3: Color theme for Waste (Отход) column
+  // Color theme for Waste (Отход) column (runs with deficit do not participate in sample)
   const wasteList = useMemo(
-    () => runs.map((r) => Number(((r.solution.totalWasteLength || 0) / 1000).toFixed(2))),
-    [runs]
+    () => validRuns.map((r) => Number(((r.solution.totalWasteLength || 0) / 1000).toFixed(2))),
+    [validRuns]
   );
-  const minWaste = useMemo(() => (wasteList.length > 0 ? Math.min(...wasteList) : 0), [wasteList]);
-  const maxWaste = useMemo(() => (wasteList.length > 0 ? Math.max(...wasteList) : 0), [wasteList]);
+  const minWaste = useMemo(() => (wasteList.length > 0 ? Math.min(...wasteList) : null), [wasteList]);
+  const maxWaste = useMemo(() => (wasteList.length > 0 ? Math.max(...wasteList) : null), [wasteList]);
 
-  const getWasteTheme = (wasteMeters: number) => {
-    if (runs.length <= 1 || minWaste === maxWaste) {
+  const getWasteTheme = (wasteMeters: number, isDeficit: boolean) => {
+    if (isDeficit) {
+      return 'text-slate-400 font-mono font-normal';
+    }
+    if (validRuns.length <= 1 || minWaste === null || maxWaste === null || minWaste === maxWaste) {
       return 'text-slate-500 font-mono font-medium';
     }
     if (wasteMeters === minWaste) {
@@ -732,22 +769,11 @@ export const CalculationProgressModal: React.FC<CalculationProgressModalProps> =
           ) : (
             <>
               {/* Left sidebar controller banner */}
-              <div className="bg-slate-50 border border-slate-200 rounded-xl px-3.5 py-2.5 text-xs flex flex-wrap items-center justify-between gap-3 shadow-2xs">
-                <div className="flex items-center gap-2 text-slate-700">
-                  <Sliders className="w-4 h-4 text-blue-600 shrink-0" />
-                  <span>
-                    Параметры расчета настраиваются в <strong>боковой панели слева</strong>. Измените параметры и нажмите «Рассчитать раскрой» для добавления нового варианта в сравнение.
-                  </span>
-                </div>
-                <button
-                  type="button"
-                  onClick={handleRecalculate}
-                  disabled={isRecalculating}
-                  className="flex items-center gap-1.5 px-3 py-1.5 text-xs font-bold text-white bg-blue-600 hover:bg-blue-500 disabled:opacity-50 rounded-lg shadow-2xs transition-colors cursor-pointer shrink-0 ml-auto"
-                >
-                  <RefreshCw className={`w-3.5 h-3.5 ${isRecalculating ? 'animate-spin' : ''}`} />
-                  <span>Пересчитать вариант</span>
-                </button>
+              <div className="bg-slate-50 border border-slate-200 rounded-xl px-3.5 py-2.5 text-xs flex items-center gap-2.5 text-slate-700 shadow-2xs">
+                <Sliders className="w-4 h-4 text-blue-600 shrink-0" />
+                <span>
+                  Параметры расчета настраиваются в <strong>боковой панели слева</strong>. Для расчета нового варианта нажмите кнопку «Рассчитать раскрой» в боковой панели или шапке.
+                </span>
               </div>
 
               {/* Sub-tab navigation */}
@@ -1124,10 +1150,6 @@ export const CalculationProgressModal: React.FC<CalculationProgressModalProps> =
                               filteredAndSortedRuns.map((r) => {
                                 const isActive = r.id === activeRunId;
                                 const isHighlighted = r.id === highlightedRunId;
-                                const kimTheme = getKimTheme(r.solution.overallKIM);
-                                const remnantTheme = getRemnantTheme(r.solution.totalReusableLength);
-                                const spentMeters = Number(((r.solution.totalStockLength || 0) / 1000).toFixed(2));
-                                const wasteMeters = Number(((r.solution.totalWasteLength || 0) / 1000).toFixed(2));
                                 const hasUnplaced = Boolean(
                                   r.solution.unplacedDemand &&
                                   r.solution.unplacedDemand.some((u) => u.quantity > 0)
@@ -1135,6 +1157,10 @@ export const CalculationProgressModal: React.FC<CalculationProgressModalProps> =
                                 const unplacedCount = r.solution.unplacedDemand
                                   ? r.solution.unplacedDemand.reduce((sum, u) => sum + (u.quantity || 0), 0)
                                   : 0;
+                                const kimTheme = getKimTheme(r.solution.overallKIM, hasUnplaced);
+                                const remnantTheme = getRemnantTheme(r.solution.totalReusableLength, hasUnplaced);
+                                const spentMeters = Number(((r.solution.totalStockLength || 0) / 1000).toFixed(2));
+                                const wasteMeters = Number(((r.solution.totalWasteLength || 0) / 1000).toFixed(2));
 
                                 return (
                                   <tr
@@ -1215,12 +1241,12 @@ export const CalculationProgressModal: React.FC<CalculationProgressModalProps> =
                                     </td>
 
                                     {/* Карт раскроя */}
-                                    <td className={`py-2 px-2.5 text-right whitespace-nowrap ${getCardsTheme(r.solution.rows.length)}`}>
+                                    <td className={`py-2 px-2.5 text-right whitespace-nowrap ${getCardsTheme(r.solution.rows.length, hasUnplaced)}`}>
                                       {r.solution.rows.length}
                                     </td>
 
                                     {/* Расход хлыстов (м) */}
-                                    <td className={`py-2 px-2.5 text-right whitespace-nowrap ${getSpentTheme(spentMeters)}`}>
+                                    <td className={`py-2 px-2.5 text-right whitespace-nowrap ${getSpentTheme(spentMeters, hasUnplaced)}`}>
                                       {((r.solution.totalStockLength || 0) / 1000).toFixed(1)} м
                                     </td>
 
@@ -1230,7 +1256,7 @@ export const CalculationProgressModal: React.FC<CalculationProgressModalProps> =
                                     </td>
 
                                     {/* Отход и резы (м) */}
-                                    <td className={`py-2 px-2.5 text-right whitespace-nowrap ${getWasteTheme(wasteMeters)}`}>
+                                    <td className={`py-2 px-2.5 text-right whitespace-nowrap ${getWasteTheme(wasteMeters, hasUnplaced)}`}>
                                       {(r.solution.totalWasteLength / 1000).toFixed(2)}
                                     </td>
 
