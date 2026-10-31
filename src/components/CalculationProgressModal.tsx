@@ -789,7 +789,7 @@ export const CalculationProgressModal: React.FC<CalculationProgressModalProps> =
                 >
                   <Scale className="w-3.5 h-3.5" />
                   <span>Итоги и сравнение расчетов</span>
-                  {runs.length > 1 && (
+                  {runs.length > 0 && (
                     <span className="bg-blue-100 text-blue-800 px-1.5 py-0.2 rounded-full text-[10px]">
                       {runs.length}
                     </span>
@@ -895,14 +895,16 @@ export const CalculationProgressModal: React.FC<CalculationProgressModalProps> =
                     </div>
                   )}
 
-                  {/* Comparative table if more than 1 run */}
-                  {runs.length > 1 && (
+                  {/* Comparative table: shown even when only 1 run is generated */}
+                  {runs.length > 0 && (
                     <div className="space-y-3 pt-1">
                       {/* Comparison Toolbar: Title, Filtering, Search, and Clear */}
                       <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2.5">
                         <div className="flex items-center gap-2">
                           <span className="text-xs font-bold text-slate-800">
-                            Сравнение рассчитанных вариантов ({runs.length}):
+                            {runs.length > 1
+                              ? `Сравнение рассчитанных вариантов (${runs.length}):`
+                              : `Таблица вариантов (${runs.length}):`}
                           </span>
                           <span className="text-[11px] text-slate-500 font-normal hidden md:inline">
                             Нажмите на заголовок для сортировки или на строку для выбора
@@ -910,15 +912,17 @@ export const CalculationProgressModal: React.FC<CalculationProgressModalProps> =
                         </div>
 
                         <div className="flex items-center gap-2 self-end sm:self-auto">
-                          <button
-                            type="button"
-                            onClick={handleClearRuns}
-                            title="Сбросить историю расчетов и оставить только выбранный"
-                            className="flex items-center gap-1 text-[11px] text-slate-500 hover:text-rose-600 px-2 py-1 rounded-lg hover:bg-rose-50 transition-colors cursor-pointer border border-transparent hover:border-rose-200"
-                          >
-                            <Trash2 className="w-3 h-3" />
-                            <span>Очистить историю</span>
-                          </button>
+                          {runs.length > 1 && (
+                            <button
+                              type="button"
+                              onClick={handleClearRuns}
+                              title="Сбросить историю расчетов и оставить только выбранный"
+                              className="flex items-center gap-1 text-[11px] text-slate-500 hover:text-rose-600 px-2 py-1 rounded-lg hover:bg-rose-50 transition-colors cursor-pointer border border-transparent hover:border-rose-200"
+                            >
+                              <Trash2 className="w-3 h-3" />
+                              <span>Очистить историю</span>
+                            </button>
+                          )}
                         </div>
                       </div>
 
