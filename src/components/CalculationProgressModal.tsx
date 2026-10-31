@@ -19,8 +19,21 @@ import {
   RotateCcw,
   Trash2,
   ChevronLeft,
+  Clock,
+  Timer,
+  Square,
+  Zap,
 } from 'lucide-react';
-import { FullOptimizationSolution, AppSettings } from '../types/cutting';
+import {
+  FullOptimizationSolution,
+  AppSettings,
+  CalculationProgressInfo,
+  ComplexityEstimate,
+  StockItem,
+  DemandItem,
+} from '../types/cutting';
+import { estimateCalculationComplexity } from '../utils/cuttingEngine';
+import { DynamicRowItem } from './DynamicInputBlock';
 
 export interface CalculationRun {
   id: string;
@@ -46,6 +59,8 @@ interface CalculationProgressModalProps {
   onGoToResults: () => void;
   isSettingsOpen?: boolean;
   calcTriggerNonce?: number;
+  stockItems?: DynamicRowItem[];
+  demandItems?: DynamicRowItem[];
 }
 
 export const CalculationProgressModal: React.FC<CalculationProgressModalProps> = ({
@@ -62,6 +77,8 @@ export const CalculationProgressModal: React.FC<CalculationProgressModalProps> =
   onGoToResults,
   isSettingsOpen = true,
   calcTriggerNonce,
+  stockItems,
+  demandItems,
 }) => {
   const [phase, setPhase] = useState<'calculating' | 'done'>('calculating');
   const [activeSubTab, setActiveSubTab] = useState<'summary' | 'remnants'>('summary');
@@ -71,8 +88,15 @@ export const CalculationProgressModal: React.FC<CalculationProgressModalProps> =
   const [highlightedRunId, setHighlightedRunId] = useState<string | null>(null);
   const [duplicateWarning, setDuplicateWarning] = useState<string | null>(null);
   const [isRecalculating, setIsRecalculating] = useState<boolean>(false);
-  const [progressPercent, setProgressPercent] = useState<number>(15);
+  const [progressPercent, setProgressPercent] = useState<number>(10);
   const [statusText, setStatusText] = useState<string>('Инициализация параметров...');
+
+  // Live worker execution states
+  const [progressInfo, setProgressInfo] = useState<CalculationProgressInfo | null>(null);
+  const [elapsedTimeMs, setElapsedTimeMs] = useState<number>(0);
+  const workerRef = useRef<Worker | null>(null);
+  const stopwatchIntervalRef = useRef<any>(null);
+  const latestSolutionRef = useRef<FullOptimizationSolution | null>(null);
 
   const [sortField, setSortField] = useState<
     | 'index'
@@ -93,6 +117,39 @@ export const CalculationProgressModal: React.FC<CalculationProgressModalProps> =
   const [filterStrategy, setFilterStrategy] = useState<string>('all');
   const [searchQuery, setSearchQuery] = useState<string>('');
 
+  // Pre-flight calculation complexity and volume assessment
+  const complexityEstimate = useMemo<ComplexityEstimate | null>(() => {
+    if (!demandItems || demandItems.length === 0) return null;
+    const stocks: StockItem[] = (stockItems || [])
+      .filter((s) => s.isActive !== false && s.length > 0)
+      .map((s) => ({
+        id: s.id,
+        orderIndex: s.orderIndex,
+        length: s.length,
+        quantity: s.quantity,
+        isActive: s.isActive !== false,
+        isStandard: s.isStandard || s.length === 6000 || s.length === 12000,
+        isStandardUnlimited:
+          s.isStandardUnlimited ||
+          ((s.length === 6000 || s.length === 12000) && s.quantity <= 0),
+        mark: s.mark,
+        notes: s.notes,
+      }));
+
+    const demands: DemandItem[] = (demandItems || [])
+      .filter((d) => d.length > 0 && d.quantity > 0)
+      .map((d) => ({
+        id: d.id,
+        orderIndex: d.orderIndex,
+        length: d.length,
+        quantity: d.quantity,
+        mark: d.mark,
+        notes: d.notes,
+      }));
+
+    return estimateCalculationComplexity(stocks, demands, settings);
+  }, [stockItems, demandItems, settings]);
+
   const areSettingsEqual = (a: AppSettings, b: AppSettings): boolean => {
     return (
       a.bladeWidth === b.bladeWidth &&
@@ -108,13 +165,250 @@ export const CalculationProgressModal: React.FC<CalculationProgressModalProps> =
     );
   };
 
+  const formatStopwatch = (ms: number): string => {
+    const totalSeconds = Math.floor(ms / 1000);
+    const minutes = Math.floor(totalSeconds / 60);
+    const seconds = totalSeconds % 60;
+    const tenths = Math.floor((ms % 1000) / 100);
+    const mm = minutes.toString().padStart(2, '0');
+    const ss = seconds.toString().padStart(2, '0');
+    return `${mm}:${ss}.${tenths}`;
+  };
+
+  const formatETA = (progress: CalculationProgressInfo | null, elapsedMs: number): string => {
+    if (!progress) return 'Оценка...';
+    if (progress.etaSeconds !== undefined) {
+      if (progress.etaSeconds <= 0) return 'Завершение...';
+      if (progress.etaSeconds < 2) return 'Менее 2 сек';
+      if (progress.etaSeconds < 60) return `~${progress.etaSeconds} сек`;
+      const min = Math.floor(progress.etaSeconds / 60);
+      const sec = progress.etaSeconds % 60;
+      return `~${min} мин ${sec} сек`;
+    }
+    if (progress.percent > 5) {
+      const totalEstMs = (elapsedMs / progress.percent) * 100;
+      const remainingSec = Math.max(0, Math.round((totalEstMs - elapsedMs) / 1000));
+      return remainingSec <= 0 ? 'Завершение...' : `~${remainingSec} сек`;
+    }
+    return 'Оценка...';
+  };
+
+  // Cleanup on unmount
+  useEffect(() => {
+    return () => {
+      if (workerRef.current) {
+        workerRef.current.terminate();
+        workerRef.current = null;
+      }
+      if (stopwatchIntervalRef.current) {
+        clearInterval(stopwatchIntervalRef.current);
+        stopwatchIntervalRef.current = null;
+      }
+    };
+  }, []);
+
+  /**
+   * High-performance worker-based calculation runner with live telemetry
+   */
+  const startOptimizationRun = (
+    settingsToRun: AppSettings,
+    existingRunsList: CalculationRun[],
+    onFinished?: (sol: FullOptimizationSolution) => void
+  ) => {
+    setPhase('calculating');
+    setProgressPercent(10);
+    setStatusText('Инициализация параметров и подготовка заготовок...');
+    setElapsedTimeMs(0);
+    setProgressInfo(null);
+    latestSolutionRef.current = null;
+
+    if (workerRef.current) {
+      workerRef.current.terminate();
+      workerRef.current = null;
+    }
+    if (stopwatchIntervalRef.current) {
+      clearInterval(stopwatchIntervalRef.current);
+      stopwatchIntervalRef.current = null;
+    }
+
+    const startPerfTime = performance.now();
+    stopwatchIntervalRef.current = setInterval(() => {
+      setElapsedTimeMs(performance.now() - startPerfTime);
+    }, 40);
+
+    const finishRun = (sol: FullOptimizationSolution) => {
+      if (stopwatchIntervalRef.current) {
+        clearInterval(stopwatchIntervalRef.current);
+        stopwatchIntervalRef.current = null;
+      }
+      if (workerRef.current) {
+        workerRef.current.terminate();
+        workerRef.current = null;
+      }
+
+      const nextIndex = existingRunsList.length + 1;
+      const newRun: CalculationRun = {
+        id: `run_${Date.now()}_${nextIndex}`,
+        index: nextIndex,
+        title: `Расчет #${nextIndex}`,
+        timestamp: Date.now(),
+        settings: { ...settingsToRun },
+        solution: sol,
+        inputSignature,
+      };
+
+      const updated = [...existingRunsList, newRun];
+      setRuns(updated);
+      setActiveRunId(newRun.id);
+      if (onSaveRuns) onSaveRuns(updated);
+      if (onApplySolutionAndSettings) onApplySolutionAndSettings(sol, settingsToRun);
+      setProgressPercent(100);
+      setStatusText('Расчет успешно выполнен!');
+      setPhase('done');
+      setIsRecalculating(false);
+      if (onFinished) onFinished(sol);
+    };
+
+    // Prepare Stock & Demand items for Worker
+    const stocks: StockItem[] = (stockItems || [])
+      .filter((s) => s.isActive !== false && s.length > 0)
+      .map((s) => ({
+        id: s.id,
+        orderIndex: s.orderIndex,
+        length: s.length,
+        quantity: s.quantity,
+        isActive: s.isActive !== false,
+        isStandard: s.isStandard || s.length === 6000 || s.length === 12000,
+        isStandardUnlimited:
+          s.isStandardUnlimited ||
+          ((s.length === 6000 || s.length === 12000) && s.quantity <= 0),
+        mark: s.mark,
+        notes: s.notes,
+      }));
+
+    const demands: DemandItem[] = (demandItems || [])
+      .filter((d) => d.length > 0 && d.quantity > 0)
+      .map((d) => ({
+        id: d.id,
+        orderIndex: d.orderIndex,
+        length: d.length,
+        quantity: d.quantity,
+        mark: d.mark,
+        notes: d.notes,
+      }));
+
+    try {
+      const worker = new Worker(new URL('../workers/cuttingWorker.ts', import.meta.url), {
+        type: 'module',
+      });
+      workerRef.current = worker;
+
+      worker.onmessage = (e: MessageEvent<any>) => {
+        const { type, payload } = e.data;
+        if (type === 'PROGRESS') {
+          setProgressInfo(payload);
+          setProgressPercent(payload.percent);
+          setStatusText(payload.stageName);
+        } else if (type === 'DONE') {
+          latestSolutionRef.current = payload;
+          finishRun(payload);
+        } else if (type === 'ERROR') {
+          console.error('Worker returned error:', payload);
+          // Fallback to sync
+          const sol = onExecuteCalculation(settingsToRun);
+          finishRun(sol);
+        }
+      };
+
+      worker.onerror = (err) => {
+        console.warn('Worker runtime error, falling back to sync:', err);
+        const sol = onExecuteCalculation(settingsToRun);
+        finishRun(sol);
+      };
+
+      worker.postMessage({
+        type: 'START',
+        payload: {
+          stockInput: stocks,
+          demandInput: demands,
+          settings: settingsToRun,
+        },
+      });
+    } catch (err) {
+      console.warn('Worker spawn error, using synchronous execution:', err);
+      setTimeout(() => {
+        try {
+          const sol = onExecuteCalculation(settingsToRun);
+          finishRun(sol);
+        } catch (e) {
+          console.error('Calculation execution error:', e);
+          setPhase('done');
+          setIsRecalculating(false);
+        }
+      }, 50);
+    }
+  };
+
+  /**
+   * Stop & apply best result found so far
+   */
+  const handleStopAndApply = () => {
+    if (workerRef.current) {
+      workerRef.current.postMessage({ type: 'ABORT' });
+      setTimeout(() => {
+        if (phase === 'calculating') {
+          if (workerRef.current) {
+            workerRef.current.terminate();
+            workerRef.current = null;
+          }
+          if (stopwatchIntervalRef.current) {
+            clearInterval(stopwatchIntervalRef.current);
+            stopwatchIntervalRef.current = null;
+          }
+
+          const solToApply = latestSolutionRef.current || onExecuteCalculation({ ...modalSettings, searchSpeed: 'fast' });
+          const nextIdx = runs.length + 1;
+          const newRun: CalculationRun = {
+            id: `run_${Date.now()}_${nextIdx}`,
+            index: nextIdx,
+            title: `Расчет #${nextIdx} (Остановлен)`,
+            timestamp: Date.now(),
+            settings: { ...modalSettings },
+            solution: solToApply,
+            inputSignature,
+          };
+          const updated = [...runs, newRun];
+          setRuns(updated);
+          setActiveRunId(newRun.id);
+          if (onSaveRuns) onSaveRuns(updated);
+          if (onApplySolutionAndSettings) onApplySolutionAndSettings(solToApply, modalSettings);
+          setProgressPercent(100);
+          setStatusText('Расчет прерван пользователем и применен текущий результат');
+          setPhase('done');
+          setIsRecalculating(false);
+        }
+      }, 250);
+    } else {
+      setPhase('done');
+      setIsRecalculating(false);
+    }
+  };
+
   // Reset or run initial calculation on open, preserving prior results when settings and input conditions match
   useEffect(() => {
     if (!isOpen) {
       setPhase('calculating');
-      setProgressPercent(15);
+      setProgressPercent(10);
       setHighlightedRunId(null);
       setDuplicateWarning(null);
+      if (workerRef.current) {
+        workerRef.current.terminate();
+        workerRef.current = null;
+      }
+      if (stopwatchIntervalRef.current) {
+        clearInterval(stopwatchIntervalRef.current);
+        stopwatchIntervalRef.current = null;
+      }
       return;
     }
 
@@ -156,81 +450,13 @@ export const CalculationProgressModal: React.FC<CalculationProgressModalProps> =
         return;
       }
 
-      // User modified settings or changed input conditions (e.g. stocks / demands) and started a new calculation!
-      // Keep previous runs in the comparison table and add the new calculation as the next row!
-      setPhase('calculating');
-      setProgressPercent(40);
-      setStatusText('Расчет нового варианта и сравнение с предыдущим...');
-
-      const timer = setTimeout(() => {
-        try {
-          const newSol = onExecuteCalculation(settings);
-          const nextIndex = existingRuns.length + 1;
-          const newRun: CalculationRun = {
-            id: `run_${Date.now()}_${nextIndex}`,
-            index: nextIndex,
-            title: `Расчет #${nextIndex}`,
-            timestamp: Date.now(),
-            settings: { ...settings },
-            solution: newSol,
-            inputSignature,
-          };
-          const updated = [...existingRuns, newRun];
-          setRuns(updated);
-          setActiveRunId(newRun.id);
-          if (onSaveRuns) onSaveRuns(updated);
-          if (onApplySolutionAndSettings) onApplySolutionAndSettings(newSol, settings);
-          setProgressPercent(100);
-          setStatusText('Расчет успешно выполнен!');
-          setPhase('done');
-        } catch (err) {
-          console.error('Calculation error:', err);
-          setPhase('done');
-        }
-      }, 150);
-
-      return () => clearTimeout(timer);
+      // User modified settings or changed input conditions -> run optimization and append run to comparison table
+      startOptimizationRun(settings, existingRuns);
+      return;
     }
 
     // No previous runs or solution exist at all (first calculation ever):
-    setPhase('calculating');
-    setProgressPercent(20);
-    setStatusText('Инициализация списков заготовок и склада...');
-
-    const timer1 = setTimeout(() => {
-      setProgressPercent(60);
-      setStatusText('Динамическое программирование рюкзака и перебор перестановок...');
-    }, 80);
-
-    const timer2 = setTimeout(() => {
-      try {
-        const initialSol = onExecuteCalculation(settings);
-        const firstRun: CalculationRun = {
-          id: `run_${Date.now()}_1`,
-          index: 1,
-          title: 'Расчет #1',
-          timestamp: Date.now(),
-          settings: { ...settings },
-          solution: initialSol,
-          inputSignature,
-        };
-        setRuns([firstRun]);
-        setActiveRunId(firstRun.id);
-        if (onSaveRuns) onSaveRuns([firstRun]);
-        if (onApplySolutionAndSettings) onApplySolutionAndSettings(initialSol, settings);
-        setProgressPercent(100);
-        setStatusText('Расчет успешно выполнен!');
-        setPhase('done');
-      } catch (err) {
-        console.error('Calculation error:', err);
-        setPhase('done');
-      }
-    }, 180);
-
-    return () => {
-      clearTimeout(timer1);
-      clearTimeout(timer2);
-    };
+    startOptimizationRun(settings, []);
   }, [isOpen, inputSignature]);
 
   // Active run and solution
@@ -276,34 +502,7 @@ export const CalculationProgressModal: React.FC<CalculationProgressModalProps> =
     // Execute recalculation (new run added to comparison list)
     setDuplicateWarning(null);
     setIsRecalculating(true);
-    setTimeout(() => {
-      try {
-        const newSol = onExecuteCalculation(settingsToUse);
-        const nextIndex = runs.length + 1;
-        const newRun: CalculationRun = {
-          id: `run_${Date.now()}_${nextIndex}`,
-          index: nextIndex,
-          title: `Расчет #${nextIndex}`,
-          timestamp: Date.now(),
-          settings: { ...settingsToUse },
-          solution: newSol,
-          inputSignature,
-        };
-        const updatedRuns = [...runs, newRun];
-        setRuns(updatedRuns);
-        setActiveRunId(newRun.id);
-        if (onSaveRuns) {
-          onSaveRuns(updatedRuns);
-        }
-        if (onApplySolutionAndSettings) {
-          onApplySolutionAndSettings(newSol, settingsToUse);
-        }
-      } catch (err) {
-        console.error('Recalculation error:', err);
-      } finally {
-        setIsRecalculating(false);
-      }
-    }, 50);
+    startOptimizationRun(settingsToUse, runs);
   };
 
   const handleRecalculate = () => {
@@ -747,23 +946,204 @@ export const CalculationProgressModal: React.FC<CalculationProgressModalProps> =
         {/* Body */}
         <div className="flex-1 overflow-y-auto p-4 sm:p-5 space-y-4">
           {phase === 'calculating' ? (
-            <div className="space-y-4 text-center py-10">
-              <div className="relative w-14 h-14 mx-auto flex items-center justify-center">
-                <div className="w-12 h-12 border-3 border-blue-600 border-t-transparent rounded-full animate-spin" />
-              </div>
+            <div className="py-4 px-2 sm:px-4 max-w-2xl mx-auto space-y-4">
+              {/* Pre-flight complexity banner */}
+              {complexityEstimate?.isHeavy && (
+                <div className="bg-amber-50 border border-amber-200/90 rounded-xl p-3 flex items-start gap-3 text-amber-900 shadow-2xs">
+                  <Zap className="w-4 h-4 text-amber-600 shrink-0 mt-0.5" />
+                  <div className="text-xs leading-relaxed">
+                    <div className="font-bold flex items-center gap-2">
+                      <span>Обнаружен большой объем спецификации</span>
+                      <span className="bg-amber-200/90 text-amber-900 px-2 py-0.2 rounded-full text-[10px] font-mono font-bold">
+                        {complexityEstimate.totalMeters.toLocaleString('ru-RU')} м · {complexityEstimate.totalParts.toLocaleString('ru-RU')} шт.
+                      </span>
+                    </div>
+                    <p className="mt-0.5 text-amber-800 text-[11px]">
+                      {complexityEstimate.recommendation}
+                    </p>
+                  </div>
+                </div>
+              )}
 
-              <div>
-                <div className="text-xs font-bold text-slate-900">{statusText}</div>
-                <div className="text-[11px] text-slate-500 mt-1">
-                  Эвристический многопроходный перебор перестановок и оптимизация вариантов
+              {/* Live Stopwatch & ETA Dashboard Card */}
+              <div className="bg-slate-900 text-white rounded-2xl p-4 sm:p-5 shadow-lg flex flex-col sm:flex-row items-center justify-between gap-4">
+                <div className="flex items-center gap-3.5 w-full sm:w-auto">
+                  <div className="w-12 h-12 rounded-xl bg-blue-600/30 border border-blue-500/40 flex items-center justify-center text-blue-400 shrink-0">
+                    <Timer className="w-6 h-6 animate-pulse" />
+                  </div>
+                  <div>
+                    <div className="text-[10px] text-slate-400 uppercase tracking-wider font-semibold">
+                      Время расчета (Секундомер)
+                    </div>
+                    <div className="text-2xl sm:text-3xl font-mono font-extrabold text-blue-400 tracking-tight">
+                      {formatStopwatch(elapsedTimeMs)}
+                    </div>
+                  </div>
+                </div>
+
+                <div className="sm:text-right flex sm:flex-col items-center sm:items-end justify-between w-full sm:w-auto border-t sm:border-t-0 border-slate-800 pt-3 sm:pt-0">
+                  <div className="text-[10px] text-slate-400 uppercase tracking-wider font-semibold">
+                    Ориентировочное время (ETA)
+                  </div>
+                  <div className="text-sm sm:text-base font-bold font-mono text-emerald-400 flex items-center gap-1.5 mt-0.5">
+                    <Clock className="w-4 h-4 text-emerald-400" />
+                    <span>{formatETA(progressInfo, elapsedTimeMs)}</span>
+                  </div>
                 </div>
               </div>
 
-              <div className="w-full max-w-md mx-auto bg-slate-100 rounded-full h-2 overflow-hidden">
-                <div
-                  style={{ width: `${progressPercent}%` }}
-                  className="bg-blue-600 h-full transition-all duration-200 rounded-full"
-                />
+              {/* 3-Stage Progress Tracker */}
+              <div className="bg-white border border-slate-200 rounded-xl p-4 shadow-2xs space-y-3">
+                <div className="flex items-center justify-between text-xs">
+                  <span className="font-bold text-slate-800 flex items-center gap-2">
+                    <span className="w-2 h-2 rounded-full bg-blue-600 animate-ping inline-block" />
+                    <span>{statusText}</span>
+                  </span>
+                  <span className="font-mono font-extrabold text-blue-600">{progressPercent}%</span>
+                </div>
+
+                <div className="w-full bg-slate-100 rounded-full h-2.5 overflow-hidden">
+                  <div
+                    style={{ width: `${progressPercent}%` }}
+                    className="bg-blue-600 h-full transition-all duration-150 rounded-full shadow-inner"
+                  />
+                </div>
+
+                {/* Visual Stages */}
+                <div className="grid grid-cols-3 gap-2 pt-2 border-t border-slate-100">
+                  <div
+                    className={`p-2 rounded-lg text-center border transition-colors ${
+                      (progressInfo?.stage || 1) >= 1
+                        ? (progressInfo?.stage || 1) === 1
+                          ? 'bg-blue-50 border-blue-300 text-blue-800 ring-2 ring-blue-500/20'
+                          : 'bg-emerald-50 border-emerald-200 text-emerald-800'
+                        : 'bg-slate-50 border-slate-200 text-slate-400'
+                    }`}
+                  >
+                    <div className="text-[10px] uppercase font-bold flex items-center justify-center gap-1">
+                      {(progressInfo?.stage || 1) > 1 ? (
+                        <CheckCircle2 className="w-3 h-3 text-emerald-600" />
+                      ) : (
+                        <span className="w-3 h-3 rounded-full bg-blue-600 text-white text-[9px] flex items-center justify-center">
+                          1
+                        </span>
+                      )}
+                      <span>Этап 1</span>
+                    </div>
+                    <div className="text-[11px] font-semibold mt-0.5 truncate">Подготовка и анализ</div>
+                  </div>
+
+                  <div
+                    className={`p-2 rounded-lg text-center border transition-colors ${
+                      (progressInfo?.stage || 1) >= 2
+                        ? (progressInfo?.stage || 1) === 2
+                          ? 'bg-blue-50 border-blue-300 text-blue-800 ring-2 ring-blue-500/20'
+                          : 'bg-emerald-50 border-emerald-200 text-emerald-800'
+                        : 'bg-slate-50 border-slate-200 text-slate-400'
+                    }`}
+                  >
+                    <div className="text-[10px] uppercase font-bold flex items-center justify-center gap-1">
+                      {(progressInfo?.stage || 1) > 2 ? (
+                        <CheckCircle2 className="w-3 h-3 text-emerald-600" />
+                      ) : (
+                        <span
+                          className={`w-3 h-3 rounded-full text-white text-[9px] flex items-center justify-center ${
+                            (progressInfo?.stage || 1) === 2 ? 'bg-blue-600 animate-pulse' : 'bg-slate-300'
+                          }`}
+                        >
+                          2
+                        </span>
+                      )}
+                      <span>Этап 2</span>
+                    </div>
+                    <div className="text-[11px] font-semibold mt-0.5 truncate">Подбор схем реза</div>
+                  </div>
+
+                  <div
+                    className={`p-2 rounded-lg text-center border transition-colors ${
+                      (progressInfo?.stage || 1) >= 3
+                        ? 'bg-blue-50 border-blue-300 text-blue-800 ring-2 ring-blue-500/20'
+                        : 'bg-slate-50 border-slate-200 text-slate-400'
+                    }`}
+                  >
+                    <div className="text-[10px] uppercase font-bold flex items-center justify-center gap-1">
+                      <span
+                        className={`w-3 h-3 rounded-full text-white text-[9px] flex items-center justify-center ${
+                          (progressInfo?.stage || 1) === 3 ? 'bg-blue-600' : 'bg-slate-300'
+                        }`}
+                      >
+                        3
+                      </span>
+                      <span>Этап 3</span>
+                    </div>
+                    <div className="text-[11px] font-semibold mt-0.5 truncate">Минимизация отходов</div>
+                  </div>
+                </div>
+              </div>
+
+              {/* Live Counters Quartet */}
+              <div className="grid grid-cols-2 sm:grid-cols-3 gap-2.5">
+                <div className="bg-slate-50 border border-slate-200 rounded-xl p-3">
+                  <span className="text-[10px] uppercase text-slate-500 font-bold block">
+                    Разложено деталей
+                  </span>
+                  <div className="text-base sm:text-lg font-mono font-extrabold text-slate-900 mt-0.5">
+                    {progressInfo?.placedParts ?? 0}
+                    <span className="text-xs text-slate-500 font-normal">
+                      {' '}
+                      / {progressInfo?.totalParts || complexityEstimate?.totalParts || '—'} шт.
+                    </span>
+                  </div>
+                  <span className="text-[10px] text-slate-500 block mt-0.5">
+                    {progressInfo && progressInfo.totalParts > 0
+                      ? `${Math.round((progressInfo.placedParts / progressInfo.totalParts) * 100)}% спецификации`
+                      : 'В процессе размещения'}
+                  </span>
+                </div>
+
+                <div className="bg-slate-50 border border-slate-200 rounded-xl p-3">
+                  <span className="text-[10px] uppercase text-slate-500 font-bold block">
+                    Использовано хлыстов
+                  </span>
+                  <div className="text-base sm:text-lg font-mono font-extrabold text-slate-900 mt-0.5">
+                    {progressInfo?.usedBars ?? 0}
+                    <span className="text-xs text-slate-500 font-normal"> шт.</span>
+                  </div>
+                  <span className="text-[10px] text-slate-500 block mt-0.5">
+                    {progressInfo?.usedBars
+                      ? `~${((progressInfo.usedBars * 6000) / 1000).toFixed(0)} м металла`
+                      : 'Подбор карт'}
+                  </span>
+                </div>
+
+                <div className="bg-slate-50 border border-slate-200 rounded-xl p-3 col-span-2 sm:col-span-1">
+                  <span className="text-[10px] uppercase text-slate-500 font-bold block">
+                    Текущий КИМ
+                  </span>
+                  <div className="text-base sm:text-lg font-mono font-extrabold text-emerald-600 mt-0.5">
+                    {progressInfo?.bestKIM && progressInfo.bestKIM > 0
+                      ? `${progressInfo.bestKIM.toFixed(1)}%`
+                      : 'Оптимизация...'}
+                  </div>
+                  <span className="text-[10px] text-slate-500 block mt-0.5">
+                    Полезный выход металла
+                  </span>
+                </div>
+              </div>
+
+              {/* Stop & Apply Button */}
+              <div className="pt-2 text-center space-y-1.5">
+                <button
+                  type="button"
+                  onClick={handleStopAndApply}
+                  className="inline-flex items-center gap-2 px-5 py-2.5 bg-rose-50 hover:bg-rose-100 text-rose-700 hover:text-rose-800 border border-rose-300 rounded-xl font-bold text-xs transition-all shadow-xs hover:shadow-md cursor-pointer active:scale-95"
+                >
+                  <Square className="w-3.5 h-3.5 fill-rose-600 text-rose-600" />
+                  <span>Остановить и применить текущий результат</span>
+                </button>
+                <p className="text-[11px] text-slate-400">
+                  Вы можете прервать расчет в любой момент — будет сохранен и применен лучший найденный вариант раскроя
+                </p>
               </div>
             </div>
           ) : (

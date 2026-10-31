@@ -105,6 +105,33 @@ export interface AppSettings {
   targetRemnantKIM?: number; // Целевой КИМ делового остатка (1 - 99%), default: 75%
 }
 
+export interface CalculationProgressInfo {
+  stage: number; // 1, 2, 3
+  totalStages: number; // 3
+  stageName: string;
+  percent: number; // 0 - 100
+  placedParts: number;
+  totalParts: number;
+  usedBars: number;
+  totalBarsEstimate: number;
+  bestKIM: number;
+  elapsedMs: number;
+  etaSeconds?: number;
+}
+
+export interface ComplexityEstimate {
+  totalMeters: number;
+  totalParts: number;
+  uniqueParts: number;
+  isHeavy: boolean;
+  estimatedSeconds: {
+    fast: number;
+    standard: number;
+    deep: number;
+  };
+  recommendation: string;
+}
+
 // Backward-compatible types for legacy & reporting components
 export interface PartDemand {
   id: string;

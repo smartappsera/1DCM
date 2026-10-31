@@ -14,6 +14,8 @@ import {
   PartDemand,
   StockBar,
   CuttingParams,
+  CalculationProgressInfo,
+  ComplexityEstimate,
 } from '../types/cutting';
 
 /**
@@ -180,12 +182,66 @@ export function greedyAlgo(arr: number[], sm: number): number[] | null {
 }
 
 /**
- * Full Port of Sub Raskroy() from MyRaskroy.bas
+ * Pre-flight estimation of cutting calculation complexity and expected duration
+ */
+export function estimateCalculationComplexity(
+  stockInput: StockItem[],
+  demandInput: DemandItem[],
+  settings: AppSettings
+): ComplexityEstimate {
+  let totalDemandLength = 0;
+  let totalParts = 0;
+  const uniquePartsSet = new Set<number>();
+
+  for (const d of demandInput) {
+    if (d.length > 0 && d.quantity > 0) {
+      totalDemandLength += d.length * d.quantity;
+      totalParts += d.quantity;
+      uniquePartsSet.add(d.length);
+    }
+  }
+
+  const totalMeters = Number((totalDemandLength / 1000).toFixed(1));
+  const uniqueParts = uniquePartsSet.size;
+
+  // Heavy task criteria: > 1,000 meters or > 800 parts or > 15 unique lengths
+  const isHeavy = totalMeters > 1000 || totalParts > 800 || uniqueParts > 15;
+
+  // Estimated execution durations in seconds (with batch pattern multiplicity)
+  const estimatedSeconds = {
+    fast: isHeavy ? (totalMeters > 10000 ? 0.8 : 0.4) : 0.1,
+    standard: isHeavy ? (totalMeters > 10000 ? 2.2 : 1.1) : 0.3,
+    deep: isHeavy ? (totalMeters > 10000 ? 5.5 : 2.8) : 0.8,
+  };
+
+  let recommendation = 'Стандартная нагрузка. Все режимы оптимизации выполняются мгновенно.';
+  if (isHeavy) {
+    recommendation = `Большой объем спецификации (${totalMeters.toLocaleString('ru-RU')} м, ${totalParts.toLocaleString('ru-RU')} деталей, ${uniqueParts} типоразмеров). Включен режим пакетной оптимизации шаблонов (Multiplicity Engine). Рекомендуемый режим скорости: «Быстро» или «Обычный».`;
+  }
+
+  return {
+    totalMeters,
+    totalParts,
+    uniqueParts,
+    isHeavy,
+    estimatedSeconds,
+    recommendation,
+  };
+}
+
+export interface SolveLinearCuttingOptions {
+  onProgress?: (progress: CalculationProgressInfo) => void;
+  shouldAbort?: () => boolean;
+}
+
+/**
+ * Full Port of Sub Raskroy() from MyRaskroy.bas with Batch Multiplicity Engine
  */
 export function solveLinearCutting(
   stockInput: StockItem[],
   demandInput: DemandItem[],
-  settings: AppSettings
+  settings: AppSettings,
+  options?: SolveLinearCuttingOptions
 ): FullOptimizationSolution {
   const startTime = performance.now();
 
@@ -206,7 +262,6 @@ export function solveLinearCutting(
   }
 
   // Expand demand items: rng array in VBA
-  // rng(kRng) = s + dRez
   const rawRng: number[] = [];
   let ostSmTotal = 0;
 
@@ -222,7 +277,6 @@ export function solveLinearCutting(
   }
 
   // Expand stock bars: smArr array in VBA
-  // Standard lengths (6000, 12000) or items with isStandardUnlimited can have auto quantity
   const isPrioritizeRemnants = settings.optimizationGoal === 'prioritize_remnants';
   const targetRemnantKIM = Math.min(99, Math.max(1, settings.targetRemnantKIM ?? 75));
 
@@ -312,16 +366,28 @@ export function solveLinearCutting(
   let best: BestSolutionState | null = null;
   const varOptim = settings.optimizationGoal === 'variants' ? 2 : 1;
 
-  // Fast, responsive search loops matching VBA heuristics
-  for (let sortZ = 0; sortZ <= maxSortZ; sortZ++) {
+  // Initial stage 1 progress
+  options?.onProgress?.({
+    stage: 1,
+    totalStages: 3,
+    stageName: 'Анализ спецификации и подготовка заготовок',
+    percent: 10,
+    placedParts: 0,
+    totalParts: rawRng.length,
+    usedBars: 0,
+    totalBarsEstimate: Math.ceil(totalDemandLength / (rawSmArr[0] || 6000)),
+    bestKIM: 0,
+    elapsedMs: Math.round(performance.now() - startTime),
+  });
+
+  const totalPasses = (maxSortZ + 1) * (maxSort + 1) * (maxVar + 1);
+  let currentPass = 0;
+  let lastProgressReportTime = performance.now();
+
+  // Search loops matching VBA heuristics with high-performance batch multiplicity
+  outerLoopSearch: for (let sortZ = 0; sortZ <= maxSortZ; sortZ++) {
     let smArr: number[];
     if (isPrioritizeRemnants) {
-      // In "prioritize_remnants" strategy:
-      // Remnants MUST ALWAYS BE AT THE FRONT, before standard bars!
-      // We explore different orderings of remnants across sortZ:
-      // sortZ === 0: descending remnants (longest first: e.g. 2630 then 580)
-      // sortZ === 1: ascending remnants (shortest first: test if small remnants fit small pieces)
-      // sortZ === 2: alternating
       const sortedRemnants = sortLongArray(
         scaledRemnants,
         sortZ === 0 ? 1 : sortZ === 1 ? 2 : sortZ
@@ -336,12 +402,20 @@ export function solveLinearCutting(
       const rng = sortLongArray(scaledRng, sort);
 
       for (let v = 0; v <= maxVar; v++) {
+        currentPass++;
+
+        // Check cancellation / early abort
+        if (options?.shouldAbort?.()) {
+          break outerLoopSearch;
+        }
+
         let maxOst = 0;
         let kout = 0;
         let data = [...rng];
+        let sumData = data.reduce((a, b) => a + b, 0);
         let iSm = 0;
         let othSm = 0;
-        let ostSm = 0;
+        let ostSm = sumData;
         let curRemnantsUsed = 0;
         let curRemnantLengthUsed = 0;
 
@@ -352,13 +426,32 @@ export function solveLinearCutting(
 
         while (iSm < smArr.length && data.length > 0) {
           const sm = smArr[iSm];
-          iSm++;
+
+          // 1. Candidate Pool Truncation:
+          // A bar of length sm can never fit item val more than floor(sm / val) times!
+          // Filter candidate items so knapsack DP table stays compact (<= 200 items instead of 40,000)
+          const freqMap = new Map<number, number>();
+          for (let dIdx = 0; dIdx < data.length; dIdx++) {
+            const val = data[dIdx];
+            freqMap.set(val, (freqMap.get(val) || 0) + 1);
+          }
+
+          const candidateItems: number[] = [];
+          for (const [val, count] of freqMap.entries()) {
+            if (val <= sm) {
+              const maxCanFit = Math.floor(sm / val);
+              const take = Math.min(count, maxCanFit);
+              for (let c = 0; c < take; c++) {
+                candidateItems.push(val);
+              }
+            }
+          }
+          const sortedCandidates = sortLongArray(candidateItems, sort);
 
           let arrEl: number[] | null = null;
           if (v === 0) {
-            arrEl = greedyAlgo(data, sm);
+            arrEl = greedyAlgo(sortedCandidates, sm);
           } else {
-            const sumData = data.reduce((a, b) => a + b, 0);
             let dm = 0;
             if (v === 1) {
               const ceilDiv = Math.ceil(sumData / sm);
@@ -369,7 +462,7 @@ export function solveLinearCutting(
             } else {
               dm = Math.floor((sm * (v - 3)) / 200);
             }
-            arrEl = longSumEl(data, sm, dm);
+            arrEl = longSumEl(sortedCandidates, sm, dm);
           }
 
           if (arrEl && arrEl.length > 0) {
@@ -381,12 +474,39 @@ export function solveLinearCutting(
 
             // If remnant does not achieve target KIM threshold, preserve the remnant for future orders
             if (isPrioritizeRemnants && isRemnantBar && barKIM < targetRemnantKIM) {
+              iSm++;
               continue;
             }
 
             arrEl = sortLongArray(arrEl, 1);
             const kEl = arrEl.length;
-            const newArr = [...data];
+
+            // Count pieces in this pattern
+            const patternCounts = new Map<number, number>();
+            for (let i = 0; i < kEl; i++) {
+              const el = arrEl[i];
+              patternCounts.set(el, (patternCounts.get(el) || 0) + 1);
+            }
+
+            // 2. Multiplicity Batching:
+            // Calculate how many times this exact optimal pattern can be cut
+            // based on available piece demand counts and consecutive identical bar stock
+            let maxPatternRepeats = Infinity;
+            for (const [el, neededPerBar] of patternCounts.entries()) {
+              const available = freqMap.get(el) || 0;
+              const repeats = Math.floor(available / neededPerBar);
+              if (repeats < maxPatternRepeats) {
+                maxPatternRepeats = repeats;
+              }
+            }
+
+            // Count consecutive available bars of identical length sm
+            let identicalBarsAvailable = 0;
+            while (iSm + identicalBarsAvailable < smArr.length && smArr[iSm + identicalBarsAvailable] === sm) {
+              identicalBarsAvailable++;
+            }
+
+            const batchCount = Math.max(1, Math.min(maxPatternRepeats, identicalBarsAvailable));
 
             let t = 0;
             let k = 1;
@@ -415,30 +535,51 @@ export function solveLinearCutting(
               }
               t = el;
               s += el;
-
-              // Remove taken element
-              const removeIdx = newArr.indexOf(el);
-              if (removeIdx >= 0) newArr[removeIdx] = 0;
             }
 
             const barWaste = sm - s;
-            othSm += barWaste;
-            if (maxOst < barWaste) maxOst = barWaste;
 
-            kout++;
-            curOutSmIsh.push(sm);
-            curOutSm.push(s);
-            curOutTxt.push(txt);
-            curOutPieces.push(patternPieceLengths);
+            // Apply batch of identical bars in a single step
+            for (let b = 0; b < batchCount; b++) {
+              kout++;
+              curOutSmIsh.push(sm);
+              curOutSm.push(s);
+              curOutTxt.push(txt);
+              curOutPieces.push(patternPieceLengths);
 
-            if (isRemnantBar) {
-              curRemnantsUsed++;
-              curRemnantLengthUsed += barTotalMm;
+              if (isRemnantBar) {
+                curRemnantsUsed++;
+                curRemnantLengthUsed += barTotalMm;
+              }
             }
 
-            // Remaining elements in data
-            data = newArr.filter((x) => x > 0);
-            ostSm = data.reduce((acc, x) => acc + x, 0);
+            othSm += barWaste * batchCount;
+            if (maxOst < barWaste) maxOst = barWaste;
+
+            iSm += batchCount;
+
+            // Deduct batchCount * neededPerBar pieces from data
+            const toRemove = new Map<number, number>();
+            for (const [el, neededPerBar] of patternCounts.entries()) {
+              toRemove.set(el, neededPerBar * batchCount);
+            }
+
+            const nextData: number[] = [];
+            for (let i = 0; i < data.length; i++) {
+              const val = data[i];
+              const rem = toRemove.get(val);
+              if (rem && rem > 0) {
+                toRemove.set(val, rem - 1);
+              } else {
+                nextData.push(val);
+              }
+            }
+            data = nextData;
+            sumData -= s * batchCount;
+            ostSm = Math.max(0, sumData);
+          } else {
+            // No pieces fit into current bar, advance to next bar
+            iSm++;
           }
         }
 
@@ -489,9 +630,58 @@ export function solveLinearCutting(
             remainingData: [...data],
           };
         }
+
+        // Periodic Stage 2 progress report
+        const now = performance.now();
+        if (now - lastProgressReportTime > 50 || currentPass === totalPasses) {
+          lastProgressReportTime = now;
+          const elapsed = now - startTime;
+          const pct = Math.min(85, 10 + Math.round((currentPass / totalPasses) * 75));
+          const estTotal = pct > 0 ? (elapsed / pct) * 100 : 0;
+          const etaSec = Math.max(0, Math.round((estTotal - elapsed) / 1000));
+          const placed = rawRng.length - (best ? best.remainingData.length : data.length);
+          const currentBestKIM =
+            best && best.kout > 0
+              ? Number(
+                  (
+                    ((best.outSm.reduce((a, b) => a + b, 0) * nod) /
+                      (best.outSmIsh.reduce((a, b) => a + b, 0) * nod)) *
+                    100
+                  ).toFixed(1)
+                )
+              : 0;
+
+          options?.onProgress?.({
+            stage: 2,
+            totalStages: 3,
+            stageName: `Многопроходный подбор схем реза (проход ${currentPass}/${totalPasses})`,
+            percent: pct,
+            placedParts: Math.max(0, placed),
+            totalParts: rawRng.length,
+            usedBars: best ? best.kout : kout,
+            totalBarsEstimate: Math.ceil(totalDemandLength / (rawSmArr[0] || 6000)),
+            bestKIM: currentBestKIM,
+            elapsedMs: Math.round(elapsed),
+            etaSeconds: etaSec,
+          });
+        }
       }
     }
   }
+
+  // Stage 3 progress
+  options?.onProgress?.({
+    stage: 3,
+    totalStages: 3,
+    stageName: 'Группировка карт раскроя и балансировка отходов',
+    percent: 92,
+    placedParts: rawRng.length - (best ? best.remainingData.length : 0),
+    totalParts: rawRng.length,
+    usedBars: best ? best.kout : 0,
+    totalBarsEstimate: Math.ceil(totalDemandLength / (rawSmArr[0] || 6000)),
+    bestKIM: 0,
+    elapsedMs: Math.round(performance.now() - startTime),
+  });
 
   if (!best || best.kout === 0) {
     return {

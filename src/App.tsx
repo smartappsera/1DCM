@@ -558,6 +558,8 @@ export default function App() {
         onGoToResults={() => handleTabChange('visualizer')}
         isSettingsOpen={isSettingsOpen}
         calcTriggerNonce={calcTriggerNonce}
+        stockItems={stockItems}
+        demandItems={demandItems}
       />
 
       {/* Paste from Excel Clipboard Modal */}
