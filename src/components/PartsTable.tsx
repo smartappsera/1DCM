@@ -10,16 +10,12 @@ interface PartsTableProps {
 }
 
 const DEFAULT_COLORS = [
-  '#3B82F6', // Blue
-  '#10B981', // Emerald
-  '#F59E0B', // Amber
-  '#8B5CF6', // Purple
-  '#EC4899', // Pink
-  '#06B6D4', // Cyan
-  '#F97316', // Orange
-  '#6366F1', // Indigo
-  '#14B8A6', // Teal
-  '#84CC16', // Lime
+  '#38BDF8', '#E879F9', '#FACC15', '#4ADE80', '#F87171', '#6366F1',
+  '#FB923C', '#2DD4BF', '#A78BFA', '#F472B6', '#34D399', '#60A5FA',
+  '#FBBF24', '#C084FC', '#F43F5E', '#14B8A6', '#818CF8', '#FB7185',
+  '#A3E635', '#06B6D4', '#E11D48', '#0EA5E9', '#D946EF', '#84CC16',
+  '#F97316', '#8B5CF6', '#10B981', '#D97706', '#64748B', '#EC4899',
+  '#059669', '#7C3AED', '#B45309', '#2563EB', '#0284C7', '#475569',
 ];
 
 export const PartsTable: React.FC<PartsTableProps> = ({

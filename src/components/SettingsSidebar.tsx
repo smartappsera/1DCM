@@ -1,5 +1,6 @@
 import React from 'react';
 import { AppSettings } from '../types/cutting';
+import { getDefaultCustomConfig } from '../utils/cuttingEngine';
 import {
   Sliders,
   ChevronLeft,
@@ -101,50 +102,318 @@ export const SettingsSidebar: React.FC<SettingsSidebarProps> = ({
 
       {/* Sidebar Scrollable Body */}
       <div className="flex-1 overflow-y-auto p-3.5 space-y-3.5 text-xs">
-        {/* Block 1: Заказ и материал */}
+        {/* Block 1: Алгоритм и стратегия (ОПТИМИЗАЦИЯ И СКОРОСТЬ) */}
         <div className="bg-slate-50/70 border border-slate-200 rounded-xl p-3 space-y-2.5">
           <div className="flex items-center justify-between">
             <div className="text-[11px] font-bold text-slate-800 uppercase tracking-wider">
-              Заказ и материал
+              Оптимизация и скорость
             </div>
             <div
               className="cursor-help text-slate-400 hover:text-blue-600 transition-colors"
-              title={"• Номер заказа: идентификатор заказа для накладных, отчетов и бирок деталей.\n• Наименование материала: марка или тип профиля (напр. Труба 60х40х2) для ведомостей раскроя и складского учета."}
+              title={"• Скорость расчета: «Быстро» (10–15 сек) — быстрый эвристический перебор с локальной оптимизацией; «Стандарт» (1–2 мин) — многопроходный генератор карт; «Глубокий» (от 2 мин) — максимальный комбинаторный перебор и отжиг.\n• Стратегия оптимизации: «Схемы» — минимум разных карт раскроя; «Минимум отходов» — наивысший КИМ и минимум лома; «Минимум хлыстов» — экономия исходного проката; «Максимум делового» — получение крупных полезных обрезков; «Приоритет остатков» — первоочередной раскрой коротких складских заготовок."}
             >
               <HelpCircle className="w-3.5 h-3.5" />
             </div>
           </div>
 
-          <div className="space-y-2">
+          <div className="space-y-2.5">
             <div>
               <label className="text-[11px] font-semibold text-slate-600 block mb-1">
-                Номер заказа:
+                Скорость расчета:
               </label>
-              <input
-                type="text"
-                value={settings.orderNumber}
-                onChange={(e) => updateSetting('orderNumber', e.target.value)}
-                placeholder="ПР-01"
-                className="w-full text-xs font-medium px-2.5 py-1.5 border border-slate-300 rounded-lg bg-white focus:outline-hidden focus:ring-1 focus:ring-blue-500"
-              />
+              <select
+                value={settings.searchSpeed}
+                onChange={(e) => updateSetting('searchSpeed', e.target.value as any)}
+                className="w-full text-xs bg-white border border-slate-300 rounded-lg px-2.5 py-1.5 font-medium text-slate-800 focus:outline-hidden cursor-pointer"
+              >
+                <option value="fast">Быстро (~10-15 сек)</option>
+                <option value="standard">Стандарт (~1-2 мин)</option>
+                <option value="deep">Глубокий перебор (от 2 мин)</option>
+              </select>
             </div>
 
             <div>
               <label className="text-[11px] font-semibold text-slate-600 block mb-1">
-                Наименование материала:
+                Стратегия оптимизации:
               </label>
-              <input
-                type="text"
-                value={settings.material}
-                onChange={(e) => updateSetting('material', e.target.value)}
-                placeholder="Труба 60х40х2"
-                className="w-full text-xs font-medium px-2.5 py-1.5 border border-slate-300 rounded-lg bg-white focus:outline-hidden focus:ring-1 focus:ring-blue-500"
-              />
+              <select
+                value={settings.optimizationGoal}
+                onChange={(e) => updateSetting('optimizationGoal', e.target.value as any)}
+                className="w-full text-xs bg-white border border-slate-300 rounded-lg px-2.5 py-1.5 font-medium text-slate-800 focus:outline-hidden cursor-pointer"
+              >
+                <option value="variants">Оптимизация вариантов (схем)</option>
+                <option value="min_waste">Минимум отходов</option>
+                <option value="min_bars">Минимум хлыстов</option>
+                <option value="max_reusable">Максимум делового остатка</option>
+                <option value="prioritize_remnants">Приоритет остатков со склада</option>
+                <option value="comprehensive">Комплексный подбор (4 стратегии)</option>
+                <option value="custom">Пользовательская (настраиваемая)</option>
+              </select>
             </div>
+
+            {settings.optimizationGoal === 'max_reusable' && (
+              <div className="p-2.5 bg-amber-50/80 border border-amber-200 rounded-xl space-y-2">
+                <div className="flex items-center justify-between gap-2">
+                  <label className="text-[11px] font-semibold text-amber-950 block">
+                    Мин. размер остатка:
+                  </label>
+                  <div className="flex items-center">
+                    <input
+                      type="text"
+                      maxLength={5}
+                      value={settings.targetRemnantMinLength ?? 1500}
+                      onChange={(e) => {
+                        const clean = e.target.value.replace(/[^0-9]/g, '');
+                        updateSetting(
+                          'targetRemnantMinLength',
+                          clean === '' ? 0 : parseInt(clean, 10)
+                        );
+                      }}
+                      placeholder="1500"
+                      className="w-16 text-xs font-mono font-bold text-amber-900 px-2 py-1 border border-amber-300 rounded-l-lg bg-white text-right focus:outline-hidden focus:ring-1 focus:ring-amber-500"
+                    />
+                    <span className="bg-amber-100/80 border border-l-0 border-amber-300 px-2 py-1 text-[11px] text-amber-800 rounded-r-lg font-mono">
+                      мм
+                    </span>
+                  </div>
+                </div>
+
+                {/* Preset quick buttons */}
+                <div className="flex items-center gap-1.5 pt-0.5">
+                  <span className="text-[10px] text-amber-800/80 font-medium">Кнопки:</span>
+                  {[1000, 1500, 2000, 3000].map((preset) => (
+                    <button
+                      key={preset}
+                      type="button"
+                      onClick={() => updateSetting('targetRemnantMinLength', preset)}
+                      className={`text-[10px] font-mono px-1.5 py-0.5 rounded cursor-pointer transition-colors ${
+                        (settings.targetRemnantMinLength ?? 1500) === preset
+                          ? 'bg-amber-600 text-white font-bold shadow-2xs'
+                          : 'bg-white text-amber-800 border border-amber-200 hover:bg-amber-100'
+                      }`}
+                    >
+                      {preset}
+                    </button>
+                  ))}
+                </div>
+
+                <p className="text-[10px] text-amber-800/90 leading-tight">
+                  Алгоритм будет компоновать детали так, чтобы оставлять цельные деловые обрезки длиной не менее{' '}
+                  <strong>{settings.targetRemnantMinLength ?? 1500} мм</strong> для возврата на склад.
+                </p>
+              </div>
+            )}
+
+            {settings.optimizationGoal === 'prioritize_remnants' && (
+              <div className="flex items-center justify-between gap-2 p-2 bg-blue-50 border border-blue-200 rounded-lg">
+                <span className="text-[11px] font-semibold text-blue-900">
+                  Целевой КИМ остатка:
+                </span>
+                <div className="flex items-center gap-1">
+                  <input
+                    type="number"
+                    min="1"
+                    max="99"
+                    value={settings.targetRemnantKIM ?? 75}
+                    onChange={(e) => {
+                      const val = parseInt(e.target.value, 10);
+                      const clamped = isNaN(val) ? 75 : Math.min(99, Math.max(1, val));
+                      updateSetting('targetRemnantKIM', clamped);
+                    }}
+                    className="w-12 text-xs font-mono font-bold text-blue-700 px-1.5 py-0.5 border border-slate-300 rounded bg-white text-right"
+                  />
+                  <span className="text-[11px] text-blue-700 font-mono">%</span>
+                </div>
+              </div>
+            )}
+
+            {settings.optimizationGoal === 'custom' && (
+              <div className="p-3 bg-blue-50/80 border border-blue-200/90 rounded-xl space-y-3">
+                <div className="flex items-center justify-between border-b border-blue-200/60 pb-1.5">
+                  <div className="text-[11px] font-bold text-blue-950 flex items-center gap-1.5">
+                    <Sliders className="w-3.5 h-3.5 text-blue-600" />
+                    <span>Параметры алгоритма</span>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      updateSetting('customStrategyConfig', getDefaultCustomConfig());
+                    }}
+                    className="text-[10px] text-blue-700 hover:text-blue-900 underline cursor-pointer"
+                    title="Сбросить к значениям по умолчанию"
+                  >
+                    Сброс
+                  </button>
+                </div>
+
+                {/* 1. Множитель проходов / глубина поиска */}
+                <div className="space-y-1">
+                  <div className="flex items-center justify-between text-[11px]">
+                    <label className="font-semibold text-slate-700">Множитель проходов:</label>
+                    <span className="font-mono font-bold text-blue-700">
+                      {(settings.customStrategyConfig?.maxPassesMultiplier ?? 1.0).toFixed(2)}x
+                    </span>
+                  </div>
+                  <input
+                    type="range"
+                    min="0.25"
+                    max="3.0"
+                    step="0.25"
+                    value={settings.customStrategyConfig?.maxPassesMultiplier ?? 1.0}
+                    onChange={(e) => {
+                      const val = parseFloat(e.target.value);
+                      updateSetting('customStrategyConfig', {
+                        ...(settings.customStrategyConfig || getDefaultCustomConfig()),
+                        maxPassesMultiplier: val,
+                      });
+                    }}
+                    className="w-full accent-blue-600 cursor-pointer"
+                  />
+                  <div className="flex justify-between text-[9px] text-slate-500 font-mono">
+                    <span>0.25x</span>
+                    <span>1.0x</span>
+                    <span>3.0x</span>
+                  </div>
+                </div>
+
+                {/* 2. 2-Opt локальный поиск и раунды */}
+                <div className="space-y-2 border-t border-blue-200/60 pt-2">
+                  <label className="flex items-center justify-between cursor-pointer">
+                    <span className="text-[11px] font-semibold text-slate-700">2-Opt локальный поиск:</span>
+                    <input
+                      type="checkbox"
+                      checked={settings.customStrategyConfig?.enable2Opt ?? true}
+                      onChange={(e) => {
+                        updateSetting('customStrategyConfig', {
+                          ...(settings.customStrategyConfig || getDefaultCustomConfig()),
+                          enable2Opt: e.target.checked,
+                        });
+                      }}
+                      className="w-4 h-4 text-blue-600 rounded cursor-pointer"
+                    />
+                  </label>
+
+                  {(settings.customStrategyConfig?.enable2Opt ?? true) && (
+                    <div className="space-y-1 pl-2 border-l-2 border-blue-300">
+                      <div className="flex items-center justify-between text-[11px]">
+                        <span className="text-slate-600">Раундов 2-Opt:</span>
+                        <span className="font-mono font-bold text-blue-700">
+                          {settings.customStrategyConfig?.twoOptRounds ?? 15}
+                        </span>
+                      </div>
+                      <input
+                        type="range"
+                        min="2"
+                        max="50"
+                        step="1"
+                        value={settings.customStrategyConfig?.twoOptRounds ?? 15}
+                        onChange={(e) => {
+                          const val = parseInt(e.target.value, 10);
+                          updateSetting('customStrategyConfig', {
+                            ...(settings.customStrategyConfig || getDefaultCustomConfig()),
+                            twoOptRounds: val,
+                          });
+                        }}
+                        className="w-full accent-blue-600 cursor-pointer"
+                      />
+                    </div>
+                  )}
+                </div>
+
+                {/* 3. Tail Consolidation (Схлопывание карт) */}
+                <div className="space-y-2 border-t border-blue-200/60 pt-2">
+                  <label className="flex items-center justify-between cursor-pointer">
+                    <span className="text-[11px] font-semibold text-slate-700">Схлопывание карт хвостов:</span>
+                    <input
+                      type="checkbox"
+                      checked={settings.customStrategyConfig?.enableTailConsolidation ?? true}
+                      onChange={(e) => {
+                        updateSetting('customStrategyConfig', {
+                          ...(settings.customStrategyConfig || getDefaultCustomConfig()),
+                          enableTailConsolidation: e.target.checked,
+                        });
+                      }}
+                      className="w-4 h-4 text-blue-600 rounded cursor-pointer"
+                    />
+                  </label>
+
+                  {(settings.customStrategyConfig?.enableTailConsolidation ?? true) && (
+                    <div className="space-y-2 pl-2 border-l-2 border-blue-300">
+                      <div className="space-y-1">
+                        <div className="flex items-center justify-between text-[11px]">
+                          <span className="text-slate-600">Пул хвостов (хлыстов):</span>
+                          <span className="font-mono font-bold text-blue-700">
+                            {settings.customStrategyConfig?.tailConsolidationMaxBars ?? 10}
+                          </span>
+                        </div>
+                        <input
+                          type="range"
+                          min="2"
+                          max="20"
+                          step="1"
+                          value={settings.customStrategyConfig?.tailConsolidationMaxBars ?? 10}
+                          onChange={(e) => {
+                            const val = parseInt(e.target.value, 10);
+                            updateSetting('customStrategyConfig', {
+                              ...(settings.customStrategyConfig || getDefaultCustomConfig()),
+                              tailConsolidationMaxBars: val,
+                            });
+                          }}
+                          className="w-full accent-blue-600 cursor-pointer"
+                        />
+                      </div>
+
+                      <div className="flex items-center justify-between gap-2 text-[11px]">
+                        <span className="text-slate-600">Допуск обрезка при слиянии:</span>
+                        <div className="flex items-center">
+                          <input
+                            type="text"
+                            maxLength={4}
+                            value={settings.customStrategyConfig?.cardMergeScrapToleranceMm ?? 120}
+                            onChange={(e) => {
+                              const clean = e.target.value.replace(/[^0-9]/g, '');
+                              updateSetting('customStrategyConfig', {
+                                ...(settings.customStrategyConfig || getDefaultCustomConfig()),
+                                cardMergeScrapToleranceMm: clean === '' ? 0 : parseInt(clean, 10),
+                              });
+                            }}
+                            className="w-14 text-xs font-mono font-bold text-slate-900 px-1.5 py-0.5 border border-slate-300 rounded-l-md bg-white text-right focus:outline-hidden"
+                          />
+                          <span className="bg-slate-100 border border-l-0 border-slate-300 px-1.5 py-0.5 text-[10px] text-slate-600 rounded-r-md font-mono">
+                            мм
+                          </span>
+                        </div>
+                      </div>
+                    </div>
+                  )}
+                </div>
+
+                {/* 4. Приоритет минимального числа карт */}
+                <div className="border-t border-blue-200/60 pt-2">
+                  <label className="flex items-center justify-between cursor-pointer">
+                    <span className="text-[11px] font-semibold text-slate-700">Приоритет минимума карт:</span>
+                    <input
+                      type="checkbox"
+                      checked={settings.customStrategyConfig?.preferFewerCards ?? true}
+                      onChange={(e) => {
+                        updateSetting('customStrategyConfig', {
+                          ...(settings.customStrategyConfig || getDefaultCustomConfig()),
+                          preferFewerCards: e.target.checked,
+                        });
+                      }}
+                      className="w-4 h-4 text-blue-600 rounded cursor-pointer"
+                    />
+                  </label>
+                  <p className="text-[10px] text-slate-500 mt-1 leading-tight">
+                    Группирует одинаковые детали в единые карты для сокращения переналадок пилы.
+                  </p>
+                </div>
+              </div>
+            )}
           </div>
         </div>
 
-        {/* Block 2: Геометрия и параметры реза */}
+        {/* Block 2: Геометрия реза */}
         <div className="bg-slate-50/70 border border-slate-200 rounded-xl p-3 space-y-2.5">
           <div className="flex items-center justify-between">
             <div className="text-[11px] font-bold text-slate-800 uppercase tracking-wider">
@@ -245,15 +514,15 @@ export const SettingsSidebar: React.FC<SettingsSidebarProps> = ({
           </label>
         </div>
 
-        {/* Block 3: Режим раскроя (В 2 профиля + Контроль заполнения) */}
+        {/* Block 3: Пакетный раскрой (Пакетный рез + Контроль заполнения) */}
         <div className="bg-slate-50/70 border border-slate-200 rounded-xl p-3 space-y-2.5">
           <div className="flex items-center justify-between">
             <div className="text-[11px] font-bold text-slate-800 uppercase tracking-wider">
-              Парный раскрой
+              Пакетный раскрой
             </div>
             <div
               className="cursor-help text-slate-400 hover:text-blue-600 transition-colors"
-              title={"• Раскрой в 2 профиля: одновременный раскрой двух одинаковых хлыстов на пиле за один проход для удвоения производительности цеха.\n• Контроль заполнения: если в крайней неполной паре хлыстов КИМ падает ниже указанного порога, алгоритм автоматически раскладывает эту пару раздельно по 1 профилю со стратегией «Минимум отходов»."}
+              title={"• Пакетный рез: объединение заготовок равной длины в группы от 2 шт. с любым шагом для одновременного реза пакета заготовок за один проход пилы.\n• Контроль заполнения: если в крайней неполной пачке КИМ падает ниже указанного порога, алгоритм распускает пакет по 1 профилю со стратегией «Минимум отходов»."}
             >
               <HelpCircle className="w-3.5 h-3.5" />
             </div>
@@ -267,9 +536,14 @@ export const SettingsSidebar: React.FC<SettingsSidebarProps> = ({
                 onChange={(e) => updateSetting('dualProfileCut', e.target.checked)}
                 className="w-4 h-4 rounded text-blue-600 focus:ring-blue-500 cursor-pointer"
               />
-              <span className="text-[11px] font-semibold text-slate-900">
-                Раскрой в 2 профиля
-              </span>
+              <div>
+                <span className="text-[11px] font-bold text-slate-900 block">
+                  Пакетный рез
+                </span>
+                <span className="text-[10px] text-slate-500 block leading-tight">
+                  Группы равных заготовок от 2 шт.
+                </span>
+              </div>
             </label>
 
             {/* Контроль заполнения */}
@@ -313,78 +587,6 @@ export const SettingsSidebar: React.FC<SettingsSidebarProps> = ({
                 <span className="text-xs text-blue-700 font-mono font-bold">%</span>
               </div>
             </div>
-          </div>
-        </div>
-
-        {/* Block 4: Алгоритм и стратегия */}
-        <div className="bg-slate-50/70 border border-slate-200 rounded-xl p-3 space-y-2.5">
-          <div className="flex items-center justify-between">
-            <div className="text-[11px] font-bold text-slate-800 uppercase tracking-wider">
-              Оптимизация и скорость
-            </div>
-            <div
-              className="cursor-help text-slate-400 hover:text-blue-600 transition-colors"
-              title={"• Скорость расчета: «Быстро» — быстрый эвристический перебор; «Стандарт» — многопроходная оптимизация; «Глубокий» — максимальный перебор перестановок.\n• Стратегия оптимизации: «Схемы» — минимум разных карт раскроя; «Минимум отходов» — наивысший КИМ; «Минимум хлыстов» — экономия исходного проката; «Максимум делового» — получение крупных полезных обрезков; «Приоритет остатков» — первоочередной раскрой коротких складских заготовок.\n• Целевой КИМ: желаемый уровень плотности раскроя деловых обрезков."}
-            >
-              <HelpCircle className="w-3.5 h-3.5" />
-            </div>
-          </div>
-
-          <div className="space-y-2.5">
-            <div>
-              <label className="text-[11px] font-semibold text-slate-600 block mb-1">
-                Скорость расчета:
-              </label>
-              <select
-                value={settings.searchSpeed}
-                onChange={(e) => updateSetting('searchSpeed', e.target.value as any)}
-                className="w-full text-xs bg-white border border-slate-300 rounded-lg px-2.5 py-1.5 font-medium text-slate-800 focus:outline-hidden cursor-pointer"
-              >
-                <option value="fast">Быстро (эвристика)</option>
-                <option value="standard">Стандарт (многопроходный)</option>
-                <option value="deep">Глубокий перебор</option>
-              </select>
-            </div>
-
-            <div>
-              <label className="text-[11px] font-semibold text-slate-600 block mb-1">
-                Стратегия оптимизации:
-              </label>
-              <select
-                value={settings.optimizationGoal}
-                onChange={(e) => updateSetting('optimizationGoal', e.target.value as any)}
-                className="w-full text-xs bg-white border border-slate-300 rounded-lg px-2.5 py-1.5 font-medium text-slate-800 focus:outline-hidden cursor-pointer"
-              >
-                <option value="variants">Оптимизация вариантов (схем)</option>
-                <option value="min_waste">Минимум отходов</option>
-                <option value="min_bars">Минимум хлыстов</option>
-                <option value="max_reusable">Максимум делового остатка</option>
-                <option value="prioritize_remnants">Приоритет остатков со склада</option>
-              </select>
-            </div>
-
-            {settings.optimizationGoal === 'prioritize_remnants' && (
-              <div className="flex items-center justify-between gap-2 p-2 bg-blue-50 border border-blue-200 rounded-lg">
-                <span className="text-[11px] font-semibold text-blue-900">
-                  Целевой КИМ остатка:
-                </span>
-                <div className="flex items-center gap-1">
-                  <input
-                    type="number"
-                    min="1"
-                    max="99"
-                    value={settings.targetRemnantKIM ?? 75}
-                    onChange={(e) => {
-                      const val = parseInt(e.target.value, 10);
-                      const clamped = isNaN(val) ? 75 : Math.min(99, Math.max(1, val));
-                      updateSetting('targetRemnantKIM', clamped);
-                    }}
-                    className="w-12 text-xs font-mono font-bold text-blue-700 px-1.5 py-0.5 border border-slate-300 rounded bg-white text-right"
-                  />
-                  <span className="text-[11px] text-blue-700 font-mono">%</span>
-                </div>
-              </div>
-            )}
           </div>
         </div>
       </div>

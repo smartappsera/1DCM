@@ -19,17 +19,12 @@ export const CalculationSpoiler: React.FC<CalculationSpoilerProps> = ({
       translate="no"
       title={`Сравнение расчетов (${runsCount} вар.) — нажать для открытия`}
     >
-      <button
-        type="button"
-        onClick={(e) => {
-          e.stopPropagation();
-          onOpen();
-        }}
-        className="p-1.5 rounded-lg text-blue-700 group-hover:bg-blue-200/80 transition-colors cursor-pointer"
+      <div
+        className="p-1.5 rounded-lg text-blue-700 group-hover:bg-blue-200/80 transition-colors"
         title="Развернуть сравнение расчетов"
       >
         <ChevronRight className="w-4 h-4 group-hover:translate-x-0.5 transition-transform" />
-      </button>
+      </div>
 
       <div className="w-7 h-7 rounded-lg bg-blue-600 text-white flex items-center justify-center mt-2 shadow-xs group-hover:scale-105 transition-transform">
         <Scale className="w-3.5 h-3.5" />

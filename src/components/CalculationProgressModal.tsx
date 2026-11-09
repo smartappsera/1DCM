@@ -23,6 +23,9 @@ import {
   Timer,
   Square,
   Zap,
+  TrendingUp,
+  ExternalLink,
+  Sparkles,
 } from 'lucide-react';
 import {
   FullOptimizationSolution,
@@ -32,17 +35,28 @@ import {
   StockItem,
   DemandItem,
 } from '../types/cutting';
-import { estimateCalculationComplexity } from '../utils/cuttingEngine';
+import {
+  estimateCalculationComplexity,
+  runComprehensiveSuite,
+  solveNaiveSequentialCutting,
+  solveLinearCutting,
+  getPrimaryStandardSize,
+  ComprehensiveSuiteItem,
+  getDefaultDemandColor,
+} from '../utils/cuttingEngine';
 import { DynamicRowItem } from './DynamicInputBlock';
 
 export interface CalculationRun {
   id: string;
   index: number;
   title: string;
+  badge?: string;
   timestamp: number;
   settings: AppSettings;
   solution: FullOptimizationSolution;
   inputSignature?: string;
+  isBaseline?: boolean;
+  standardSize?: number;
 }
 
 interface CalculationProgressModalProps {
@@ -61,6 +75,7 @@ interface CalculationProgressModalProps {
   calcTriggerNonce?: number;
   stockItems?: DynamicRowItem[];
   demandItems?: DynamicRowItem[];
+  onSetDemandItems?: React.Dispatch<React.SetStateAction<DynamicRowItem[]>>;
 }
 
 export const CalculationProgressModal: React.FC<CalculationProgressModalProps> = ({
@@ -79,6 +94,7 @@ export const CalculationProgressModal: React.FC<CalculationProgressModalProps> =
   calcTriggerNonce,
   stockItems,
   demandItems,
+  onSetDemandItems,
 }) => {
   const [phase, setPhase] = useState<'calculating' | 'done'>('calculating');
   const [activeSubTab, setActiveSubTab] = useState<'summary' | 'remnants'>('summary');
@@ -98,14 +114,121 @@ export const CalculationProgressModal: React.FC<CalculationProgressModalProps> =
   const stopwatchIntervalRef = useRef<any>(null);
   const latestSolutionRef = useRef<FullOptimizationSolution | null>(null);
 
+  // Deficit modal state (Point 9)
+  const [deficitModalRun, setDeficitModalRun] = useState<CalculationRun | null>(null);
+  const [deficitStandardSize, setDeficitStandardSize] = useState<12000 | 6000 | 'both'>(12000);
+  const [deficitStrategy, setDeficitStrategy] = useState<string>('variants');
+
+  const handleRunDeficitCalculation = () => {
+    if (!deficitModalRun) return;
+    const unplaced = deficitModalRun.solution.unplacedDemand || [];
+    if (unplaced.length === 0) return;
+
+    const deficitDemands: DemandItem[] = unplaced.map((u, idx) => ({
+      id: `def_${Date.now()}_${idx}`,
+      orderIndex: idx + 1,
+      length: u.length,
+      quantity: u.quantity,
+      mark: (u as any).mark || `${idx + 1}`,
+      notes: 'Дефицит',
+    }));
+
+    const deficitStocks: StockItem[] = [];
+    if (deficitStandardSize === 12000 || deficitStandardSize === 'both') {
+      deficitStocks.push({
+        id: 's_def_12000',
+        orderIndex: 1,
+        length: 12000,
+        quantity: 0,
+        isStandard: true,
+        isStandardUnlimited: true,
+        isActive: true,
+        mark: 'Стандарт 12м',
+      });
+    }
+    if (deficitStandardSize === 6000 || deficitStandardSize === 'both') {
+      deficitStocks.push({
+        id: 's_def_6000',
+        orderIndex: 2,
+        length: 6000,
+        quantity: 0,
+        isStandard: true,
+        isStandardUnlimited: true,
+        isActive: true,
+        mark: 'Стандарт 6м',
+      });
+    }
+
+    const deficitSettings: AppSettings = {
+      ...deficitModalRun.settings,
+      optimizationGoal: deficitStrategy as any,
+    };
+
+    const sol = solveLinearCutting(deficitStocks, deficitDemands, deficitSettings);
+    const nextIdx = runs.filter((r) => !r.isBaseline && r.index > 0).length + 1;
+    const newRun: CalculationRun = {
+      id: `run_deficit_${Date.now()}_${nextIdx}`,
+      index: nextIdx,
+      title: `Раскрой дефицита (#${nextIdx})`,
+      badge: '⚠️ Дефицит закрыт',
+      timestamp: Date.now(),
+      settings: deficitSettings,
+      solution: sol,
+      inputSignature,
+    };
+
+    const updated = [...runs, newRun];
+    setRuns(updated);
+    setActiveRunId(newRun.id);
+    if (onSaveRuns) onSaveRuns(updated);
+    if (onApplySolutionAndSettings) onApplySolutionAndSettings(sol, deficitSettings);
+    setDeficitModalRun(null);
+  };
+
+  const handleTransferDeficitToDemand = () => {
+    if (!deficitModalRun) return;
+    const unplaced = deficitModalRun.solution.unplacedDemand || [];
+    if (unplaced.length === 0) return;
+
+    const newDemands: DynamicRowItem[] = unplaced.map((u, idx) => {
+      const orig = demandItems?.find((d) => d.length === u.length);
+      return {
+        id: `def_dmd_${Date.now()}_${idx}`,
+        orderIndex: idx + 1,
+        length: u.length,
+        quantity: u.quantity,
+        mark: (u as any).mark || orig?.mark || `${idx + 1}`,
+        notes: `Дефицит из ${deficitModalRun.title}`,
+        color: orig?.color || getDefaultDemandColor(idx, u.length),
+      };
+    });
+
+    const deficitData = {
+      items: newDemands,
+      material: deficitModalRun.settings.material,
+      orderNumber: `${deficitModalRun.settings.orderNumber || 'ПР'}-ДЕФИЦИТ`,
+    };
+
+    try {
+      localStorage.setItem('pending_deficit_payload', JSON.stringify(deficitData));
+      window.open(window.location.origin + window.location.pathname + '#deficit_task', '_blank');
+    } catch (e) {
+      console.warn('Popup or localStorage prevented opening new tab:', e);
+      window.open(window.location.href.split('#')[0] + '#deficit_task', '_blank');
+    }
+    setDeficitModalRun(null);
+  };
+
   const [sortField, setSortField] = useState<
     | 'index'
+    | 'standardSize'
     | 'speed'
     | 'strategy'
     | 'dualProfile'
     | 'fillControl'
     | 'reusableMin'
     | 'kim'
+    | 'netKim'
     | 'cards'
     | 'spent'
     | 'reusable'
@@ -115,6 +238,7 @@ export const CalculationProgressModal: React.FC<CalculationProgressModalProps> =
   const [sortDirection, setSortDirection] = useState<'asc' | 'desc'>('asc');
   const [filterStatus, setFilterStatus] = useState<'all' | 'complete' | 'unplaced'>('all');
   const [filterStrategy, setFilterStrategy] = useState<string>('all');
+  const [filterStandardSize, setFilterStandardSize] = useState<'all' | '12000' | '6000'>('all');
   const [searchQuery, setSearchQuery] = useState<string>('');
 
   // Pre-flight calculation complexity and volume assessment
@@ -151,18 +275,38 @@ export const CalculationProgressModal: React.FC<CalculationProgressModalProps> =
   }, [stockItems, demandItems, settings]);
 
   const areSettingsEqual = (a: AppSettings, b: AppSettings): boolean => {
-    return (
+    const basicEqual =
       a.bladeWidth === b.bladeWidth &&
       a.edgeTrim === b.edgeTrim &&
       a.reusableRemnantMin === b.reusableRemnantMin &&
+      (a.targetRemnantMinLength ?? 1500) === (b.targetRemnantMinLength ?? 1500) &&
       a.cutAngle45 === b.cutAngle45 &&
       a.dualProfileCut === b.dualProfileCut &&
       (a.fillControlEnabled ?? false) === (b.fillControlEnabled ?? false) &&
       (a.fillControlThreshold ?? 50) === (b.fillControlThreshold ?? 50) &&
       a.searchSpeed === b.searchSpeed &&
       a.optimizationGoal === b.optimizationGoal &&
-      a.targetRemnantKIM === b.targetRemnantKIM
-    );
+      a.targetRemnantKIM === b.targetRemnantKIM;
+
+    if (!basicEqual) return false;
+
+    if (a.optimizationGoal === 'custom' || b.optimizationGoal === 'custom') {
+      const cA = a.customStrategyConfig;
+      const cB = b.customStrategyConfig;
+      if (!cA && !cB) return true;
+      if (!cA || !cB) return false;
+      return (
+        cA.maxPassesMultiplier === cB.maxPassesMultiplier &&
+        cA.enable2Opt === cB.enable2Opt &&
+        cA.twoOptRounds === cB.twoOptRounds &&
+        cA.enableTailConsolidation === cB.enableTailConsolidation &&
+        cA.tailConsolidationMaxBars === cB.tailConsolidationMaxBars &&
+        cA.cardMergeScrapToleranceMm === cB.cardMergeScrapToleranceMm &&
+        cA.preferFewerCards === cB.preferFewerCards
+      );
+    }
+
+    return true;
   };
 
   const formatStopwatch = (ms: number): string => {
@@ -207,6 +351,72 @@ export const CalculationProgressModal: React.FC<CalculationProgressModalProps> =
     };
   }, []);
 
+  // Ensure Baseline Runs (Эталон-12 и Эталон-6) exist as references for 12m and 6m stocks
+  const ensureBaselines = (
+    baseRunsList: CalculationRun[],
+    stocks: StockItem[],
+    demands: DemandItem[],
+    settingsToRun: AppSettings,
+    inputSig?: string
+  ): CalculationRun[] => {
+    let updated = [...baseRunsList].filter((r) => r.id !== 'run_baseline_0');
+    const hasEta12 = updated.some(
+      (r) => r.id === 'run_baseline_12' || (r.isBaseline && r.standardSize === 12000)
+    );
+    const hasEta6 = updated.some(
+      (r) => r.id === 'run_baseline_6' || (r.isBaseline && r.standardSize === 6000)
+    );
+
+    if (!hasEta12 && demands.length > 0 && stocks.length > 0) {
+      try {
+        const sol12 = solveNaiveSequentialCutting(stocks, demands, settingsToRun, 12000);
+        const eta12: CalculationRun = {
+          id: 'run_baseline_12',
+          index: -1,
+          title: 'Эталон-12',
+          badge: '📊 12 м (Порезка подряд)',
+          timestamp: Date.now() - 2000,
+          settings: { ...settingsToRun, searchSpeed: 'fast' },
+          solution: sol12,
+          inputSignature: inputSig,
+          isBaseline: true,
+          standardSize: 12000,
+        };
+        updated.unshift(eta12);
+      } catch (e) {
+        console.warn('Failed to generate baseline Эталон-12:', e);
+      }
+    }
+
+    if (!hasEta6 && demands.length > 0 && stocks.length > 0) {
+      try {
+        const sol6 = solveNaiveSequentialCutting(stocks, demands, settingsToRun, 6000);
+        const eta6: CalculationRun = {
+          id: 'run_baseline_6',
+          index: 0,
+          title: 'Эталон-6',
+          badge: '📊 6 м (Порезка подряд)',
+          timestamp: Date.now() - 1000,
+          settings: { ...settingsToRun, searchSpeed: 'fast' },
+          solution: sol6,
+          inputSignature: inputSig,
+          isBaseline: true,
+          standardSize: 6000,
+        };
+        const idx12 = updated.findIndex((r) => r.id === 'run_baseline_12');
+        if (idx12 !== -1) {
+          updated.splice(idx12 + 1, 0, eta6);
+        } else {
+          updated.unshift(eta6);
+        }
+      } catch (e) {
+        console.warn('Failed to generate baseline Эталон-6:', e);
+      }
+    }
+
+    return updated;
+  };
+
   /**
    * High-performance worker-based calculation runner with live telemetry
    */
@@ -236,40 +446,7 @@ export const CalculationProgressModal: React.FC<CalculationProgressModalProps> =
       setElapsedTimeMs(performance.now() - startPerfTime);
     }, 40);
 
-    const finishRun = (sol: FullOptimizationSolution) => {
-      if (stopwatchIntervalRef.current) {
-        clearInterval(stopwatchIntervalRef.current);
-        stopwatchIntervalRef.current = null;
-      }
-      if (workerRef.current) {
-        workerRef.current.terminate();
-        workerRef.current = null;
-      }
-
-      const nextIndex = existingRunsList.length + 1;
-      const newRun: CalculationRun = {
-        id: `run_${Date.now()}_${nextIndex}`,
-        index: nextIndex,
-        title: `Расчет #${nextIndex}`,
-        timestamp: Date.now(),
-        settings: { ...settingsToRun },
-        solution: sol,
-        inputSignature,
-      };
-
-      const updated = [...existingRunsList, newRun];
-      setRuns(updated);
-      setActiveRunId(newRun.id);
-      if (onSaveRuns) onSaveRuns(updated);
-      if (onApplySolutionAndSettings) onApplySolutionAndSettings(sol, settingsToRun);
-      setProgressPercent(100);
-      setStatusText('Расчет успешно выполнен!');
-      setPhase('done');
-      setIsRecalculating(false);
-      if (onFinished) onFinished(sol);
-    };
-
-    // Prepare Stock & Demand items for Worker
+    // Prepare Stock & Demand items for Worker & Baselines
     const stocks: StockItem[] = (stockItems || [])
       .filter((s) => s.isActive !== false && s.length > 0)
       .map((s) => ({
@@ -297,6 +474,94 @@ export const CalculationProgressModal: React.FC<CalculationProgressModalProps> =
         notes: d.notes,
       }));
 
+    // Point 5: Generate Baselines (Эталон-12 и Эталон-6) as references
+    let baseRuns = ensureBaselines(existingRunsList, stocks, demands, settingsToRun, inputSignature);
+
+    const finishRun = (sol: FullOptimizationSolution) => {
+      if (stopwatchIntervalRef.current) {
+        clearInterval(stopwatchIntervalRef.current);
+        stopwatchIntervalRef.current = null;
+      }
+      if (workerRef.current) {
+        workerRef.current.terminate();
+        workerRef.current = null;
+      }
+
+      const nextIndex = baseRuns.filter((r) => r.index > 0).length + 1;
+      const newRun: CalculationRun = {
+        id: `run_${Date.now()}_${nextIndex}`,
+        index: nextIndex,
+        title: `Расчет #${nextIndex}`,
+        timestamp: Date.now(),
+        settings: { ...settingsToRun },
+        solution: sol,
+        inputSignature,
+      };
+
+      const updated = [...baseRuns, newRun];
+      setRuns(updated);
+      setActiveRunId(newRun.id);
+      if (onSaveRuns) onSaveRuns(updated);
+      if (onApplySolutionAndSettings) onApplySolutionAndSettings(sol, settingsToRun);
+      setProgressPercent(100);
+      setStatusText('Расчет успешно выполнен!');
+      setPhase('done');
+      setIsRecalculating(false);
+      if (onFinished) onFinished(sol);
+    };
+
+    const finishComprehensiveSuite = (
+      suite: ComprehensiveSuiteItem[],
+      bestSol: FullOptimizationSolution
+    ) => {
+      if (stopwatchIntervalRef.current) {
+        clearInterval(stopwatchIntervalRef.current);
+        stopwatchIntervalRef.current = null;
+      }
+      if (workerRef.current) {
+        workerRef.current.terminate();
+        workerRef.current = null;
+      }
+
+      let curIdx = baseRuns.filter((r) => r.index > 0).length;
+      const newRuns: CalculationRun[] = [];
+
+      for (const item of suite) {
+        curIdx++;
+        const runSettings: AppSettings = {
+          ...settingsToRun,
+          optimizationGoal: item.goal,
+        };
+        newRuns.push({
+          id: `run_${Date.now()}_${curIdx}_${item.goal}`,
+          index: curIdx,
+          title: `Расчет #${curIdx} (${item.title})`,
+          badge: item.badge,
+          timestamp: Date.now(),
+          settings: runSettings,
+          solution: item.solution,
+          inputSignature,
+        });
+      }
+
+      const updated = [...baseRuns, ...newRuns];
+      setRuns(updated);
+      const bestRun = newRuns.find((r) => r.solution === bestSol) || newRuns[0];
+      if (bestRun) {
+        setActiveRunId(bestRun.id);
+        if (onApplySolutionAndSettings) {
+          onApplySolutionAndSettings(bestRun.solution, bestRun.settings);
+        }
+      }
+      if (onSaveRuns) onSaveRuns(updated);
+
+      setProgressPercent(100);
+      setStatusText('Комплексный расчет выполнен! Добавлено 4 стратегии для сравнения.');
+      setPhase('done');
+      setIsRecalculating(false);
+      if (onFinished && bestRun) onFinished(bestRun.solution);
+    };
+
     try {
       const worker = new Worker(new URL('../workers/cuttingWorker.ts', import.meta.url), {
         type: 'module',
@@ -309,21 +574,34 @@ export const CalculationProgressModal: React.FC<CalculationProgressModalProps> =
           setProgressInfo(payload);
           setProgressPercent(payload.percent);
           setStatusText(payload.stageName);
+        } else if (type === 'COMPREHENSIVE_DONE') {
+          latestSolutionRef.current = payload.bestSolution;
+          finishComprehensiveSuite(payload.suite, payload.bestSolution);
         } else if (type === 'DONE') {
           latestSolutionRef.current = payload;
           finishRun(payload);
         } else if (type === 'ERROR') {
           console.error('Worker returned error:', payload);
           // Fallback to sync
-          const sol = onExecuteCalculation(settingsToRun);
-          finishRun(sol);
+          if (settingsToRun.optimizationGoal === 'comprehensive') {
+            const comp = runComprehensiveSuite(stocks, demands, settingsToRun);
+            finishComprehensiveSuite(comp.suite, comp.bestSolution);
+          } else {
+            const sol = onExecuteCalculation(settingsToRun);
+            finishRun(sol);
+          }
         }
       };
 
       worker.onerror = (err) => {
         console.warn('Worker runtime error, falling back to sync:', err);
-        const sol = onExecuteCalculation(settingsToRun);
-        finishRun(sol);
+        if (settingsToRun.optimizationGoal === 'comprehensive') {
+          const comp = runComprehensiveSuite(stocks, demands, settingsToRun);
+          finishComprehensiveSuite(comp.suite, comp.bestSolution);
+        } else {
+          const sol = onExecuteCalculation(settingsToRun);
+          finishRun(sol);
+        }
       };
 
       worker.postMessage({
@@ -332,14 +610,20 @@ export const CalculationProgressModal: React.FC<CalculationProgressModalProps> =
           stockInput: stocks,
           demandInput: demands,
           settings: settingsToRun,
+          isComprehensive: settingsToRun.optimizationGoal === 'comprehensive',
         },
       });
     } catch (err) {
       console.warn('Worker spawn error, using synchronous execution:', err);
       setTimeout(() => {
         try {
-          const sol = onExecuteCalculation(settingsToRun);
-          finishRun(sol);
+          if (settingsToRun.optimizationGoal === 'comprehensive') {
+            const comp = runComprehensiveSuite(stocks, demands, settingsToRun);
+            finishComprehensiveSuite(comp.suite, comp.bestSolution);
+          } else {
+            const sol = onExecuteCalculation(settingsToRun);
+            finishRun(sol);
+          }
         } catch (e) {
           console.error('Calculation execution error:', e);
           setPhase('done');
@@ -432,10 +716,41 @@ export const CalculationProgressModal: React.FC<CalculationProgressModalProps> =
       ];
     }
 
-    // If we have previous runs:
-    if (existingRuns.length > 0) {
-      // Check if an identical run matches BOTH settings AND inputSignature
-      const matchRun = existingRuns.find(
+    // Ensure Baseline Runs (Эталон-12 и Эталон-6) exist in existingRuns
+    const stocks: StockItem[] = (stockItems || [])
+      .filter((s) => s.isActive !== false && s.length > 0)
+      .map((s) => ({
+        id: s.id,
+        orderIndex: s.orderIndex,
+        length: s.length,
+        quantity: s.quantity,
+        isActive: s.isActive !== false,
+        isStandard: s.isStandard || s.length === 6000 || s.length === 12000,
+        isStandardUnlimited:
+          s.isStandardUnlimited ||
+          ((s.length === 6000 || s.length === 12000) && s.quantity <= 0),
+        mark: s.mark,
+        notes: s.notes,
+      }));
+    const demands: DemandItem[] = (demandItems || [])
+      .filter((d) => d.length > 0 && d.quantity > 0)
+      .map((d) => ({
+        id: d.id,
+        orderIndex: d.orderIndex,
+        length: d.length,
+        quantity: d.quantity,
+        mark: d.mark,
+        notes: d.notes,
+      }));
+
+    existingRuns = ensureBaselines(existingRuns, stocks, demands, settings, inputSignature);
+
+    // Filter optimization runs (excluding baselines which are economic benchmarks)
+    const optimizationRuns = existingRuns.filter((r) => !r.isBaseline && r.index > 0);
+
+    if (optimizationRuns.length > 0) {
+      // Check if an identical optimization run matches BOTH settings AND inputSignature
+      const matchRun = optimizationRuns.find(
         (r) =>
           areSettingsEqual(r.settings, settings) &&
           (!r.inputSignature || !inputSignature || r.inputSignature === inputSignature)
@@ -455,8 +770,8 @@ export const CalculationProgressModal: React.FC<CalculationProgressModalProps> =
       return;
     }
 
-    // No previous runs or solution exist at all (first calculation ever):
-    startOptimizationRun(settings, []);
+    // No user optimization runs exist yet: start optimization run!
+    startOptimizationRun(settings, existingRuns);
   }, [isOpen, inputSignature]);
 
   // Active run and solution
@@ -466,11 +781,67 @@ export const CalculationProgressModal: React.FC<CalculationProgressModalProps> =
 
   const activeSolution = activeRun ? activeRun.solution : solution;
 
+  // Point 6 & 7: Primary standard bar size of active run and matching baseline (Эталон-12 / Эталон-6)
+  const activeStd = useMemo(() => {
+    if (!activeRun) return null;
+    return getPrimaryStandardSize(activeRun.solution);
+  }, [activeRun]);
+
+  const matchingBaseline = useMemo(() => {
+    if (!activeRun || activeRun.isBaseline) return null;
+    const targetStd = activeStd?.primarySize ?? 12000;
+    return (
+      runs.find((r) => r.isBaseline && r.standardSize === targetStd) ||
+      runs.find((r) => r.isBaseline) ||
+      null
+    );
+  }, [runs, activeRun, activeStd]);
+
+  // Point 7: Economic Benefit calculations in comparison to matching baseline (Эталон-12 или Эталон-6)
+  const economicBenefit = useMemo(() => {
+    if (!matchingBaseline || !activeRun || activeRun.id === matchingBaseline.id) return null;
+    const baseSol = matchingBaseline.solution;
+    const actSol = activeRun.solution;
+
+    const baseSpentM = (baseSol.totalStockLength || 0) / 1000;
+    const actSpentM = (actSol.totalStockLength || 0) / 1000;
+    const savedStockM = baseSpentM - actSpentM;
+
+    const baseBars = baseSol.rows.reduce((sum, r) => sum + r.barsCount, 0);
+    const actBars = actSol.rows.reduce((sum, r) => sum + r.barsCount, 0);
+    const savedBars = baseBars - actBars;
+
+    const baseWasteM = (baseSol.totalWasteLength || 0) / 1000;
+    const actWasteM = (actSol.totalWasteLength || 0) / 1000;
+    const reducedWasteM = baseWasteM - actWasteM;
+
+    const kimGain = actSol.overallKIM - baseSol.overallKIM;
+
+    const actReusableM = (actSol.totalReusableLength || 0) / 1000;
+    const baseReusableM = (baseSol.totalReusableLength || 0) / 1000;
+    const reusableDiffM = actReusableM - baseReusableM;
+
+    return {
+      savedStockM,
+      savedBars,
+      reducedWasteM,
+      kimGain,
+      baseKim: baseSol.overallKIM,
+      actKim: actSol.overallKIM,
+      baseSpentM,
+      actSpentM,
+      baseWasteM,
+      actWasteM,
+      reusableDiffM,
+    };
+  }, [matchingBaseline, activeRun]);
+
   // Recalculate avoiding blocked calculations and respecting all parameters
   const executeRecalculateWithSettings = (settingsToUse: AppSettings) => {
-    // Check if an identical run exists in the current session
+    // Check if an identical run exists in the current session (excluding baseline run #0)
     const existingRun = runs.find(
       (r) =>
+        r.index > 0 &&
         (!r.inputSignature || !inputSignature || r.inputSignature === inputSignature) &&
         areSettingsEqual(r.settings, settingsToUse)
     );
@@ -521,9 +892,15 @@ export const CalculationProgressModal: React.FC<CalculationProgressModalProps> =
 
   const handleClearRuns = () => {
     if (!activeRun) return;
-    const reset = [{ ...activeRun, index: 1, title: 'Расчет #1' }];
+    const baselines = runs.filter((r) => r.isBaseline || r.index <= 0);
+    let reset: CalculationRun[] = [];
+    if (activeRun.isBaseline) {
+      reset = [...baselines];
+    } else {
+      reset = [...baselines, { ...activeRun, index: 1, title: 'Расчет #1' }];
+    }
     setRuns(reset);
-    setActiveRunId(reset[0].id);
+    setActiveRunId(activeRun.id);
     if (onSaveRuns) onSaveRuns(reset);
   };
 
@@ -604,8 +981,39 @@ export const CalculationProgressModal: React.FC<CalculationProgressModalProps> =
         return 'Максимум делового';
       case 'prioritize_remnants':
         return 'Приоритет остатков';
+      case 'comprehensive':
+        return 'Комплексный (4)';
+      case 'custom':
+        return 'Пользовательская';
       default:
         return goal || '—';
+    }
+  };
+
+  const getStrategyBadge = (goal?: string, runSettings?: AppSettings) => {
+    switch (goal) {
+      case 'variants':
+        return { label: 'Меньше наладок', icon: '⚡', color: 'bg-indigo-50 text-indigo-700 border-indigo-200' };
+      case 'min_waste':
+        return { label: 'Мин. отход', icon: '🏆', color: 'bg-emerald-50 text-emerald-700 border-emerald-200' };
+      case 'min_bars':
+        return { label: 'Мин. хлыстов', icon: '📦', color: 'bg-sky-50 text-sky-700 border-sky-200' };
+      case 'max_reusable':
+        return {
+          label: runSettings?.targetRemnantMinLength
+            ? `Остаток ≥${runSettings.targetRemnantMinLength} мм`
+            : 'Деловой остаток',
+          icon: '♻️',
+          color: 'bg-amber-50 text-amber-700 border-amber-200',
+        };
+      case 'prioritize_remnants':
+        return { label: 'Склад', icon: '🔄', color: 'bg-teal-50 text-teal-700 border-teal-200' };
+      case 'comprehensive':
+        return { label: '4 стратегии', icon: '✨', color: 'bg-purple-50 text-purple-700 border-purple-200' };
+      case 'custom':
+        return { label: 'Настраиваемая', icon: '⚙️', color: 'bg-blue-50 text-blue-700 border-blue-200' };
+      default:
+        return null;
     }
   };
 
@@ -774,6 +1182,7 @@ export const CalculationProgressModal: React.FC<CalculationProgressModalProps> =
     if (filterStatus === 'complete') {
       list = list.filter(
         (r) =>
+          r.isBaseline ||
           !r.solution.unplacedDemand ||
           r.solution.unplacedDemand.length === 0 ||
           r.solution.unplacedDemand.every((u) => u.quantity === 0)
@@ -781,31 +1190,65 @@ export const CalculationProgressModal: React.FC<CalculationProgressModalProps> =
     } else if (filterStatus === 'unplaced') {
       list = list.filter(
         (r) =>
+          !r.isBaseline &&
           r.solution.unplacedDemand &&
           r.solution.unplacedDemand.some((u) => u.quantity > 0)
       );
     }
 
+    // Point 8: Filter by primary standard bar size (12m / 6m)
+    if (filterStandardSize !== 'all') {
+      const targetSize = Number(filterStandardSize);
+      list = list.filter((r) => {
+        const std = getPrimaryStandardSize(r.solution);
+        return std.primarySize === targetSize;
+      });
+    }
+
     if (filterStrategy !== 'all') {
-      list = list.filter((r) => r.settings.optimizationGoal === filterStrategy);
+      if (filterStrategy === 'baseline') {
+        list = list.filter((r) => r.isBaseline || r.index <= 0);
+      } else {
+        list = list.filter((r) => r.settings.optimizationGoal === filterStrategy && !r.isBaseline && r.index > 0);
+      }
     }
 
     if (searchQuery.trim()) {
       const q = searchQuery.toLowerCase().trim();
       list = list.filter((r) => {
         const titleMatch = r.title.toLowerCase().includes(q);
-        const stratMatch = getStrategyLabel(r.settings.optimizationGoal).toLowerCase().includes(q);
-        const speedMatch = getSpeedLabel(r.settings.searchSpeed).toLowerCase().includes(q);
+        const stratMatch = (
+          r.isBaseline
+            ? 'эталон порезка подряд без оптимизации'
+            : getStrategyLabel(r.settings.optimizationGoal)
+        )
+          .toLowerCase()
+          .includes(q);
+        const speedMatch = (
+          r.isBaseline ? 'базовый' : getSpeedLabel(r.settings.searchSpeed)
+        )
+          .toLowerCase()
+          .includes(q);
         return titleMatch || stratMatch || speedMatch;
       });
     }
 
-    list.sort((a, b) => {
+    // Point 3: ЭТАЛОН не сортируется в сравнительной таблице (всегда сверху!)
+    const baselineRuns = list.filter((r) => r.isBaseline || r.index <= 0);
+    const regularRuns = list.filter((r) => !r.isBaseline && r.index > 0);
+
+    regularRuns.sort((a, b) => {
       let diff = 0;
       switch (sortField) {
         case 'index':
           diff = a.index - b.index;
           break;
+        case 'standardSize': {
+          const stdA = getPrimaryStandardSize(a.solution).primarySize;
+          const stdB = getPrimaryStandardSize(b.solution).primarySize;
+          diff = stdA - stdB;
+          break;
+        }
         case 'speed':
           diff = a.settings.searchSpeed.localeCompare(b.settings.searchSpeed);
           break;
@@ -827,6 +1270,20 @@ export const CalculationProgressModal: React.FC<CalculationProgressModalProps> =
         case 'kim':
           diff = a.solution.overallKIM - b.solution.overallKIM;
           break;
+        case 'netKim': {
+          const nA =
+            a.solution.netKIM ??
+            (a.solution.totalStockLength > 0
+              ? (a.solution.totalSpentLength / a.solution.totalStockLength) * 100
+              : 0);
+          const nB =
+            b.solution.netKIM ??
+            (b.solution.totalStockLength > 0
+              ? (b.solution.totalSpentLength / b.solution.totalStockLength) * 100
+              : 0);
+          diff = nA - nB;
+          break;
+        }
         case 'cards':
           diff = a.solution.rows.length - b.solution.rows.length;
           break;
@@ -851,8 +1308,8 @@ export const CalculationProgressModal: React.FC<CalculationProgressModalProps> =
       return sortDirection === 'asc' ? diff : -diff;
     });
 
-    return list;
-  }, [runs, filterStatus, filterStrategy, searchQuery, sortField, sortDirection]);
+    return [...baselineRuns, ...regularRuns];
+  }, [runs, filterStatus, filterStrategy, filterStandardSize, searchQuery, sortField, sortDirection]);
 
   const handleSortToggle = (field: typeof sortField) => {
     if (sortField === field) {
@@ -1002,6 +1459,13 @@ export const CalculationProgressModal: React.FC<CalculationProgressModalProps> =
                   <span className="font-mono font-extrabold text-blue-600">{progressPercent}%</span>
                 </div>
 
+                {progressInfo?.stageStepName && (
+                  <div className="flex items-center gap-2 text-[11px] font-mono text-blue-800 bg-blue-50/80 border border-blue-200/90 px-2.5 py-1.5 rounded-lg shadow-2xs">
+                    <Sparkles className="w-3.5 h-3.5 text-blue-600 animate-pulse shrink-0" />
+                    <span className="truncate">{progressInfo.stageStepName}</span>
+                  </div>
+                )}
+
                 <div className="w-full bg-slate-100 rounded-full h-2.5 overflow-hidden">
                   <div
                     style={{ width: `${progressPercent}%` }}
@@ -1069,20 +1533,22 @@ export const CalculationProgressModal: React.FC<CalculationProgressModalProps> =
                     <div className="text-[10px] uppercase font-bold flex items-center justify-center gap-1">
                       <span
                         className={`w-3 h-3 rounded-full text-white text-[9px] flex items-center justify-center ${
-                          (progressInfo?.stage || 1) === 3 ? 'bg-blue-600' : 'bg-slate-300'
+                          (progressInfo?.stage || 1) === 3 ? 'bg-blue-600 animate-pulse' : 'bg-slate-300'
                         }`}
                       >
                         3
                       </span>
                       <span>Этап 3</span>
                     </div>
-                    <div className="text-[11px] font-semibold mt-0.5 truncate">Минимизация отходов</div>
+                    <div className="text-[11px] font-semibold mt-0.5 truncate">
+                      {(progressInfo?.stage || 1) === 3 ? '2-Opt и сжатие карт' : 'Минимизация отходов'}
+                    </div>
                   </div>
                 </div>
               </div>
 
-              {/* Live Counters Quartet */}
-              <div className="grid grid-cols-2 sm:grid-cols-3 gap-2.5">
+              {/* Live Counters 4-Card Dashboard */}
+              <div className="grid grid-cols-2 sm:grid-cols-4 gap-2.5">
                 <div className="bg-slate-50 border border-slate-200 rounded-xl p-3">
                   <span className="text-[10px] uppercase text-slate-500 font-bold block">
                     Разложено деталей
@@ -1116,7 +1582,20 @@ export const CalculationProgressModal: React.FC<CalculationProgressModalProps> =
                   </span>
                 </div>
 
-                <div className="bg-slate-50 border border-slate-200 rounded-xl p-3 col-span-2 sm:col-span-1">
+                <div className="bg-slate-50 border border-slate-200 rounded-xl p-3">
+                  <span className="text-[10px] uppercase text-slate-500 font-bold block">
+                    Уникальных карт
+                  </span>
+                  <div className="text-base sm:text-lg font-mono font-extrabold text-blue-700 mt-0.5">
+                    {progressInfo?.uniqueCardsCount ?? '—'}
+                    <span className="text-xs text-slate-500 font-normal"> схем</span>
+                  </div>
+                  <span className="text-[10px] text-slate-500 block mt-0.5">
+                    Минимум переналадок
+                  </span>
+                </div>
+
+                <div className="bg-slate-50 border border-slate-200 rounded-xl p-3">
                   <span className="text-[10px] uppercase text-slate-500 font-bold block">
                     Текущий КИМ
                   </span>
@@ -1292,6 +1771,21 @@ export const CalculationProgressModal: React.FC<CalculationProgressModalProps> =
                         </div>
 
                         <div className="flex items-center gap-2 self-end sm:self-auto">
+                          <button
+                            type="button"
+                            onClick={() => {
+                              executeRecalculateWithSettings({
+                                ...modalSettings,
+                                optimizationGoal: 'comprehensive',
+                              });
+                            }}
+                            title="Рассчитать сразу 4 варианта (по схемам, мин. отход, мин. хлыстов, макс. делового) для сравнительного выбора"
+                            className="flex items-center gap-1.5 text-[11px] font-bold text-indigo-700 bg-indigo-50 hover:bg-indigo-100 border border-indigo-200 px-2.5 py-1 rounded-lg transition-all cursor-pointer shadow-2xs hover:shadow-xs"
+                          >
+                            <Zap className="w-3.5 h-3.5 text-indigo-600 fill-indigo-600" />
+                            <span>Комплексный расчет (4 стратегии)</span>
+                          </button>
+
                           {runs.length > 1 && (
                             <button
                               type="button"
@@ -1305,6 +1799,106 @@ export const CalculationProgressModal: React.FC<CalculationProgressModalProps> =
                           )}
                         </div>
                       </div>
+
+                      {/* Economic Benefit Benchmark Banner against matching baseline (Point 7) */}
+                      {economicBenefit && activeRun && !activeRun.isBaseline && matchingBaseline && (
+                        <div className="bg-gradient-to-r from-emerald-50 via-teal-50 to-blue-50 border border-emerald-200/80 rounded-xl p-3 shadow-2xs">
+                          <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2 pb-2 border-b border-emerald-200/50">
+                            <div className="flex items-center gap-2">
+                              <div className="p-1.5 bg-emerald-600 text-white rounded-lg shadow-2xs">
+                                <TrendingUp className="w-4 h-4" />
+                              </div>
+                              <div>
+                                <span className="text-xs font-bold text-slate-900">
+                                  Экономический эффект оптимизации:
+                                </span>{' '}
+                                <span className="text-xs text-slate-600">
+                                  в сравнении с «{matchingBaseline.title}» ({matchingBaseline.standardSize ? matchingBaseline.standardSize / 1000 + ' м' : ''})
+                                </span>
+                              </div>
+                            </div>
+                            <div className="text-[11px] font-semibold text-emerald-800 bg-white/80 px-2 py-0.5 rounded-md border border-emerald-200 self-start sm:self-auto">
+                              Сравнивается: <strong>{activeRun.title}</strong> с <strong>{matchingBaseline.title}</strong>
+                            </div>
+                          </div>
+
+                          <div className="grid grid-cols-2 sm:grid-cols-4 gap-2.5 pt-2.5">
+                            {/* Saved Metal */}
+                            <div className="bg-white/90 border border-emerald-100 rounded-lg p-2">
+                              <div className="text-[10px] text-slate-500 font-medium">Сбережение металла:</div>
+                              <div className={`text-base font-extrabold ${economicBenefit.savedStockM >= 0 ? 'text-emerald-700' : 'text-slate-700'}`}>
+                                {economicBenefit.savedStockM >= 0 ? `+${economicBenefit.savedStockM.toFixed(1)} м` : `${economicBenefit.savedStockM.toFixed(1)} м`}
+                              </div>
+                              <div className="text-[10px] text-slate-500">
+                                {economicBenefit.savedBars > 0
+                                  ? `на ${economicBenefit.savedBars} хлыст${economicBenefit.savedBars === 1 ? '' : economicBenefit.savedBars < 5 ? 'а' : 'ов'} меньше`
+                                  : `${economicBenefit.actSpentM.toFixed(1)} м против ${economicBenefit.baseSpentM.toFixed(1)} м`}
+                              </div>
+                            </div>
+
+                            {/* KIM Gain */}
+                            <div className="bg-white/90 border border-blue-100 rounded-lg p-2">
+                              <div className="text-[10px] text-slate-500 font-medium">Прирост КИМ:</div>
+                              <div className="text-base font-extrabold text-blue-700">
+                                {economicBenefit.kimGain >= 0 ? `+${economicBenefit.kimGain.toFixed(2)}%` : `${economicBenefit.kimGain.toFixed(2)}%`}
+                              </div>
+                              <div className="text-[10px] text-slate-500">
+                                с {economicBenefit.baseKim.toFixed(1)}% до {economicBenefit.actKim.toFixed(2)}%
+                              </div>
+                            </div>
+
+                            {/* Waste Reduction or Change */}
+                            {(() => {
+                              const wasteIncreased = economicBenefit.reducedWasteM < 0;
+                              return (
+                                <div
+                                  className={`bg-white/90 border rounded-lg p-2 ${
+                                    wasteIncreased ? 'border-blue-200' : 'border-emerald-100'
+                                  }`}
+                                >
+                                  <div className="text-[10px] text-slate-500 font-medium">
+                                    {wasteIncreased ? 'Отходы к эталону:' : 'Сокращение отходов:'}
+                                  </div>
+                                  <div
+                                    className={`text-base font-extrabold ${
+                                      wasteIncreased ? 'text-blue-700' : 'text-emerald-700'
+                                    }`}
+                                  >
+                                    {wasteIncreased
+                                      ? `+${Math.abs(economicBenefit.reducedWasteM).toFixed(1)} м`
+                                      : `-${economicBenefit.reducedWasteM.toFixed(1)} м`}
+                                  </div>
+                                  <div className="text-[10px] text-slate-500">
+                                    с {economicBenefit.baseWasteM.toFixed(1)} м до {economicBenefit.actWasteM.toFixed(1)} м
+                                  </div>
+                                </div>
+                              );
+                            })()}
+
+                            {/* Reusable Offcut or Efficiency */}
+                            <div className="bg-white/90 border border-indigo-100 rounded-lg p-2">
+                              <div className="text-[10px] text-slate-500 font-medium">Деловой остаток (склад):</div>
+                              <div className="text-base font-extrabold text-indigo-700">
+                                {((activeRun.solution.totalReusableLength || 0) / 1000).toFixed(1)} м
+                              </div>
+                              <div className="text-[10px] text-slate-500">
+                                {economicBenefit.reusableDiffM >= 0 ? `+${economicBenefit.reusableDiffM.toFixed(1)} м к эталону` : `${economicBenefit.reusableDiffM.toFixed(1)} м к эталону`}
+                              </div>
+                            </div>
+                          </div>
+                        </div>
+                      )}
+
+                      {/* If Active Run is a Baseline itself */}
+                      {activeRun && (activeRun.isBaseline || activeRun.index <= 0) && (
+                        <div className="bg-slate-100/90 border border-slate-300 rounded-xl p-3 text-xs text-slate-700 flex items-center gap-3">
+                          <span className="text-base">📊</span>
+                          <div>
+                            <span className="font-bold text-slate-900">Выбран «{activeRun.title}»:</span>{' '}
+                            Имитирует ручную раскладку пильщика от длинных деталей к коротким без оптимизации на заготовках {activeRun.standardSize ? activeRun.standardSize / 1000 + ' м' : ''}. Этот расчет служит базовым эталоном (benchmark). Выберите в таблице любой оптимизированный расчет (#1, #2...), чтобы увидеть чистую экономию метров металла и сокращение лома.
+                          </div>
+                        </div>
+                      )}
 
                       {/* Filter Bar */}
                       <div className="flex flex-wrap items-center justify-between gap-2 bg-slate-50 p-2 rounded-xl border border-slate-200">
@@ -1339,7 +1933,7 @@ export const CalculationProgressModal: React.FC<CalculationProgressModalProps> =
                             {
                               runs.filter(
                                 (r) =>
-                                  !r.solution.unplacedDemand ||
+                                   !r.solution.unplacedDemand ||
                                   r.solution.unplacedDemand.length === 0 ||
                                   r.solution.unplacedDemand.every((u) => u.quantity === 0)
                               ).length
@@ -1361,6 +1955,7 @@ export const CalculationProgressModal: React.FC<CalculationProgressModalProps> =
                             {
                               runs.filter(
                                 (r) =>
+                                  !r.isBaseline &&
                                   r.solution.unplacedDemand &&
                                   r.solution.unplacedDemand.some((u) => u.quantity > 0)
                               ).length
@@ -1368,17 +1963,57 @@ export const CalculationProgressModal: React.FC<CalculationProgressModalProps> =
                             )
                           </button>
 
+                          {/* Point 8: Размер стандартной заготовки в фильтрах таблицы */}
+                          <div className="flex items-center bg-white border border-slate-200 rounded-lg p-0.5 text-xs ml-1">
+                            <button
+                              type="button"
+                              onClick={() => setFilterStandardSize('all')}
+                              className={`px-2 py-0.5 rounded-md text-[11px] font-semibold transition-colors cursor-pointer ${
+                                filterStandardSize === 'all'
+                                  ? 'bg-blue-600 text-white shadow-2xs'
+                                  : 'text-slate-600 hover:text-slate-900'
+                              }`}
+                            >
+                              Все
+                            </button>
+                            <button
+                              type="button"
+                              onClick={() => setFilterStandardSize('12000')}
+                              className={`px-2 py-0.5 rounded-md text-[11px] font-semibold transition-colors cursor-pointer ${
+                                filterStandardSize === '12000'
+                                  ? 'bg-blue-600 text-white shadow-2xs'
+                                  : 'text-slate-600 hover:text-slate-900'
+                              }`}
+                            >
+                              12 м
+                            </button>
+                            <button
+                              type="button"
+                              onClick={() => setFilterStandardSize('6000')}
+                              className={`px-2 py-0.5 rounded-md text-[11px] font-semibold transition-colors cursor-pointer ${
+                                filterStandardSize === '6000'
+                                  ? 'bg-blue-600 text-white shadow-2xs'
+                                  : 'text-slate-600 hover:text-slate-900'
+                              }`}
+                            >
+                              6 м
+                            </button>
+                          </div>
+
                           <select
                             value={filterStrategy}
                             onChange={(e) => setFilterStrategy(e.target.value)}
                             className="bg-white border border-slate-200 rounded-lg text-xs text-slate-700 px-2 py-1 ml-1 cursor-pointer font-medium focus:outline-hidden"
                           >
                             <option value="all">Все стратегии</option>
+                            <option value="baseline">Эталоны (без оптимизации)</option>
                             <option value="variants">Схемы (Кол-во вариантов)</option>
                             <option value="min_waste">Мин. отход</option>
                             <option value="min_bars">Мин. хлыстов</option>
                             <option value="max_reusable">Деловой остаток</option>
                             <option value="prioritize_remnants">Склад</option>
+                            <option value="comprehensive">Комплексный</option>
+                            <option value="custom">Пользовательская</option>
                           </select>
                         </div>
 
@@ -1433,6 +2068,17 @@ export const CalculationProgressModal: React.FC<CalculationProgressModalProps> =
                                 </div>
                               </th>
 
+                              {/* Point 6: Колонка с размером основной стандартной заготовки в сравнительной таблице */}
+                              <th
+                                onClick={() => handleSortToggle('standardSize')}
+                                className="py-2 px-2.5 cursor-pointer hover:bg-slate-200 transition-colors group whitespace-nowrap w-22"
+                              >
+                                <div className="flex items-center gap-1">
+                                  <span>Стандарт</span>
+                                  {renderSortIndicator('standardSize')}
+                                </div>
+                              </th>
+
                               <th
                                 onClick={() => handleSortToggle('speed')}
                                 className="py-2 px-2.5 cursor-pointer hover:bg-slate-200 transition-colors group whitespace-nowrap"
@@ -1476,11 +2122,23 @@ export const CalculationProgressModal: React.FC<CalculationProgressModalProps> =
 
                               <th
                                 onClick={() => handleSortToggle('kim')}
-                                className="py-2 px-2.5 text-right cursor-pointer hover:bg-slate-200 transition-colors group whitespace-nowrap w-20"
+                                title="Валовый КИМ: учитывает суммарный выход деталей и делового остатка"
+                                className="py-2 px-2 text-right cursor-pointer hover:bg-slate-200 transition-colors group whitespace-nowrap w-20"
                               >
                                 <div className="flex items-center justify-end gap-1">
-                                  <span>КИМ</span>
+                                  <span>КИМ (вал.)</span>
                                   {renderSortIndicator('kim')}
+                                </div>
+                              </th>
+
+                              <th
+                                onClick={() => handleSortToggle('netKim')}
+                                title="Мгновенный (чистый) КИМ: отношение длины готовых деталей к расходу материала без учета деловых отходов"
+                                className="py-2 px-2 text-right cursor-pointer hover:bg-slate-200 transition-colors group whitespace-nowrap w-20"
+                              >
+                                <div className="flex items-center justify-end gap-1">
+                                  <span className="text-blue-900 font-bold">Мгн. КИМ</span>
+                                  {renderSortIndicator('netKim')}
                                 </div>
                               </th>
 
@@ -1534,7 +2192,9 @@ export const CalculationProgressModal: React.FC<CalculationProgressModalProps> =
                               filteredAndSortedRuns.map((r) => {
                                 const isActive = r.id === activeRunId;
                                 const isHighlighted = r.id === highlightedRunId;
+                                const isBaseline = Boolean(r.isBaseline || r.index <= 0);
                                 const hasUnplaced = Boolean(
+                                  !isBaseline &&
                                   r.solution.unplacedDemand &&
                                   r.solution.unplacedDemand.some((u) => u.quantity > 0)
                                 );
@@ -1542,9 +2202,16 @@ export const CalculationProgressModal: React.FC<CalculationProgressModalProps> =
                                   ? r.solution.unplacedDemand.reduce((sum, u) => sum + (u.quantity || 0), 0)
                                   : 0;
                                 const kimTheme = getKimTheme(r.solution.overallKIM, hasUnplaced);
+                                const netKim =
+                                  r.solution.netKIM ??
+                                  (r.solution.totalStockLength > 0
+                                    ? (r.solution.totalSpentLength / r.solution.totalStockLength) * 100
+                                    : 0);
+                                const netKimTheme = getKimTheme(netKim, hasUnplaced);
                                 const remnantTheme = getRemnantTheme(r.solution.totalReusableLength, hasUnplaced);
                                 const spentMeters = Number(((r.solution.totalStockLength || 0) / 1000).toFixed(2));
                                 const wasteMeters = Number(((r.solution.totalWasteLength || 0) / 1000).toFixed(2));
+                                const stdInfo = getPrimaryStandardSize(r.solution);
 
                                 return (
                                   <tr
@@ -1555,6 +2222,8 @@ export const CalculationProgressModal: React.FC<CalculationProgressModalProps> =
                                         ? 'bg-amber-100 ring-2 ring-amber-400 font-bold'
                                         : isActive
                                         ? 'bg-blue-50/80 font-bold text-blue-950'
+                                        : isBaseline
+                                        ? 'bg-slate-50/70 hover:bg-slate-100/80 border-slate-200 text-slate-800'
                                         : 'hover:bg-slate-50 text-slate-800'
                                     }`}
                                   >
@@ -1571,29 +2240,99 @@ export const CalculationProgressModal: React.FC<CalculationProgressModalProps> =
                                         ) : (
                                           <span
                                             className={`w-2.5 h-2.5 rounded-full shrink-0 ${
-                                              isActive ? 'bg-blue-600 ring-2 ring-blue-300' : 'bg-slate-300'
+                                              isActive
+                                                ? 'bg-blue-600 ring-2 ring-blue-300'
+                                                : isBaseline
+                                                ? 'bg-slate-400 ring-1 ring-slate-300'
+                                                : 'bg-slate-300'
                                             }`}
                                           />
                                         )}
-                                        <span className={`font-semibold ${isActive ? 'text-blue-950' : 'text-slate-900'}`}>
+                                        <span className={`font-semibold ${isActive ? 'text-blue-950' : isBaseline ? 'text-slate-800' : 'text-slate-900'}`}>
                                           {r.title}
                                         </span>
-                                        {hasUnplaced && (
-                                          <span className="text-[10px] text-rose-600 font-bold bg-rose-50 px-1 py-0.2 rounded border border-rose-200">
-                                            -{unplacedCount}
+                                        {isBaseline && (
+                                          <span className="text-[9px] font-bold text-slate-600 bg-slate-200/90 px-1.5 py-0.2 rounded border border-slate-300">
+                                            Эталон
                                           </span>
+                                        )}
+                                        {hasUnplaced && (
+                                          <button
+                                            type="button"
+                                            onClick={(e) => {
+                                              e.stopPropagation();
+                                              setDeficitModalRun(r);
+                                            }}
+                                            title="Раскроить дефицит в отдельном окне с новым списком «ЕСТЬ»"
+                                            className="text-[10px] text-rose-700 font-bold bg-rose-50 hover:bg-rose-100 px-1.5 py-0.2 rounded border border-rose-300 transition-colors cursor-pointer flex items-center gap-0.5"
+                                          >
+                                            <Zap className="w-2.5 h-2.5 text-rose-600" />
+                                            <span>-{unplacedCount} (Дефицит)</span>
+                                          </button>
                                         )}
                                       </div>
                                     </td>
 
+                                    {/* Point 6: Размер стандартной заготовки в таблице */}
+                                    <td className="py-2 px-2.5 text-[11px] whitespace-nowrap">
+                                      <span
+                                        className={`px-1.5 py-0.5 rounded text-[10.5px] font-bold border ${
+                                          stdInfo.primarySize === 12000
+                                            ? 'bg-blue-50 text-blue-700 border-blue-200'
+                                            : 'bg-emerald-50 text-emerald-700 border-emerald-200'
+                                        }`}
+                                      >
+                                        {stdInfo.label}
+                                      </span>
+                                    </td>
+
                                     {/* Скорость */}
                                     <td className="py-2 px-2.5 text-[11px] whitespace-nowrap text-slate-600">
-                                      {getSpeedLabel(r.settings.searchSpeed)}
+                                      {isBaseline ? (
+                                        <span className="text-slate-400 font-medium">—</span>
+                                      ) : (
+                                        getSpeedLabel(r.settings.searchSpeed)
+                                      )}
                                     </td>
 
                                     {/* Стратегия */}
-                                    <td className="py-2 px-2.5 text-[11px] whitespace-nowrap font-medium text-slate-800">
-                                      {getStrategyLabel(r.settings.optimizationGoal)}
+                                    <td className="py-2 px-2.5 text-[11px] whitespace-nowrap">
+                                      <div className="flex items-center gap-1.5">
+                                        <span className="font-medium text-slate-800">
+                                          {isBaseline ? 'Порезка подряд' : getStrategyLabel(r.settings.optimizationGoal)}
+                                        </span>
+                                        {(() => {
+                                          if (isBaseline) {
+                                            return (
+                                              <span
+                                                className="text-[9.5px] font-semibold px-1.5 py-0.2 rounded border bg-slate-100 text-slate-600 border-slate-300"
+                                                title="Базовый раскрой от крупных деталей к мелким без оптимизации"
+                                              >
+                                                📊 Без оптимизации
+                                              </span>
+                                            );
+                                          }
+                                          if (r.badge) {
+                                            return (
+                                              <span
+                                                className="text-[9.5px] font-semibold px-1.5 py-0.2 rounded border bg-indigo-50 text-indigo-700 border-indigo-200"
+                                                title={r.badge}
+                                              >
+                                                {r.badge}
+                                              </span>
+                                            );
+                                          }
+                                          const badge = getStrategyBadge(r.settings.optimizationGoal, r.settings);
+                                          if (!badge) return null;
+                                          return (
+                                            <span
+                                              className={`text-[9.5px] font-semibold px-1.5 py-0.2 rounded border ${badge.color}`}
+                                            >
+                                              {badge.icon} {badge.label}
+                                            </span>
+                                          );
+                                        })()}
+                                      </div>
                                     </td>
 
                                     {/* 2 профиля */}
@@ -1619,9 +2358,20 @@ export const CalculationProgressModal: React.FC<CalculationProgressModalProps> =
                                     </td>
 
 
-                                    {/* КИМ */}
-                                    <td className={`py-2 px-2.5 text-right font-mono whitespace-nowrap ${kimTheme.tableText}`}>
+                                    {/* КИМ (валовый) */}
+                                    <td
+                                      title="Валовый КИМ: выход готовых деталей + деловой остаток"
+                                      className={`py-2 px-2 text-right font-mono whitespace-nowrap ${kimTheme.tableText}`}
+                                    >
                                       {r.solution.overallKIM.toFixed(2)}%
+                                    </td>
+
+                                    {/* Мгновенный КИМ (чистый) */}
+                                    <td
+                                      title="Мгновенный (чистый) КИМ: выход готовых деталей без делового остатка"
+                                      className={`py-2 px-2 text-right font-mono whitespace-nowrap ${netKimTheme.tableText}`}
+                                    >
+                                      {netKim.toFixed(2)}%
                                     </td>
 
                                     {/* Карт раскроя */}
@@ -1662,7 +2412,7 @@ export const CalculationProgressModal: React.FC<CalculationProgressModalProps> =
                               })
                             ) : (
                               <tr>
-                                <td colSpan={12} className="py-6 text-center text-slate-400 text-xs">
+                                <td colSpan={14} className="py-6 text-center text-slate-400 text-xs">
                                   Нет вариантов, соответствующих выбранным фильтрам
                                 </td>
                               </tr>
@@ -1683,6 +2433,12 @@ export const CalculationProgressModal: React.FC<CalculationProgressModalProps> =
                     <div>
                       <span className="font-bold">Порог делового остатка:</span> обрезки длиной от{' '}
                       <strong>{modalSettings.reusableRemnantMin} мм</strong> и более считаются пригодными для повторного использования и возвращаются на склад.
+                      {activeRun?.settings.optimizationGoal === 'max_reusable' && (
+                        <div className="mt-1 text-[11px] text-amber-800">
+                          🎯 <strong>Стратегия «Максимум делового»:</strong> расчет ориентирован на формирование остатков длиной от{' '}
+                          <strong className="underline decoration-amber-500">{activeRun.settings.targetRemnantMinLength ?? 1500} мм</strong>.
+                        </div>
+                      )}
                     </div>
                     <div className="shrink-0 font-mono font-bold text-amber-800 text-sm">
                       {totalCutRemnantsMeters.toFixed(2)} м / {totalCutRemnantsCount} шт.
@@ -1816,6 +2572,198 @@ export const CalculationProgressModal: React.FC<CalculationProgressModalProps> =
           )}
         </div>
       </div>
+
+      {/* Point 9: Раскрой дефицита позиций в новом окне с новыми настройками и новым списком ЕСТЬ */}
+      {deficitModalRun && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-900/50 backdrop-blur-xs animate-in fade-in duration-150">
+          <div className="bg-white rounded-2xl shadow-2xl border border-slate-200 w-full max-w-xl overflow-hidden flex flex-col max-h-[90vh] animate-in zoom-in-95 duration-150">
+            {/* Modal Header */}
+            <div className="px-5 py-3.5 bg-rose-50/80 border-b border-rose-200 flex items-center justify-between">
+              <div className="flex items-center gap-2.5">
+                <div className="w-8 h-8 rounded-lg bg-rose-100 text-rose-700 flex items-center justify-center">
+                  <AlertTriangle className="w-4 h-4" />
+                </div>
+                <div>
+                  <h4 className="text-sm font-bold text-slate-900">
+                    Раскрой дефицита деталей ({deficitModalRun.title})
+                  </h4>
+                  <p className="text-[11px] text-slate-500">
+                    Всего не разложено:{' '}
+                    <strong>
+                      {deficitModalRun.solution.unplacedDemand.reduce((s, u) => s + (u.quantity || 0), 0)} шт.
+                    </strong>{' '}
+                    (
+                    {(
+                      deficitModalRun.solution.unplacedDemand.reduce(
+                        (s, u) => s + (u.length * (u.quantity || 0)),
+                        0
+                      ) / 1000
+                    ).toFixed(2)}{' '}
+                    м)
+                  </p>
+                </div>
+              </div>
+              <button
+                type="button"
+                onClick={() => setDeficitModalRun(null)}
+                className="text-slate-400 hover:text-slate-700 p-1 rounded-lg hover:bg-slate-100 transition-colors cursor-pointer"
+              >
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+
+            {/* Modal Body */}
+            <div className="p-5 space-y-4 overflow-y-auto flex-1 text-xs">
+              {/* Deficit Parts Table */}
+              <div className="space-y-1.5">
+                <span className="font-bold text-slate-800 text-[11px] uppercase tracking-wider block">
+                  Список неразложенных деталей (дефицит):
+                </span>
+                <div className="border border-slate-200 rounded-xl overflow-hidden max-h-44 overflow-y-auto">
+                  <table className="w-full text-left border-collapse text-xs">
+                    <thead>
+                      <tr className="bg-slate-100 text-slate-600 border-b border-slate-200 text-[10.5px]">
+                        <th className="py-1.5 px-3">№</th>
+                        <th className="py-1.5 px-3">Длина</th>
+                        <th className="py-1.5 px-3 text-right">Количество</th>
+                        <th className="py-1.5 px-3 text-right">Суммарно</th>
+                        <th className="py-1.5 px-3">Марка</th>
+                      </tr>
+                    </thead>
+                    <tbody className="divide-y divide-slate-100 font-mono">
+                      {deficitModalRun.solution.unplacedDemand.map((u, idx) => (
+                        <tr key={idx} className="hover:bg-slate-50">
+                          <td className="py-1.5 px-3 text-slate-400 font-sans">{idx + 1}</td>
+                          <td className="py-1.5 px-3 font-bold text-slate-900">{u.length} мм</td>
+                          <td className="py-1.5 px-3 text-right text-rose-700 font-bold">{u.quantity} шт.</td>
+                          <td className="py-1.5 px-3 text-right text-slate-600">
+                            {((u.length * u.quantity) / 1000).toFixed(2)} м
+                          </td>
+                          <td className="py-1.5 px-3 text-[11px] text-slate-500 font-sans">
+                            {(u as any).mark || '—'}
+                          </td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              </div>
+
+              {/* Action Options */}
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 pt-2">
+                {/* Option 1: Quick Cut with New Standard Bars */}
+                <div className="p-3.5 bg-slate-50 border border-slate-200 rounded-xl space-y-3 flex flex-col justify-between">
+                  <div>
+                    <span className="font-bold text-slate-900 text-xs block">
+                      Вариант А: Быстрый раскрой
+                    </span>
+                    <p className="text-[11px] text-slate-500 mt-1 leading-relaxed">
+                      Подобрать раскрой только для дефицита со стандартных хлыстов прямо сейчас.
+                    </p>
+
+                    <div className="mt-2.5 space-y-2">
+                      <label className="text-[11px] text-slate-600 font-semibold block">
+                        Стандартная заготовка:
+                      </label>
+                      <div className="flex items-center gap-1.5">
+                        <button
+                          type="button"
+                          onClick={() => setDeficitStandardSize(12000)}
+                          className={`px-2 py-1 text-xs rounded-lg font-bold border transition-colors cursor-pointer ${
+                            deficitStandardSize === 12000
+                              ? 'bg-blue-600 text-white border-blue-600'
+                              : 'bg-white text-slate-700 border-slate-300 hover:bg-slate-100'
+                          }`}
+                        >
+                          12 м
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => setDeficitStandardSize(6000)}
+                          className={`px-2 py-1 text-xs rounded-lg font-bold border transition-colors cursor-pointer ${
+                            deficitStandardSize === 6000
+                              ? 'bg-blue-600 text-white border-blue-600'
+                              : 'bg-white text-slate-700 border-slate-300 hover:bg-slate-100'
+                          }`}
+                        >
+                          6 м
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => setDeficitStandardSize('both')}
+                          className={`px-2 py-1 text-xs rounded-lg font-bold border transition-colors cursor-pointer ${
+                            deficitStandardSize === 'both'
+                              ? 'bg-blue-600 text-white border-blue-600'
+                              : 'bg-white text-slate-700 border-slate-300 hover:bg-slate-100'
+                          }`}
+                        >
+                          12м + 6м
+                        </button>
+                      </div>
+
+                      <label className="text-[11px] text-slate-600 font-semibold block pt-1">
+                        Стратегия:
+                      </label>
+                      <select
+                        value={deficitStrategy}
+                        onChange={(e) => setDeficitStrategy(e.target.value)}
+                        className="w-full bg-white border border-slate-300 rounded-lg text-xs py-1 px-2 font-medium"
+                      >
+                        <option value="variants">По вариантам (меньше карт)</option>
+                        <option value="min_waste">Минимум отходов</option>
+                        <option value="min_bars">Минимум хлыстов</option>
+                        <option value="max_reusable">Максимум делового</option>
+                      </select>
+                    </div>
+                  </div>
+
+                  <button
+                    type="button"
+                    onClick={handleRunDeficitCalculation}
+                    className="w-full flex items-center justify-center gap-1.5 px-3 py-2 bg-blue-600 hover:bg-blue-700 text-white font-bold rounded-lg transition-colors cursor-pointer shadow-xs mt-2"
+                  >
+                    <Zap className="w-3.5 h-3.5" />
+                    <span>Рассчитать дефицит</span>
+                  </button>
+                </div>
+
+                {/* Option 2: Transfer to New Window */}
+                <div className="p-3.5 bg-slate-50 border border-slate-200 rounded-xl space-y-3 flex flex-col justify-between">
+                  <div>
+                    <span className="font-bold text-slate-900 text-xs flex items-center gap-1.5">
+                      <ExternalLink className="w-3.5 h-3.5 text-emerald-600" />
+                      <span>Вариант Б: Перенести в «НУЖНО» (в новом окне)</span>
+                    </span>
+                    <p className="text-[11px] text-slate-500 mt-1 leading-relaxed">
+                      Открыть неразложенные детали в спецификации «НУЖНО» в новой вкладке/окне браузера. Текущее окно со всеми расчетами и таблицей сравнения останется полностью активным и нетронутым.
+                    </p>
+                  </div>
+
+                  <button
+                    type="button"
+                    onClick={handleTransferDeficitToDemand}
+                    className="w-full flex items-center justify-center gap-1.5 px-3 py-2 bg-emerald-600 hover:bg-emerald-700 text-white font-bold rounded-lg transition-colors cursor-pointer shadow-xs mt-2"
+                  >
+                    <ExternalLink className="w-3.5 h-3.5" />
+                    <span>Перенести в «НУЖНО» в новом окне</span>
+                  </button>
+                </div>
+              </div>
+            </div>
+
+            {/* Modal Footer */}
+            <div className="px-5 py-3 bg-slate-50 border-t border-slate-200 flex justify-end">
+              <button
+                type="button"
+                onClick={() => setDeficitModalRun(null)}
+                className="px-4 py-1.5 text-xs font-semibold text-slate-600 hover:text-slate-900 hover:bg-slate-200 rounded-lg transition-colors cursor-pointer"
+              >
+                Закрыть
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </>
   );
 };

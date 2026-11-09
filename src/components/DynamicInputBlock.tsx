@@ -1,4 +1,4 @@
-import React, { useRef, useState, useEffect } from 'react';
+import React, { useRef, useState, useEffect, useMemo } from 'react';
 import {
   Plus,
   Trash2,
@@ -9,6 +9,11 @@ import {
   ClipboardPaste,
   Columns,
   Check,
+  ArrowUpDown,
+  ArrowUp,
+  ArrowDown,
+  Lock,
+  Unlock,
 } from 'lucide-react';
 import {
   exportItemsToCsv,
@@ -16,6 +21,7 @@ import {
   parseItemsFromCsv,
   parseItemsFromXml,
 } from '../utils/dataIO';
+import { getColorForLength, getDefaultDemandColor } from '../utils/cuttingEngine';
 import { StockUploadModal } from './StockUploadModal';
 import { RemnantExportModal } from './RemnantExportModal';
 
@@ -31,6 +37,7 @@ export interface DynamicRowItem {
   isActive?: boolean; // Активна ли для расчета (галочка)
   usedOrPlaced?: number;
   remainingOrUnplaced?: number;
+  color?: string; // Зафиксированный цвет заготовки как неотъемлемое свойство
 }
 
 export interface CompanionResultItem {
@@ -49,11 +56,14 @@ interface DynamicInputBlockProps {
   usedOrPlacedColHeader: 'Использовано' | 'Разложено';
   remainingColHeader: 'Не использов.' | 'Не разложено';
   currentMaterial?: string;
-  onMaterialChange?: (materialName: string) => void;
+  onMaterialChange?: (materialName: string, source?: 'file' | 'manual') => void;
   getUsedOrPlaced?: (item: DynamicRowItem) => number;
   getRemaining?: (item: DynamicRowItem) => number;
   hasCalculated?: boolean;
   onOpenPasteModal?: () => void;
+  isLocked?: boolean;
+  onRequestUnlock?: () => void;
+  onUnlockMaterial?: () => void;
 }
 
 export const DynamicInputBlock: React.FC<DynamicInputBlockProps> = ({
@@ -70,18 +80,31 @@ export const DynamicInputBlock: React.FC<DynamicInputBlockProps> = ({
   getRemaining,
   hasCalculated = false,
   onOpenPasteModal,
+  isLocked = false,
+  onRequestUnlock,
+  onUnlockMaterial,
 }) => {
   const fileInputRef = useRef<HTMLInputElement>(null);
   const [isStockUploadModalOpen, setIsStockUploadModalOpen] = useState(false);
   const [isExportModalOpen, setIsExportModalOpen] = useState(false);
 
-  // Column visibility settings (standard "Нужно" has mark="Обозначение" enabled)
+  // Column visibility settings (Requirement 12: used/remaining hidden by default)
   const [showColumnsPopover, setShowColumnsPopover] = useState(false);
   const columnsPopoverRef = useRef<HTMLDivElement>(null);
   const [columnsConfig, setColumnsConfig] = useState({
     mark: title === 'Нужно', // In standard set: "Обозначение" is enabled for НУЖНО
     notes: false,
+    usedOrPlaced: false, // Default hidden per req 12
+    remainingOrUnplaced: false, // Default hidden per req 12
   });
+
+  // Table sorting (Requirement 11)
+  const [sortField, setSortField] = useState<'orderIndex' | 'mark' | 'length' | 'quantity' | 'notes' | null>(null);
+  const [sortDir, setSortDir] = useState<'asc' | 'desc'>('asc');
+
+  // Companion table sorting (Requirement 13: default descending by length)
+  const [companionSortField, setCompanionSortField] = useState<'length' | 'quantity'>('length');
+  const [companionSortDir, setCompanionSortDir] = useState<'asc' | 'desc'>('desc');
 
   // Mobile actions dropdown
   const [showMobileActions, setShowMobileActions] = useState(false);
@@ -160,9 +183,94 @@ export const DynamicInputBlock: React.FC<DynamicInputBlockProps> = ({
     (sum, c) => sum + (c.length || 0) * (c.quantity || 0),
     0
   );
-  const companionTotalQty = filteredCompanionItems.reduce((sum, c) => sum + (c.quantity || 0), 0);
+  const companionTotalQty = filteredCompanionItems.reduce(
+    (sum, c) => sum + (c.quantity || 0),
+    0
+  );
+  // Sorting for main table (Requirement 11: 12000 first, 6000 second always pinned at top in "Есть")
+  const displayItems = useMemo(() => {
+    if (title === 'Есть') {
+      const std12 = items.find(
+        (i) => (i.length === 12000 || i.id === 's_def_12000') && (i.isStandard || i.isStandardUnlimited || i.length === 12000)
+      );
+      const std6 = items.find(
+        (i) => (i.length === 6000 || i.id === 's_def_6000') && (i.isStandard || i.isStandardUnlimited || i.length === 6000)
+      );
+      const customItems = items.filter(
+        (i) => i.id !== std12?.id && i.id !== std6?.id
+      );
+
+      if (sortField) {
+        customItems.sort((a, b) => {
+          let diff = 0;
+          if (sortField === 'orderIndex') diff = a.orderIndex - b.orderIndex;
+          else if (sortField === 'length') diff = a.length - b.length;
+          else if (sortField === 'quantity') diff = a.quantity - b.quantity;
+          else if (sortField === 'mark') diff = (a.mark || '').localeCompare(b.mark || '');
+          else if (sortField === 'notes') diff = (a.notes || '').localeCompare(b.notes || '');
+          return sortDir === 'asc' ? diff : -diff;
+        });
+      }
+
+      const pinned: DynamicRowItem[] = [];
+      if (std12) pinned.push(std12);
+      if (std6) pinned.push(std6);
+      return [...pinned, ...customItems];
+    } else {
+      const list = [...items];
+      if (sortField) {
+        list.sort((a, b) => {
+          let diff = 0;
+          if (sortField === 'orderIndex') diff = a.orderIndex - b.orderIndex;
+          else if (sortField === 'length') diff = a.length - b.length;
+          else if (sortField === 'quantity') diff = a.quantity - b.quantity;
+          else if (sortField === 'mark') diff = (a.mark || '').localeCompare(b.mark || '');
+          else if (sortField === 'notes') diff = (a.notes || '').localeCompare(b.notes || '');
+          return sortDir === 'asc' ? diff : -diff;
+        });
+      }
+      return list;
+    }
+  }, [items, title, sortField, sortDir]);
+
+  // Sorting for companion table (Requirement 13: default descending by length)
+  const sortedCompanionItems = useMemo(() => {
+    const list = [...filteredCompanionItems];
+    list.sort((a, b) => {
+      let diff = 0;
+      if (companionSortField === 'length') {
+        diff = a.length - b.length;
+      } else {
+        diff = a.quantity - b.quantity;
+      }
+      return companionSortDir === 'asc' ? diff : -diff;
+    });
+    return list;
+  }, [filteredCompanionItems, companionSortField, companionSortDir]);
+
+  const handleSortToggle = (field: 'orderIndex' | 'mark' | 'length' | 'quantity' | 'notes') => {
+    if (sortField === field) {
+      setSortDir((prev) => (prev === 'asc' ? 'desc' : 'asc'));
+    } else {
+      setSortField(field);
+      setSortDir('asc');
+    }
+  };
+
+  const handleCompanionSortToggle = (field: 'length' | 'quantity') => {
+    if (companionSortField === field) {
+      setCompanionSortDir((prev) => (prev === 'asc' ? 'desc' : 'asc'));
+    } else {
+      setCompanionSortField(field);
+      setCompanionSortDir(field === 'length' ? 'desc' : 'asc');
+    }
+  };
 
   const handleAddRow = () => {
+    if (isLocked && title === 'Нужно') {
+      onRequestUnlock?.();
+      return;
+    }
     const newItem: DynamicRowItem = {
       id: `row_${Date.now()}_${Math.random().toString(36).substring(2, 6)}`,
       orderIndex: items.length + 1,
@@ -170,11 +278,16 @@ export const DynamicInputBlock: React.FC<DynamicInputBlockProps> = ({
       quantity: 1,
       mark: '',
       isActive: true,
+      color: title === 'Нужно' ? getDefaultDemandColor(items.length) : undefined,
     };
     setItems((prev) => [...prev, newItem]);
   };
 
   const handleDeleteRow = (id: string) => {
+    if (isLocked && title === 'Нужно') {
+      onRequestUnlock?.();
+      return;
+    }
     setItems((prev) =>
       prev
         .filter((i) => i.id !== id)
@@ -183,6 +296,10 @@ export const DynamicInputBlock: React.FC<DynamicInputBlockProps> = ({
   };
 
   const handleMoveUp = (index: number) => {
+    if (isLocked && title === 'Нужно') {
+      onRequestUnlock?.();
+      return;
+    }
     if (index === 0) return;
     setItems((prev) => {
       const arr = [...prev];
@@ -194,6 +311,10 @@ export const DynamicInputBlock: React.FC<DynamicInputBlockProps> = ({
   };
 
   const handleMoveDown = (index: number) => {
+    if (isLocked && title === 'Нужно') {
+      onRequestUnlock?.();
+      return;
+    }
     if (index >= items.length - 1) return;
     setItems((prev) => {
       const arr = [...prev];
@@ -205,6 +326,10 @@ export const DynamicInputBlock: React.FC<DynamicInputBlockProps> = ({
   };
 
   const handleUpdate = (id: string, field: keyof DynamicRowItem, val: any) => {
+    if (isLocked && title === 'Нужно') {
+      onRequestUnlock?.();
+      return;
+    }
     setItems((prev) =>
       prev.map((i) => {
         if (i.id !== id) return i;
@@ -221,7 +346,8 @@ export const DynamicInputBlock: React.FC<DynamicInputBlockProps> = ({
               mark: 'Стандарт',
             };
           }
-          return { ...i, length: num };
+          const assignedColor = i.color || (title === 'Нужно' ? getDefaultDemandColor(i.orderIndex - 1, num) : undefined);
+          return { ...i, length: num, color: assignedColor };
         }
         if (field === 'quantity') {
           const qty = Math.max(0, parseInt(val, 10) || 0);
@@ -238,7 +364,13 @@ export const DynamicInputBlock: React.FC<DynamicInputBlockProps> = ({
 
   // Clear handler: for "Есть" leaves two default standard rows (6000 and 12000) pinned, unchecked by default
   const handleClear = () => {
+    if (isLocked && title === 'Нужно') {
+      onRequestUnlock?.();
+      return;
+    }
     if (title === 'Есть') {
+      // Requirement 2: Очистка ЕСТЬ снимает блокировку с МАТЕРИАЛ
+      onUnlockMaterial?.();
       setItems([
         {
           id: `s_def_6000`,
@@ -261,7 +393,7 @@ export const DynamicInputBlock: React.FC<DynamicInputBlockProps> = ({
           mark: 'Стандарт',
         },
       ]);
-      showToast('Склад очищен. Оставлены стандартные заготовки 6000 и 12000 мм (по потребности)');
+      showToast('Склад очищен, наименование материала разблокировано. Стандартные 6000 и 12000 мм сохранены.');
     } else {
       setItems([]);
       showToast('Спецификация очищена');
@@ -297,6 +429,11 @@ export const DynamicInputBlock: React.FC<DynamicInputBlockProps> = ({
 
   // File Upload with Material Filtering for Multi-Material XML files
   const handleFileUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
+    if (isLocked && title === 'Нужно') {
+      onRequestUnlock?.();
+      e.target.value = '';
+      return;
+    }
     const file = e.target.files?.[0];
     if (!file) return;
 
@@ -318,8 +455,12 @@ export const DynamicInputBlock: React.FC<DynamicInputBlockProps> = ({
             isActive: true,
             isStandard: p.length === 6000 || p.length === 12000,
             isStandardUnlimited: (p.length === 6000 || p.length === 12000) && p.quantity === 0,
+            color: (p as any).color || (title === 'Нужно' ? getDefaultDemandColor(idx, p.length) : undefined),
           }));
           setItems(newItems);
+          if (parsed.detectedMaterial && onMaterialChange) {
+            onMaterialChange(parsed.detectedMaterial, 'file');
+          }
           showToast(
             `Импортировано ${newItems.length} поз. для материала «${parsed.detectedMaterial || currentMaterial}»`
           );
@@ -339,6 +480,7 @@ export const DynamicInputBlock: React.FC<DynamicInputBlockProps> = ({
             isActive: true,
             isStandard: p.length === 6000 || p.length === 12000,
             isStandardUnlimited: (p.length === 6000 || p.length === 12000) && p.quantity === 0,
+            color: (p as any).color || (title === 'Нужно' ? getDefaultDemandColor(idx, p.length) : undefined),
           }));
           setItems(newItems);
           showToast(`Импортировано ${newItems.length} позиций из CSV`);
@@ -361,10 +503,21 @@ export const DynamicInputBlock: React.FC<DynamicInputBlockProps> = ({
 
       {/* Primary Input Block (e.g. «Есть» or «Нужно») - 8 cols */}
       <div className="lg:col-span-8 bg-white rounded-xl border border-slate-200 overflow-hidden shadow-xs flex flex-col notranslate" translate="no">
-        {/* ROW 1: Title - strictly h-11 (44px) - Clean title without badge or parentheticals (Points 15 & 16) */}
+        {/* ROW 1: Title - strictly h-11 (44px) - Clean title with lock status badge */}
         <div className="h-11 px-3.5 bg-slate-50 border-b border-slate-200 flex items-center justify-between gap-2 notranslate" translate="no">
-          <div className="flex items-center gap-2 notranslate" translate="no">
+          <div className="flex items-center gap-2.5 notranslate" translate="no">
             <span className="text-lg font-black text-slate-900 tracking-tight">{title}</span>
+            {title === 'Нужно' && isLocked && (
+              <button
+                type="button"
+                onClick={onRequestUnlock}
+                className="flex items-center gap-1.5 px-2.5 py-1 text-xs font-semibold text-amber-800 bg-amber-50 hover:bg-amber-100 border border-amber-300 rounded-lg cursor-pointer shadow-2xs transition-colors"
+                title="Спецификация заблокирована после расчета. Нажмите для разблокировки и изменения"
+              >
+                <Lock className="w-3.5 h-3.5 text-amber-600" />
+                <span>Заблокировано (разблокировать)</span>
+              </button>
+            )}
           </div>
         </div>
 
@@ -403,6 +556,10 @@ export const DynamicInputBlock: React.FC<DynamicInputBlockProps> = ({
                       type="button"
                       onClick={() => {
                         setShowMobileActions(false);
+                        if (isLocked && title === 'Нужно') {
+                          onRequestUnlock?.();
+                          return;
+                        }
                         onOpenPasteModal();
                       }}
                       className="w-full text-left flex items-center gap-2 px-2.5 py-1.5 rounded hover:bg-slate-100 text-slate-700"
@@ -490,7 +647,13 @@ export const DynamicInputBlock: React.FC<DynamicInputBlockProps> = ({
               {onOpenPasteModal && (
                 <button
                   type="button"
-                  onClick={onOpenPasteModal}
+                  onClick={() => {
+                    if (isLocked && title === 'Нужно') {
+                      onRequestUnlock?.();
+                      return;
+                    }
+                    onOpenPasteModal();
+                  }}
                   translate="no"
                   className="flex items-center gap-1 px-2.5 py-1 font-medium text-slate-700 bg-white hover:bg-slate-50 border border-slate-300 rounded-lg transition-colors whitespace-nowrap cursor-pointer"
                   title="Вставить из буфера Excel"
@@ -544,6 +707,32 @@ export const DynamicInputBlock: React.FC<DynamicInputBlockProps> = ({
                         className="w-3.5 h-3.5 text-blue-600 rounded"
                       />
                       <span className="font-medium">Примечание</span>
+                    </label>
+                    <label className="flex items-center gap-2 cursor-pointer select-none">
+                      <input
+                        type="checkbox"
+                        checked={columnsConfig.usedOrPlaced}
+                        onChange={(e) =>
+                          setColumnsConfig((prev) => ({ ...prev, usedOrPlaced: e.target.checked }))
+                        }
+                        className="w-3.5 h-3.5 text-blue-600 rounded"
+                      />
+                      <span className="font-medium">
+                        {title === 'Есть' ? 'Использовано' : 'Разложено'}
+                      </span>
+                    </label>
+                    <label className="flex items-center gap-2 cursor-pointer select-none">
+                      <input
+                        type="checkbox"
+                        checked={columnsConfig.remainingOrUnplaced}
+                        onChange={(e) =>
+                          setColumnsConfig((prev) => ({ ...prev, remainingOrUnplaced: e.target.checked }))
+                        }
+                        className="w-3.5 h-3.5 text-blue-600 rounded"
+                      />
+                      <span className="font-medium">
+                        {title === 'Есть' ? 'Не использовано' : 'Не разложено'}
+                      </span>
                     </label>
                   </div>
                 )}
@@ -632,57 +821,113 @@ export const DynamicInputBlock: React.FC<DynamicInputBlockProps> = ({
                   }`}
                 ></th>
                 <th
-                  className={`py-2 px-2 text-center w-10 border-r ${
+                  onClick={() => handleSortToggle('orderIndex')}
+                  className={`py-2 px-2 text-center w-10 border-r cursor-pointer hover:bg-black/10 transition-colors select-none ${
                     title === 'Нужно' ? 'border-emerald-400' : 'border-blue-400'
                   }`}
+                  title="Сортировать по порядковому номеру"
                 >
-                  №
+                  <div className="flex items-center justify-center gap-0.5">
+                    <span>№</span>
+                    {sortField === 'orderIndex' ? (
+                      sortDir === 'asc' ? <ArrowUp className="w-3 h-3" /> : <ArrowDown className="w-3 h-3" />
+                    ) : (
+                      <ArrowUpDown className="w-2.5 h-2.5 opacity-40 hover:opacity-100" />
+                    )}
+                  </div>
                 </th>
+                {title === 'Нужно' && (
+                  <th
+                    className="py-2 px-1 text-center w-8 border-r border-emerald-400 select-none text-[10px] font-bold uppercase tracking-wider"
+                    title="Цветовая индикация детали"
+                  >
+                    Цвет
+                  </th>
+                )}
                 {columnsConfig.mark && (
                   <th
-                    className={`py-2 px-3 border-r min-w-[120px] ${
+                    onClick={() => handleSortToggle('mark')}
+                    className={`py-2 px-3 border-r min-w-[120px] cursor-pointer hover:bg-black/10 transition-colors select-none ${
                       title === 'Нужно' ? 'border-emerald-400' : 'border-blue-400'
                     }`}
+                    title="Сортировать по обозначению"
                   >
-                    Обозначение
+                    <div className="flex items-center justify-between gap-1">
+                      <span>Обозначение</span>
+                      {sortField === 'mark' ? (
+                        sortDir === 'asc' ? <ArrowUp className="w-3 h-3 shrink-0" /> : <ArrowDown className="w-3 h-3 shrink-0" />
+                      ) : (
+                        <ArrowUpDown className="w-2.5 h-2.5 opacity-40 hover:opacity-100 shrink-0" />
+                      )}
+                    </div>
                   </th>
                 )}
                 <th
-                  className={`py-2 px-3 border-r ${
+                  onClick={() => handleSortToggle('length')}
+                  className={`py-2 px-3 border-r cursor-pointer hover:bg-black/10 transition-colors select-none ${
                     title === 'Нужно' ? 'border-emerald-400' : 'border-blue-400'
                   }`}
+                  title="Сортировать по размеру заготовки"
                 >
-                  Размер (мм)
-                </th>
-                {/* Point 8: Предотвратить прыгание ширины столбца при переключении "Задать" / "По потребности" */}
-                <th
-                  className={`py-2 px-3 border-r w-44 min-w-[170px] max-w-[170px] ${
-                    title === 'Нужно' ? 'border-emerald-400' : 'border-blue-400'
-                  }`}
-                >
-                  Кол-во (шт)
-                </th>
-                <th
-                  className={`py-2 px-3 border-r ${
-                    title === 'Нужно' ? 'border-emerald-400' : 'border-blue-400'
-                  }`}
-                >
-                  {usedOrPlacedColHeader}
+                  <div className="flex items-center justify-between gap-1">
+                    <span>Размер (мм)</span>
+                    {sortField === 'length' ? (
+                      sortDir === 'asc' ? <ArrowUp className="w-3 h-3 shrink-0" /> : <ArrowDown className="w-3 h-3 shrink-0" />
+                    ) : (
+                      <ArrowUpDown className="w-2.5 h-2.5 opacity-40 hover:opacity-100 shrink-0" />
+                    )}
+                  </div>
                 </th>
                 <th
-                  className={`py-2 px-3 border-r ${
+                  onClick={() => handleSortToggle('quantity')}
+                  className={`py-2 px-3 border-r w-44 min-w-[170px] max-w-[170px] cursor-pointer hover:bg-black/10 transition-colors select-none ${
                     title === 'Нужно' ? 'border-emerald-400' : 'border-blue-400'
                   }`}
+                  title="Сортировать по количеству"
                 >
-                  {remainingColHeader}
+                  <div className="flex items-center justify-between gap-1">
+                    <span>Кол-во (шт)</span>
+                    {sortField === 'quantity' ? (
+                      sortDir === 'asc' ? <ArrowUp className="w-3 h-3 shrink-0" /> : <ArrowDown className="w-3 h-3 shrink-0" />
+                    ) : (
+                      <ArrowUpDown className="w-2.5 h-2.5 opacity-40 hover:opacity-100 shrink-0" />
+                    )}
+                  </div>
                 </th>
-                {columnsConfig.notes && (
+                {columnsConfig.usedOrPlaced && (
                   <th
                     className={`py-2 px-3 border-r ${
                       title === 'Нужно' ? 'border-emerald-400' : 'border-blue-400'
                     }`}
                   >
-                    Примечание
+                    {usedOrPlacedColHeader}
+                  </th>
+                )}
+                {columnsConfig.remainingOrUnplaced && (
+                  <th
+                    className={`py-2 px-3 border-r ${
+                      title === 'Нужно' ? 'border-emerald-400' : 'border-blue-400'
+                    }`}
+                  >
+                    {remainingColHeader}
+                  </th>
+                )}
+                {columnsConfig.notes && (
+                  <th
+                    onClick={() => handleSortToggle('notes')}
+                    className={`py-2 px-3 border-r cursor-pointer hover:bg-black/10 transition-colors select-none ${
+                      title === 'Нужно' ? 'border-emerald-400' : 'border-blue-400'
+                    }`}
+                    title="Сортировать по примечанию"
+                  >
+                    <div className="flex items-center justify-between gap-1">
+                      <span>Примечание</span>
+                      {sortField === 'notes' ? (
+                        sortDir === 'asc' ? <ArrowUp className="w-3 h-3 shrink-0" /> : <ArrowDown className="w-3 h-3 shrink-0" />
+                      ) : (
+                        <ArrowUpDown className="w-2.5 h-2.5 opacity-40 hover:opacity-100 shrink-0" />
+                      )}
+                    </div>
                   </th>
                 )}
                 <th className="py-2 px-2 text-center w-14">Порядок</th>
@@ -702,6 +947,7 @@ export const DynamicInputBlock: React.FC<DynamicInputBlockProps> = ({
                   }`}
                 ></td>
                 <td className="py-1 px-2 text-center">—</td>
+                {title === 'Нужно' && <td className="py-1 px-1 text-center font-bold">—</td>}
                 {columnsConfig.mark && <td className="py-1 px-3">—</td>}
                 {/* Point 11: В строке итогов «ЕСТЬ» в столбце «Размер (мм)» убрать сумму (показывать "—") */}
                 <td className="py-1 px-3 font-bold">
@@ -720,34 +966,41 @@ export const DynamicInputBlock: React.FC<DynamicInputBlockProps> = ({
                     ? `Всего: ${fixedQtyTotal.toLocaleString('ru-RU')} шт.`
                     : '—'}
                 </td>
-                <td className="py-1 px-3 font-semibold">
-                  {!hasCalculated
-                    ? '—'
-                    : totalUsedOrPlaced > 0
-                    ? `Всего: ${totalUsedOrPlaced.toLocaleString('ru-RU')} шт.`
-                    : '—'}
-                </td>
+                {columnsConfig.usedOrPlaced && (
+                  <td className="py-1 px-3 font-semibold">
+                    {!hasCalculated
+                      ? '—'
+                      : totalUsedOrPlaced > 0
+                      ? `Всего: ${totalUsedOrPlaced.toLocaleString('ru-RU')} шт.`
+                      : '—'}
+                  </td>
+                )}
                 {/* В столбце «Не использовано» до расчета всегда показывать "—" */}
-                <td className="py-1 px-3 font-semibold">
-                  {!hasCalculated
-                    ? '—'
-                    : totalRemaining > 0
-                    ? `Всего: ${totalRemaining.toLocaleString('ru-RU')} шт.`
-                    : '—'}
-                </td>
+                {columnsConfig.remainingOrUnplaced && (
+                  <td className="py-1 px-3 font-semibold">
+                    {!hasCalculated
+                      ? '—'
+                      : totalRemaining > 0
+                      ? `Всего: ${totalRemaining.toLocaleString('ru-RU')} шт.`
+                      : '—'}
+                  </td>
+                )}
                 {columnsConfig.notes && <td className="py-1 px-3">—</td>}
                 <td className="py-1 px-2 text-center"></td>
               </tr>
             </thead>
 
             <tbody className="divide-y divide-slate-200">
-              {items.length === 0 ? (
+              {displayItems.length === 0 ? (
                 <tr>
                   <td
                     colSpan={
-                      5 +
+                      3 +
+                      (title === 'Нужно' ? 1 : 0) +
                       (columnsConfig.mark ? 1 : 0) +
                       (columnsConfig.notes ? 1 : 0) +
+                      (columnsConfig.usedOrPlaced ? 1 : 0) +
+                      (columnsConfig.remainingOrUnplaced ? 1 : 0) +
                       1
                     }
                     className="py-8 text-center text-slate-400 text-xs"
@@ -756,7 +1009,7 @@ export const DynamicInputBlock: React.FC<DynamicInputBlockProps> = ({
                   </td>
                 </tr>
               ) : (
-                items.map((item, idx) => {
+                displayItems.map((item: DynamicRowItem, idx: number) => {
                   const isStandardLength =
                     title === 'Есть' &&
                     (item.isStandard || item.length === 6000 || item.length === 12000);
@@ -803,15 +1056,52 @@ export const DynamicInputBlock: React.FC<DynamicInputBlockProps> = ({
                         {idx + 1}
                       </td>
 
+                      {/* Color indicator in НУЖНО */}
+                      {title === 'Нужно' && (
+                        <td className="py-1.5 px-1 text-center border-r border-slate-200 bg-slate-50/40">
+                          <label
+                            className={`relative inline-block w-4 h-4 rounded-xs border border-black/35 shadow-2xs transition-transform overflow-hidden align-middle ${
+                              isLocked
+                                ? 'cursor-not-allowed opacity-90'
+                                : 'cursor-pointer hover:scale-110 hover:ring-2 hover:ring-emerald-400'
+                            }`}
+                            style={{ backgroundColor: item.color || getDefaultDemandColor(idx, item.length) }}
+                            title={
+                              isLocked
+                                ? `Цвет детали: ${item.length ? item.length + ' мм' : 'деталь'} (заблокировано)`
+                                : `Цвет детали: ${item.length ? item.length + ' мм' : 'деталь'} (нажмите для выбора цвета)`
+                            }
+                            onClick={(e) => {
+                              if (isLocked) {
+                                e.preventDefault();
+                                onRequestUnlock?.();
+                              }
+                            }}
+                          >
+                            <input
+                              type="color"
+                              value={item.color || getDefaultDemandColor(idx, item.length)}
+                              disabled={isLocked}
+                              onChange={(e) => handleUpdate(item.id, 'color', e.target.value)}
+                              className="opacity-0 absolute inset-0 w-full h-full cursor-pointer disabled:cursor-not-allowed"
+                            />
+                          </label>
+                        </td>
+                      )}
+
                       {/* Designation (mark) */}
                       {columnsConfig.mark && (
                         <td className="py-1 px-2 border-r border-slate-200">
                           <input
                             type="text"
                             value={item.mark || ''}
+                            readOnly={isLocked && title === 'Нужно'}
+                            onClick={() => {
+                              if (isLocked && title === 'Нужно') onRequestUnlock?.();
+                            }}
                             onChange={(e) => handleUpdate(item.id, 'mark', e.target.value)}
                             placeholder={title === 'Нужно' ? 'Деталь (С-1)' : 'Склад'}
-                            className="w-full text-xs text-slate-800 bg-transparent border-0 px-1 py-0.5 focus:outline-hidden focus:bg-white focus:ring-1 focus:ring-blue-500 rounded"
+                            className={`w-full text-xs text-slate-800 bg-transparent border-0 px-1 py-0.5 focus:outline-hidden focus:bg-white focus:ring-1 focus:ring-blue-500 rounded ${isLocked && title === 'Нужно' ? 'cursor-pointer hover:bg-amber-50/50' : ''}`}
                           />
                         </td>
                       )}
@@ -832,9 +1122,13 @@ export const DynamicInputBlock: React.FC<DynamicInputBlockProps> = ({
                             type="number"
                             min="1"
                             value={item.length || ''}
+                            readOnly={isLocked && title === 'Нужно'}
+                            onClick={() => {
+                              if (isLocked && title === 'Нужно') onRequestUnlock?.();
+                            }}
                             onChange={(e) => handleUpdate(item.id, 'length', e.target.value)}
                             placeholder="0"
-                            className="w-full font-mono font-bold text-slate-900 bg-transparent border-0 px-1 py-0.5 focus:outline-hidden focus:bg-white focus:ring-1 focus:ring-blue-500 rounded"
+                            className={`w-full font-mono font-bold text-slate-900 bg-transparent border-0 px-1 py-0.5 focus:outline-hidden focus:bg-white focus:ring-1 focus:ring-blue-500 rounded ${isLocked && title === 'Нужно' ? 'cursor-pointer hover:bg-amber-50/50' : ''}`}
                           />
                         )}
                       </td>
@@ -877,9 +1171,13 @@ export const DynamicInputBlock: React.FC<DynamicInputBlockProps> = ({
                                   ? ''
                                   : item.quantity || ''
                               }
+                              readOnly={isLocked && title === 'Нужно'}
+                              onClick={() => {
+                                if (isLocked && title === 'Нужно') onRequestUnlock?.();
+                              }}
                               onChange={(e) => handleUpdate(item.id, 'quantity', e.target.value)}
                               placeholder={isStandardLength ? '1' : '1'}
-                              className="w-full font-mono font-bold text-blue-700 bg-transparent border-0 px-1 py-0.5 focus:outline-hidden focus:bg-white focus:ring-1 focus:ring-blue-500 rounded"
+                              className={`w-full font-mono font-bold text-blue-700 bg-transparent border-0 px-1 py-0.5 focus:outline-hidden focus:bg-white focus:ring-1 focus:ring-blue-500 rounded ${isLocked && title === 'Нужно' ? 'cursor-pointer hover:bg-amber-50/50' : ''}`}
                             />
                             {isStandardLength && (
                               <button
@@ -899,25 +1197,29 @@ export const DynamicInputBlock: React.FC<DynamicInputBlockProps> = ({
                       </td>
 
                       {/* Used or Placed (calculated) */}
-                      <td className="py-1.5 px-3 font-mono font-semibold text-slate-700 border-r border-slate-200">
-                        {(() => {
-                          if (!hasCalculated) return '—';
-                          const val = getUsedOrPlaced ? getUsedOrPlaced(item) : item.usedOrPlaced;
-                          return typeof val === 'number' && val > 0 ? val : '—';
-                        })()}
-                      </td>
+                      {columnsConfig.usedOrPlaced && (
+                        <td className="py-1.5 px-3 font-mono font-semibold text-slate-700 border-r border-slate-200">
+                          {(() => {
+                            if (!hasCalculated) return '—';
+                            const val = getUsedOrPlaced ? getUsedOrPlaced(item) : item.usedOrPlaced;
+                            return typeof val === 'number' && val > 0 ? val : '—';
+                          })()}
+                        </td>
+                      )}
 
                       {/* Remaining or Unplaced (calculated) - Point 12: show "—" before calculation */}
-                      <td className="py-1.5 px-3 font-mono font-semibold text-slate-700 border-r border-slate-200">
-                        {(() => {
-                          if (!hasCalculated) return '—';
-                          if (isAutoCalculated) {
-                            return <span className="text-[10px] text-slate-400 font-sans">По потребности</span>;
-                          }
-                          const val = getRemaining ? getRemaining(item) : item.remainingOrUnplaced;
-                          return typeof val === 'number' && val > 0 ? val : '—';
-                        })()}
-                      </td>
+                      {columnsConfig.remainingOrUnplaced && (
+                        <td className="py-1.5 px-3 font-mono font-semibold text-slate-700 border-r border-slate-200">
+                          {(() => {
+                            if (!hasCalculated) return '—';
+                            if (isAutoCalculated) {
+                              return <span className="text-[10px] text-slate-400 font-sans">По потребности</span>;
+                            }
+                            const val = getRemaining ? getRemaining(item) : item.remainingOrUnplaced;
+                            return typeof val === 'number' && val > 0 ? val : '—';
+                          })()}
+                        </td>
+                      )}
 
                       {/* Notes (optional) */}
                       {columnsConfig.notes && (
@@ -925,9 +1227,13 @@ export const DynamicInputBlock: React.FC<DynamicInputBlockProps> = ({
                           <input
                             type="text"
                             value={item.notes || ''}
+                            readOnly={isLocked && title === 'Нужно'}
+                            onClick={() => {
+                              if (isLocked && title === 'Нужно') onRequestUnlock?.();
+                            }}
                             onChange={(e) => handleUpdate(item.id, 'notes', e.target.value)}
                             placeholder="Примечание"
-                            className="w-full text-xs text-slate-600 bg-transparent border-0 px-1 py-0.5 focus:outline-hidden focus:bg-white rounded"
+                            className={`w-full text-xs text-slate-600 bg-transparent border-0 px-1 py-0.5 focus:outline-hidden focus:bg-white rounded ${isLocked && title === 'Нужно' ? 'cursor-pointer hover:bg-amber-50/50' : ''}`}
                           />
                         </td>
                       )}
@@ -1038,13 +1344,43 @@ export const DynamicInputBlock: React.FC<DynamicInputBlockProps> = ({
             >
               <tr className="h-9">
                 <th
-                  className={`py-2 px-3 border-r ${
+                  onClick={() => handleCompanionSortToggle('length')}
+                  className={`py-2 px-3 border-r cursor-pointer hover:bg-black/10 transition-colors select-none ${
                     companionTitle === 'Не сделано' ? 'border-rose-500' : 'border-slate-500'
                   }`}
+                  title="Сортировать по размеру"
                 >
-                  Размер (мм)
+                  <div className="flex items-center justify-between gap-1">
+                    <span>Размер (мм)</span>
+                    {companionSortField === 'length' ? (
+                      companionSortDir === 'asc' ? (
+                        <ArrowUp className="w-3 h-3 shrink-0" />
+                      ) : (
+                        <ArrowDown className="w-3 h-3 shrink-0" />
+                      )
+                    ) : (
+                      <ArrowUpDown className="w-2.5 h-2.5 opacity-40 hover:opacity-100 shrink-0" />
+                    )}
+                  </div>
                 </th>
-                <th className="py-2 px-3">Кол-во (шт)</th>
+                <th
+                  onClick={() => handleCompanionSortToggle('quantity')}
+                  className="py-2 px-3 cursor-pointer hover:bg-black/10 transition-colors select-none"
+                  title="Сортировать по количеству"
+                >
+                  <div className="flex items-center justify-between gap-1">
+                    <span>Кол-во (шт)</span>
+                    {companionSortField === 'quantity' ? (
+                      companionSortDir === 'asc' ? (
+                        <ArrowUp className="w-3 h-3 shrink-0" />
+                      ) : (
+                        <ArrowDown className="w-3 h-3 shrink-0" />
+                      )
+                    ) : (
+                      <ArrowUpDown className="w-2.5 h-2.5 opacity-40 hover:opacity-100 shrink-0" />
+                    )}
+                  </div>
+                </th>
               </tr>
               {/* Summary Row */}
               <tr
@@ -1072,7 +1408,7 @@ export const DynamicInputBlock: React.FC<DynamicInputBlockProps> = ({
             </thead>
 
             <tbody className="divide-y divide-slate-200">
-              {filteredCompanionItems.length === 0 ? (
+              {sortedCompanionItems.length === 0 ? (
                 <tr>
                   <td colSpan={2} className="py-8 text-center text-slate-400 text-xs">
                     {companionTitle === 'Осталось'
@@ -1085,7 +1421,7 @@ export const DynamicInputBlock: React.FC<DynamicInputBlockProps> = ({
                   </td>
                 </tr>
               ) : (
-                filteredCompanionItems.map((comp, idx) => (
+                sortedCompanionItems.map((comp: CompanionResultItem, idx: number) => (
                   <tr key={idx} className="hover:bg-slate-50 transition-colors">
                     <td className="py-2 px-3 font-mono font-bold text-slate-800 border-r border-slate-200">
                       {comp.length}
@@ -1122,7 +1458,7 @@ export const DynamicInputBlock: React.FC<DynamicInputBlockProps> = ({
             }
 
             if (updateMatSettings && onMaterialChange) {
-              onMaterialChange(selectedMatName);
+              onMaterialChange(selectedMatName, 'file');
             }
 
             showToast(

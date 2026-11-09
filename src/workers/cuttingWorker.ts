@@ -2,13 +2,14 @@
  * Web Worker for Linear Cutting Optimization
  * Executes off-thread to prevent browser tab freezing and maintain 60fps UI responsiveness
  */
-import { solveLinearCutting } from '../utils/cuttingEngine';
+import { solveLinearCutting, runComprehensiveSuite, ComprehensiveSuiteItem } from '../utils/cuttingEngine';
 import { StockItem, DemandItem, AppSettings, CalculationProgressInfo, FullOptimizationSolution } from '../types/cutting';
 
 export interface WorkerStartPayload {
   stockInput: StockItem[];
   demandInput: DemandItem[];
   settings: AppSettings;
+  isComprehensive?: boolean;
 }
 
 export interface WorkerStartMessage {
@@ -32,12 +33,24 @@ export interface WorkerDoneMessage {
   payload: FullOptimizationSolution;
 }
 
+export interface WorkerComprehensiveDoneMessage {
+  type: 'COMPREHENSIVE_DONE';
+  payload: {
+    suite: ComprehensiveSuiteItem[];
+    bestSolution: FullOptimizationSolution;
+  };
+}
+
 export interface WorkerErrorMessage {
   type: 'ERROR';
   payload: string;
 }
 
-export type WorkerOutMessage = WorkerProgressMessage | WorkerDoneMessage | WorkerErrorMessage;
+export type WorkerOutMessage =
+  | WorkerProgressMessage
+  | WorkerDoneMessage
+  | WorkerComprehensiveDoneMessage
+  | WorkerErrorMessage;
 
 let isAborted = false;
 
@@ -51,17 +64,32 @@ self.onmessage = (e: MessageEvent<WorkerInMessage>) => {
 
   if (data.type === 'START') {
     isAborted = false;
-    const { stockInput, demandInput, settings } = data.payload;
+    const { stockInput, demandInput, settings, isComprehensive } = data.payload;
 
     try {
-      const solution = solveLinearCutting(stockInput, demandInput, settings, {
-        onProgress: (progress: CalculationProgressInfo) => {
-          self.postMessage({ type: 'PROGRESS', payload: progress });
-        },
-        shouldAbort: () => isAborted,
-      });
+      if (isComprehensive || settings.optimizationGoal === 'comprehensive') {
+        const result = runComprehensiveSuite(stockInput, demandInput, settings, {
+          onProgress: (progress: CalculationProgressInfo) => {
+            self.postMessage({ type: 'PROGRESS', payload: progress });
+          },
+          shouldAbort: () => isAborted,
+        });
 
-      self.postMessage({ type: 'DONE', payload: solution });
+        self.postMessage({
+          type: 'COMPREHENSIVE_DONE',
+          payload: result,
+        });
+        self.postMessage({ type: 'DONE', payload: result.bestSolution });
+      } else {
+        const solution = solveLinearCutting(stockInput, demandInput, settings, {
+          onProgress: (progress: CalculationProgressInfo) => {
+            self.postMessage({ type: 'PROGRESS', payload: progress });
+          },
+          shouldAbort: () => isAborted,
+        });
+
+        self.postMessage({ type: 'DONE', payload: solution });
+      }
     } catch (err: any) {
       self.postMessage({
         type: 'ERROR',

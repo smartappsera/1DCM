@@ -141,6 +141,24 @@ export const PrintReports: React.FC<PrintReportsProps> = ({
       `;
     });
 
+    const STRATEGY_TITLES: Record<string, string> = {
+      variants: 'Оптимизация вариантов (схем)',
+      min_waste: 'Минимум отходов',
+      min_bars: 'Минимум хлыстов',
+      max_reusable: 'Максимум делового остатка',
+      prioritize_remnants: 'Приоритет складских остатков',
+      comprehensive: 'Комплексный подбор',
+    };
+
+    const SPEED_TITLES: Record<string, string> = {
+      fast: 'Быстро (~10-15 сек)',
+      standard: 'Стандарт (~1-2 мин)',
+      deep: 'Глубокий перебор (от 2 мин)',
+    };
+
+    const strategyLabel = STRATEGY_TITLES[params.strategy || 'variants'] || params.strategy || 'Оптимизация вариантов';
+    const speedLabel = SPEED_TITLES[params.searchSpeed || 'standard'] || params.searchSpeed || 'Стандарт';
+
     const doc = `<!DOCTYPE html>
 <html lang="ru">
 <head>
@@ -153,7 +171,12 @@ export const PrintReports: React.FC<PrintReportsProps> = ({
     .meta-line { font-size: 12px; color: #475569; margin-top: 4px; }
     .divider { border: 0; border-top: 1px solid #e2e8f0; margin: 12px 0; }
     .thick-divider { border: 0; border-top: 2px solid #94a3b8; margin: 20px 0; }
-    .summary-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; padding: 12px; background: #f8fafc; border: 1px solid #e2e8f0; border-radius: 6px; font-size: 12px; margin-bottom: 20px; }
+    .summary-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; padding: 12px; background: #f8fafc; border: 1px solid #e2e8f0; border-radius: 6px; font-size: 12px; margin-bottom: 12px; }
+    .geometry-box { background: #f1f5f9; border: 1px solid #cbd5e1; border-radius: 6px; padding: 12px; margin-bottom: 20px; font-size: 11px; }
+    .geometry-title { font-weight: 800; text-transform: uppercase; letter-spacing: 0.05em; color: #334155; margin-bottom: 8px; font-size: 11px; }
+    .geometry-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 8px 14px; }
+    .geom-item { color: #475569; }
+    .geom-item strong { color: #0f172a; }
     .card-block { border: 1px solid #94a3b8; border-radius: 8px; padding: 14px; margin-bottom: 20px; page-break-inside: avoid; break-inside: avoid; }
     .card-header { display: flex; justify-content: space-between; align-items: center; }
     .badge { background: #0f172a; color: #fff; padding: 2px 6px; border-radius: 4px; font-family: monospace; font-size: 11px; font-weight: bold; margin-right: 8px; }
@@ -171,6 +194,7 @@ export const PrintReports: React.FC<PrintReportsProps> = ({
         Заказ / Проект: <strong>${safeProject}</strong> &nbsp;&middot;&nbsp;
         Материал: <strong>${safeMat}</strong> &nbsp;&middot;&nbsp;
         Дата: <strong>${new Date().toLocaleDateString('ru-RU')}</strong>
+        ${params.orderComment ? `&nbsp;&middot;&nbsp; Комментарий: <strong>${params.orderComment}</strong>` : ''}
       </div>
     </div>
     <div style="text-align:right;">
@@ -180,10 +204,24 @@ export const PrintReports: React.FC<PrintReportsProps> = ({
   </div>
 
   <div class="summary-grid">
-    <div>Ширина пропила: <strong>${params.bladeWidth} мм</strong></div>
-    <div>Торцовка: <strong>${params.trimStart} мм</strong></div>
-    <div>Всего заготовок: <strong>${result.totalStockBarsUsed} шт (${(result.totalStockLengthUsed / 1000).toFixed(1)} м)</strong></div>
+    <div>Использовано хлыстов: <strong>${result.totalStockBarsUsed} шт (${(result.totalStockLengthUsed / 1000).toFixed(1)} м)</strong></div>
+    <div>Готовых деталей: <strong>${(result.totalPartsLength / 1000).toFixed(1)} м</strong></div>
     <div>Деловой остаток: <strong>${(result.totalReusableLength / 1000).toFixed(1)} м</strong></div>
+    <div>Невозвратный лом + рез: <strong>${((result.totalScrapLength + result.totalKerfLoss) / 1000).toFixed(2)} м</strong></div>
+  </div>
+
+  <div class="geometry-box">
+    <div class="geometry-title">Параметры и геометрия реза</div>
+    <div class="geometry-grid">
+      <div class="geom-item">Ширина пропила (рез): <strong>${params.bladeWidth} мм</strong></div>
+      <div class="geom-item">Торцовка (кромка): <strong>${params.trimStart} мм</strong></div>
+      <div class="geom-item">Порог делового остатка: <strong>${params.reusableRemnantMin ?? params.minReusableLength ?? 250} мм</strong></div>
+      <div class="geom-item">Рез под углом 45°: <strong>${params.cutAngle45 ? 'Да (косой рез)' : 'Нет (прямой 90°)'}</strong></div>
+      <div class="geom-item">Режим резки: <strong>${params.dualProfileCut ? 'Пакетный рез (от 2 шт.)' : 'Одиночный (по 1 хлысту)'}</strong></div>
+      <div class="geom-item">Стратегия: <strong>${strategyLabel}</strong></div>
+      <div class="geom-item">Скорость: <strong>${speedLabel}</strong></div>
+      <div class="geom-item">Упор / стружка: <strong>Учтены в картах</strong></div>
+    </div>
   </div>
 
   <div class="cards-container">

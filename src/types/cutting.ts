@@ -81,11 +81,23 @@ export interface FullOptimizationSolution {
   totalBarsUsed: number; // Всего исп. заготовок, шт (82)
   totalWasteLength: number; // Отходы, мм (6 892 или 7 570)
   totalReusableLength: number; // Из них деловой остаток, мм
-  overallKIM: number; // Общий КИМ, % (98.60%)
+  overallKIM: number; // Общий (валовый) КИМ, % (с учетом делового остатка)
+  netKIM?: number; // Мгновенный (чистый) КИМ, % (отношение длины готовых деталей к расходу материала без учета делового остатка)
   rows: SolutionRow[];
   remainingWarehouseStock: RemnantItem[]; // Блок «Осталось»
   unplacedDemand: UnplacedItem[]; // Блок «Не сделано»
   calculationTimeMs: number;
+}
+
+export interface CustomStrategyConfig {
+  maxPassesMultiplier: number; // Множитель числа проходов (0.25 - 3.0), default 1.0
+  enable2Opt: boolean; // Включить 2-Opt локальный поиск, default true
+  twoOptRounds: number; // Количество раундов 2-Opt (1 - 50), default 15
+  enableTailConsolidation: boolean; // Включить рекомбинацию и схлопывание карт хвостов, default true
+  tailConsolidationMaxBars: number; // Максимум заготовок в пуле хвостов (1 - 20), default 10
+  cardMergeScrapToleranceMm: number; // Допуск по обрезку при слиянии карт, мм (0 - 500), default 120
+  preferFewerCards: boolean; // Приоритет минимального числа карт раскроя, default true
+  remnantTargetMinLength: number; // Целевая мин. длина делового остатка, мм, default 1500
 }
 
 export interface AppSettings {
@@ -101,20 +113,34 @@ export interface AppSettings {
   groupSolutions: boolean; // Группировать решение
   showGraphics: boolean; // Отображать графику
   searchSpeed: 'fast' | 'standard' | 'deep'; // Быстро / Обычный / Глубокий
-  optimizationGoal: 'variants' | 'min_waste' | 'min_bars' | 'max_reusable' | 'prioritize_remnants'; // Оптимизация
+  optimizationGoal:
+    | 'variants'
+    | 'min_waste'
+    | 'min_bars'
+    | 'max_reusable'
+    | 'prioritize_remnants'
+    | 'comprehensive'
+    | 'custom'; // Оптимизация
+  customStrategyConfig?: CustomStrategyConfig; // Параметры пользовательской стратегии
+  orderComment?: string; // Комментарий к заказу (цех, примечание)
+  isMaterialLocked?: boolean; // Блокировка редактирования наименования материала
+  materialLockSource?: 'file' | 'manual' | null; // Источник блокировки (из csv/xml или вручную)
   targetRemnantKIM?: number; // Целевой КИМ делового остатка (1 - 99%), default: 75%
+  targetRemnantMinLength?: number; // Минимальный целевой размер делового остатка, к которому стремиться (мм), default: 1500
 }
 
 export interface CalculationProgressInfo {
   stage: number; // 1, 2, 3
   totalStages: number; // 3
   stageName: string;
+  stageStepName?: string; // Детальный шаг (напр. "Раунд 2-Opt 4/15", "Схлопывание карт 4 -> 3")
   percent: number; // 0 - 100
   placedParts: number;
   totalParts: number;
   usedBars: number;
   totalBarsEstimate: number;
   bestKIM: number;
+  uniqueCardsCount?: number; // Живой счетчик уникальных карт
   elapsedMs: number;
   etaSeconds?: number;
 }
@@ -161,6 +187,11 @@ export interface CuttingParams {
   projectName: string;
   materialName: string;
   orderNumber: string;
+  reusableRemnantMin?: number;
+  cutAngle45?: boolean;
+  dualProfileCut?: boolean;
+  searchSpeed?: string;
+  orderComment?: string;
 }
 
 export interface CutPiece {

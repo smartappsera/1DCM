@@ -3,7 +3,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-import React, { useState, useMemo } from 'react';
+import React, { useState, useMemo, useRef, useEffect } from 'react';
 import { Header } from './components/Header';
 import { SettingsSidebar } from './components/SettingsSidebar';
 import { CalculationSpoiler } from './components/CalculationSpoiler';
@@ -12,7 +12,7 @@ import { SolutionOutputView } from './components/SolutionOutputView';
 import { PrintReports } from './components/PrintReports';
 import { ExcelPasteModal } from './components/ExcelPasteModal';
 import { CalculationProgressModal, CalculationRun } from './components/CalculationProgressModal';
-import { solveLinearCutting, recalculateSolutionWithSettings } from './utils/cuttingEngine';
+import { solveLinearCutting, recalculateSolutionWithSettings, getDefaultDemandColor } from './utils/cuttingEngine';
 import { exportSolutionToExcel } from './utils/dataIO';
 import {
   AppSettings,
@@ -20,7 +20,7 @@ import {
   StockItem,
   DemandItem,
 } from './types/cutting';
-import { Play } from 'lucide-react';
+import { Play, Lock, Unlock } from 'lucide-react';
 
 export default function App() {
   const [activeTab, setActiveTab] = useState<'workspace' | 'visualizer' | 'reports'>('workspace');
@@ -63,6 +63,7 @@ export default function App() {
     showGraphics: true,
     searchSpeed: 'fast',
     optimizationGoal: 'variants',
+    targetRemnantMinLength: 1500,
   });
 
   // Stocks («Есть») initialized with pinned standard bars + benchmark remnants
@@ -92,14 +93,30 @@ export default function App() {
     { id: 's3', orderIndex: 4, length: 580, quantity: 100, mark: 'Склад', isActive: true },
   ]);
 
-  // Demands («Нужно») initialized with the exact benchmark from Screenshot 3
+  // Demands («Нужно») initialized with fixed distinct colors for each piece
   const [demandItems, setDemandItems] = useState<DynamicRowItem[]>([
-    { id: 'd1', orderIndex: 1, length: 5230, quantity: 30 },
-    { id: 'd2', orderIndex: 2, length: 150, quantity: 400 },
-    { id: 'd3', orderIndex: 3, length: 320, quantity: 30 },
-    { id: 'd4', orderIndex: 4, length: 280, quantity: 50 },
-    { id: 'd5', orderIndex: 5, length: 800, quantity: 150 },
-    { id: 'd6', orderIndex: 6, length: 810, quantity: 150 },
+    { id: 'd1', orderIndex: 1, length: 5230, quantity: 31, mark: '1', color: '#F87171' },
+    { id: 'd2', orderIndex: 2, length: 150, quantity: 400, mark: '2', color: '#4ADE80' },
+    { id: 'd3', orderIndex: 3, length: 320, quantity: 30, mark: '3', color: '#6366F1' },
+    { id: 'd4', orderIndex: 4, length: 280, quantity: 50, mark: '4', color: '#FACC15' },
+    { id: 'd5', orderIndex: 5, length: 800, quantity: 150, mark: '5', color: '#E879F9' },
+    { id: 'd6', orderIndex: 6, length: 810, quantity: 150, mark: '6', color: '#38BDF8' },
+    { id: 'd7', orderIndex: 7, length: 564, quantity: 1200, mark: '7', color: '#FB923C' },
+    { id: 'd8', orderIndex: 8, length: 312, quantity: 112, mark: '8', color: '#2DD4BF' },
+    { id: 'd9', orderIndex: 9, length: 85, quantity: 1224, mark: '9', color: '#A78BFA' },
+    { id: 'd10', orderIndex: 10, length: 5300, quantity: 1120, mark: '10', color: '#F472B6' },
+    { id: 'd11', orderIndex: 11, length: 788, quantity: 15, mark: '11', color: '#34D399' },
+    { id: 'd12', orderIndex: 12, length: 99, quantity: 12, mark: '12', color: '#60A5FA' },
+    { id: 'd13', orderIndex: 13, length: 780, quantity: 130, mark: '13', color: '#FBBF24' },
+    { id: 'd14', orderIndex: 14, length: 1144, quantity: 780, mark: '14', color: '#C084FC' },
+    { id: 'd15', orderIndex: 15, length: 3288, quantity: 600, mark: '15', color: '#F43F5E' },
+    { id: 'd16', orderIndex: 16, length: 2500, quantity: 600, mark: '16', color: '#14B8A6' },
+    { id: 'd17', orderIndex: 17, length: 1320, quantity: 600, mark: '17', color: '#818CF8' },
+    { id: 'd18', orderIndex: 18, length: 4212, quantity: 35, mark: '18', color: '#FB7185' },
+    { id: 'd19', orderIndex: 19, length: 4220, quantity: 140, mark: '19', color: '#A3E635' },
+    { id: 'd20', orderIndex: 20, length: 879, quantity: 4500, mark: '20', color: '#06B6D4' },
+    { id: 'd21', orderIndex: 21, length: 1111, quantity: 4500, mark: '21', color: '#E11D48' },
+    { id: 'd22', orderIndex: 22, length: 400, quantity: 100, mark: '22', color: '#0EA5E9' },
   ]);
 
   // Solution is initially null: results page is NOT visible until calculate is pressed!
@@ -130,6 +147,131 @@ export default function App() {
     return `${activeStocks}|${activeDemands}`;
   }, [stockItems, demandItems]);
 
+  // Point 4: Deterministic signature of demand items to invalidate obsolete runs
+  const demandSignature = useMemo(() => {
+    return demandItems
+      .map((d) => `${d.id}:${d.length}:${d.quantity}:${d.mark || ''}`)
+      .join('|');
+  }, [demandItems]);
+
+  const prevDemandSigRef = useRef<string>(demandSignature);
+  useEffect(() => {
+    if (prevDemandSigRef.current !== demandSignature) {
+      prevDemandSigRef.current = demandSignature;
+      // When demand items change, delete stale runs and clear solution
+      if (savedRuns.length > 0 || solution) {
+        setSavedRuns([]);
+        setSolution(null);
+        setLastSolvedSettings(null);
+      }
+    }
+  }, [demandSignature, savedRuns.length, solution]);
+
+  // Synchronize solution piece colors dynamically when demandItem colors are customized
+  useEffect(() => {
+    if (!solution || solution.rows.length === 0) return;
+    const colorMap = new Map<number, string>();
+    demandItems.forEach((d) => {
+      if (d.color && !colorMap.has(d.length)) colorMap.set(d.length, d.color);
+    });
+
+    let needsUpdate = false;
+    for (const row of solution.rows) {
+      for (const p of row.pieces) {
+        const expectedColor = colorMap.get(p.length);
+        if (expectedColor && p.color !== expectedColor) {
+          needsUpdate = true;
+          break;
+        }
+      }
+      if (needsUpdate) break;
+    }
+
+    if (needsUpdate) {
+      setSolution((prev) => {
+        if (!prev) return null;
+        return {
+          ...prev,
+          rows: prev.rows.map((row) => ({
+            ...row,
+            pieces: row.pieces.map((p) => ({
+              ...p,
+              color: colorMap.get(p.length) || p.color,
+            })),
+            layoutItems: row.layoutItems.map((lay) => {
+              if (lay.isTrim || lay.isWaste) return lay;
+              return {
+                ...lay,
+                color: colorMap.get(lay.length) || lay.color,
+              };
+            }),
+          })),
+        };
+      });
+    }
+  }, [demandItems, solution]);
+
+  // Point 2: Material change handler with lock semantics
+  const handleMaterialChange = (newMat: string, source: 'file' | 'manual' = 'manual') => {
+    setSettings((prev) => ({
+      ...prev,
+      material: newMat,
+      isMaterialLocked: source === 'file' ? true : prev.isMaterialLocked,
+      materialLockSource: source === 'file' ? 'file' : prev.materialLockSource,
+    }));
+  };
+
+  const handleToggleMaterialLock = () => {
+    if (settings.materialLockSource === 'file') {
+      // Cannot manually unlock if set by file from CSV/XML
+      return;
+    }
+    setSettings((prev) => ({
+      ...prev,
+      isMaterialLocked: !prev.isMaterialLocked,
+      materialLockSource: !prev.isMaterialLocked ? 'manual' : null,
+    }));
+  };
+
+  const [isDemandLocked, setIsDemandLocked] = useState<boolean>(false);
+  const [showDemandUnlockConfirm, setShowDemandUnlockConfirm] = useState<boolean>(false);
+
+  // Check for deficit transfer task from other browser tab/window
+  useEffect(() => {
+    const checkDeficitHash = () => {
+      if (window.location.hash.includes('deficit_task')) {
+        try {
+          const raw = localStorage.getItem('pending_deficit_payload');
+          if (raw) {
+            const parsed = JSON.parse(raw);
+            if (parsed.items && Array.isArray(parsed.items)) {
+              setDemandItems(parsed.items);
+              if (parsed.material) {
+                setSettings((prev) => ({
+                  ...prev,
+                  material: parsed.material,
+                  orderNumber: parsed.orderNumber || `${prev.orderNumber || 'ПР'}-ДЕФИЦИТ`,
+                }));
+              }
+              setSolution(null);
+              setSavedRuns([]);
+              setIsDemandLocked(false);
+            }
+            localStorage.removeItem('pending_deficit_payload');
+            window.history.replaceState(null, '', window.location.pathname);
+          }
+        } catch (err) {
+          console.warn('Failed to parse deficit payload:', err);
+        }
+      }
+    };
+    checkDeficitHash();
+    window.addEventListener('hashchange', checkDeficitHash);
+    return () => {
+      window.removeEventListener('hashchange', checkDeficitHash);
+    };
+  }, []);
+
   const performSolve = (customSettings?: AppSettings) => {
     const currentSettings = customSettings || settings;
 
@@ -159,22 +301,25 @@ export default function App() {
 
     const demands: DemandItem[] = demandItems
       .filter((d) => d.length > 0 && d.quantity > 0)
-      .map((d) => ({
+      .map((d, dIdx) => ({
         id: d.id,
         orderIndex: d.orderIndex,
         length: d.length,
         quantity: d.quantity,
         mark: d.mark,
         notes: d.notes,
+        color: d.color || getDefaultDemandColor(dIdx, d.length),
       }));
 
     const res = solveLinearCutting(stocks, demands, currentSettings);
     setSolution(res);
     setLastSolvedSettings(currentSettings);
+    setIsDemandLocked(true);
     return res;
   };
 
   const handleStartCalculation = () => {
+    setIsDemandLocked(true);
     // Increment calc trigger nonce to notify comparison modal if already open
     setCalcTriggerNonce((prev) => prev + 1);
     setIsProgressModalOpen(true);
@@ -189,6 +334,7 @@ export default function App() {
       newSettings.edgeTrim !== settings.edgeTrim ||
       newSettings.optimizationGoal !== settings.optimizationGoal ||
       newSettings.targetRemnantKIM !== settings.targetRemnantKIM ||
+      newSettings.targetRemnantMinLength !== settings.targetRemnantMinLength ||
       newSettings.dualProfileCut !== settings.dualProfileCut ||
       newSettings.cutAngle45 !== settings.cutAngle45 ||
       newSettings.groupSolutions !== settings.groupSolutions;
@@ -260,11 +406,14 @@ export default function App() {
       length: s.length,
       quantity: s.quantity,
     }));
-    const demands: DemandItem[] = demandItems.map((d) => ({
+    const demands: DemandItem[] = demandItems.map((d, dIdx) => ({
       id: d.id,
       orderIndex: d.orderIndex,
       length: d.length,
       quantity: d.quantity,
+      mark: d.mark,
+      notes: d.notes,
+      color: d.color || getDefaultDemandColor(dIdx, d.length),
     }));
     exportSolutionToExcel(solution, settings, stocks, demands);
   };
@@ -307,12 +456,12 @@ export default function App() {
     ]);
 
     setDemandItems([
-      { id: 'd1', orderIndex: 1, length: 5230, quantity: 30 },
-      { id: 'd2', orderIndex: 2, length: 150, quantity: 400 },
-      { id: 'd3', orderIndex: 3, length: 320, quantity: 30 },
-      { id: 'd4', orderIndex: 4, length: 280, quantity: 50 },
-      { id: 'd5', orderIndex: 5, length: 800, quantity: 150 },
-      { id: 'd6', orderIndex: 6, length: 810, quantity: 150 },
+      { id: 'd1', orderIndex: 1, length: 5230, quantity: 30, color: '#F87171' },
+      { id: 'd2', orderIndex: 2, length: 150, quantity: 400, color: '#4ADE80' },
+      { id: 'd3', orderIndex: 3, length: 320, quantity: 30, color: '#6366F1' },
+      { id: 'd4', orderIndex: 4, length: 280, quantity: 50, color: '#FACC15' },
+      { id: 'd5', orderIndex: 5, length: 800, quantity: 150, color: '#E879F9' },
+      { id: 'd6', orderIndex: 6, length: 810, quantity: 150, color: '#38BDF8' },
     ]);
 
     setSolution(null);
@@ -321,7 +470,7 @@ export default function App() {
   };
 
   const handleImportClipboard = (
-    items: { mark: string; length: number; quantity: number; notes?: string }[]
+    items: { mark: string; length: number; quantity: number; notes?: string; color?: string }[]
   ) => {
     if (pasteTarget === 'stock') {
       const newItems: DynamicRowItem[] = items.map((item, idx) => ({
@@ -343,6 +492,7 @@ export default function App() {
         quantity: item.quantity,
         mark: item.mark || '',
         notes: item.notes || '',
+        color: item.color || getDefaultDemandColor(demandItems.length + idx, item.length),
       }));
       setDemandItems((prev) => [...prev, ...newItems]);
     }
@@ -391,47 +541,181 @@ export default function App() {
           >
             {/* Workspace Tab: ONLY Tables «Есть»/«Осталось» and «Нужно»/«Не сделано» + Calculate Button */}
             {activeTab === 'workspace' && (
-              <div className="space-y-6">
+              <div className="space-y-4">
+                {/* Point 1: Top bar order: № заказа -> Комментарий -> Материал */}
+                <div className="bg-white border border-slate-200/90 rounded-xl p-3 shadow-2xs flex flex-col md:flex-row items-stretch md:items-center gap-3">
+                  {/* 1. Order Number */}
+                  <div className="flex items-center gap-2 min-w-[190px]">
+                    <label className="text-xs font-bold text-slate-700 whitespace-nowrap">
+                      № заказа:
+                    </label>
+                    <input
+                      type="text"
+                      value={settings.orderNumber || ''}
+                      onChange={(e) => setSettings((prev) => ({ ...prev, orderNumber: e.target.value }))}
+                      placeholder="ПР-01"
+                      className="flex-1 px-2.5 py-1 text-xs font-semibold text-slate-800 bg-slate-50 hover:bg-white focus:bg-white border border-slate-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500 transition-all font-mono"
+                    />
+                  </div>
+
+                  {/* 2. Order Comment (Requirement 1: Поле КОММЕНТАРИЙ расположить после поля № ЗАКАЗА) */}
+                  <div className="flex items-center gap-2 flex-1 min-w-[240px]">
+                    <label className="text-xs font-bold text-slate-700 whitespace-nowrap">
+                      Комментарий:
+                    </label>
+                    <input
+                      type="text"
+                      value={settings.orderComment || ''}
+                      onChange={(e) => setSettings((prev) => ({ ...prev, orderComment: e.target.value }))}
+                      placeholder="Примечание к заказу..."
+                      className="flex-1 px-2.5 py-1 text-xs font-normal text-slate-800 bg-slate-50 hover:bg-white focus:bg-white border border-slate-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500 transition-all"
+                    />
+                  </div>
+
+                  {/* 3. Material with Lock/Unlock Button */}
+                  <div className="flex items-center gap-2 flex-1 min-w-[280px]">
+                    <label className="text-xs font-bold text-slate-700 whitespace-nowrap">
+                      Материал:
+                    </label>
+                    <div className="relative flex-1 flex items-center">
+                      <input
+                        type="text"
+                        value={settings.material || ''}
+                        disabled={settings.isMaterialLocked}
+                        onChange={(e) => setSettings((prev) => ({ ...prev, material: e.target.value }))}
+                        placeholder="Наименование профиля/материала"
+                        className={`w-full pl-2.5 pr-8 py-1 text-xs font-bold rounded-lg border transition-all ${
+                          settings.isMaterialLocked
+                            ? 'bg-slate-100 text-slate-700 border-slate-300 cursor-not-allowed select-none'
+                            : 'bg-slate-50 hover:bg-white focus:bg-white text-slate-900 border-slate-300 focus:outline-none focus:ring-2 focus:ring-blue-500'
+                        }`}
+                      />
+                      <button
+                        type="button"
+                        onClick={handleToggleMaterialLock}
+                        disabled={settings.materialLockSource === 'file'}
+                        title={
+                          settings.materialLockSource === 'file'
+                            ? 'Заблокировано источником остатков (CSV/XML). Ручное снятие блокировки запрещено.'
+                            : settings.isMaterialLocked
+                            ? 'Заблокировано вручную. Нажмите, чтобы разблокировать.'
+                            : 'Разблокировано. Нажмите, чтобы заблокировать наименование.'
+                        }
+                        className={`absolute right-1 p-1 rounded-md transition-colors ${
+                          settings.materialLockSource === 'file'
+                            ? 'text-amber-600 bg-amber-50 cursor-not-allowed opacity-90'
+                            : settings.isMaterialLocked
+                            ? 'text-blue-600 hover:bg-blue-50 cursor-pointer'
+                            : 'text-slate-400 hover:text-slate-700 hover:bg-slate-100 cursor-pointer'
+                        }`}
+                      >
+                        {settings.isMaterialLocked ? (
+                          <Lock className="w-3.5 h-3.5" />
+                        ) : (
+                          <Unlock className="w-3.5 h-3.5" />
+                        )}
+                      </button>
+                    </div>
+                  </div>
+                </div>
+
                 {/* Block 1: «Есть» (Склад) + «Осталось» */}
                 <DynamicInputBlock
                   title="Есть"
                   companionTitle="Осталось"
                   items={stockItems}
                   setItems={setStockItems}
-              companionItems={solution?.remainingWarehouseStock || []}
-              usedOrPlacedColHeader="Использовано"
-              remainingColHeader="Не использов."
-              currentMaterial={settings.material}
-              onMaterialChange={(newMat) => setSettings((prev) => ({ ...prev, material: newMat }))}
-              getUsedOrPlaced={getStockUsed}
-              getRemaining={getStockRemaining}
-              hasCalculated={Boolean(solution)}
-              onOpenPasteModal={() => {
-                setPasteTarget('stock');
-                setIsPasteModalOpen(true);
-              }}
-            />
+                  companionItems={solution?.remainingWarehouseStock || []}
+                  usedOrPlacedColHeader="Использовано"
+                  remainingColHeader="Не использов."
+                  currentMaterial={settings.material}
+                  onMaterialChange={handleMaterialChange}
+                  onUnlockMaterial={() =>
+                    setSettings((prev) => ({
+                      ...prev,
+                      isMaterialLocked: false,
+                      materialLockSource: null,
+                    }))
+                  }
+                  getUsedOrPlaced={getStockUsed}
+                  getRemaining={getStockRemaining}
+                  hasCalculated={Boolean(solution)}
+                  onOpenPasteModal={() => {
+                    setPasteTarget('stock');
+                    setIsPasteModalOpen(true);
+                  }}
+                />
 
-            {/* Block 3: «Нужно» (Спецификация) + «Не сделано» */}
-            <DynamicInputBlock
-              title="Нужно"
-              companionTitle="Не сделано"
-              items={demandItems}
-              setItems={setDemandItems}
-              companionItems={solution?.unplacedDemand || []}
-              usedOrPlacedColHeader="Разложено"
-              remainingColHeader="Не разложено"
-              currentMaterial={settings.material}
-              getUsedOrPlaced={getDemandPlaced}
-              getRemaining={getDemandUnplaced}
-              hasCalculated={Boolean(solution)}
-              onOpenPasteModal={() => {
-                setPasteTarget('demand');
-                setIsPasteModalOpen(true);
-              }}
-            />
-          </div>
-        )}
+                {/* Block 3: «Нужно» (Спецификация) + «Не сделано» */}
+                <DynamicInputBlock
+                  title="Нужно"
+                  companionTitle="Не сделано"
+                  items={demandItems}
+                  setItems={setDemandItems}
+                  companionItems={solution?.unplacedDemand || []}
+                  usedOrPlacedColHeader="Разложено"
+                  remainingColHeader="Не разложено"
+                  currentMaterial={settings.material}
+                  isLocked={isDemandLocked}
+                  onRequestUnlock={() => setShowDemandUnlockConfirm(true)}
+                  getUsedOrPlaced={getDemandPlaced}
+                  getRemaining={getDemandUnplaced}
+                  hasCalculated={Boolean(solution)}
+                  onOpenPasteModal={() => {
+                    setPasteTarget('demand');
+                    setIsPasteModalOpen(true);
+                  }}
+                />
+
+                {/* Requirement 4: Confirmation modal before unlocking and modifying НУЖНО */}
+                {showDemandUnlockConfirm && (
+                  <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 backdrop-blur-xs p-4">
+                    <div className="bg-white rounded-2xl max-w-md w-full p-6 shadow-2xl border border-slate-200">
+                      <div className="flex items-center gap-3 text-amber-600 mb-3">
+                        <div className="p-2.5 bg-amber-100 rounded-xl">
+                          <Lock className="w-6 h-6 text-amber-600" />
+                        </div>
+                        <div>
+                          <h3 className="text-base font-extrabold text-slate-900 leading-tight">
+                            Разблокировка спецификации
+                          </h3>
+                          <span className="text-xs text-slate-500">
+                            Очистка вариантов и пересчет эталонов
+                          </span>
+                        </div>
+                      </div>
+
+                      <p className="text-xs text-slate-600 leading-relaxed mb-5">
+                        Изменение спецификации <strong>«НУЖНО»</strong> приведет к удалению всех вариантов из сравнительной таблицы и обязательному пересчету эталонов. Вы уверены, что хотите разблокировать спецификацию?
+                      </p>
+
+                      <div className="flex items-center justify-end gap-2.5">
+                        <button
+                          type="button"
+                          onClick={() => setShowDemandUnlockConfirm(false)}
+                          className="px-4 py-2 text-xs font-semibold text-slate-700 bg-slate-100 hover:bg-slate-200 rounded-xl transition-colors cursor-pointer"
+                        >
+                          Отмена
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => {
+                            setIsDemandLocked(false);
+                            setSavedRuns([]);
+                            setSolution(null);
+                            setLastSolvedSettings(null);
+                            setShowDemandUnlockConfirm(false);
+                          }}
+                          className="px-4 py-2 text-xs font-bold text-white bg-amber-600 hover:bg-amber-500 rounded-xl transition-colors cursor-pointer shadow-sm"
+                        >
+                          Разблокировать и очистить варианты
+                        </button>
+                      </div>
+                    </div>
+                  </div>
+                )}
+              </div>
+            )}
 
         {/* Results Tab: Visible after calculation */}
         {activeTab === 'visualizer' && solution && (
@@ -514,17 +798,22 @@ export default function App() {
               trimStart: settings.edgeTrim,
               trimEnd: 0,
               minReusableLength: settings.reusableRemnantMin,
-              strategy: 'best_fit',
+              strategy: settings.optimizationGoal,
               projectName: settings.orderNumber || 'Заказ',
               materialName: settings.material || 'Профиль',
               orderNumber: settings.orderNumber || '1',
+              reusableRemnantMin: settings.reusableRemnantMin,
+              cutAngle45: settings.cutAngle45,
+              dualProfileCut: settings.dualProfileCut,
+              searchSpeed: settings.searchSpeed,
+              orderComment: settings.orderComment,
             }}
-            demands={demandItems.map((d) => ({
+            demands={demandItems.map((d, dIdx) => ({
               id: d.id,
-              mark: `Д-${d.length}`,
+              mark: d.mark || `Д-${d.length}`,
               length: d.length,
               quantity: d.quantity,
-              color: '#3B82F6',
+              color: d.color || getDefaultDemandColor(dIdx, d.length),
             }))}
             stocks={stockItems.map((s) => ({
               id: s.id,
@@ -560,6 +849,7 @@ export default function App() {
         calcTriggerNonce={calcTriggerNonce}
         stockItems={stockItems}
         demandItems={demandItems}
+        onSetDemandItems={setDemandItems}
       />
 
       {/* Paste from Excel Clipboard Modal */}
