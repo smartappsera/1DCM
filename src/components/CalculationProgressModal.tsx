@@ -109,6 +109,7 @@ export const CalculationProgressModal: React.FC<CalculationProgressModalProps> =
 
   // Live worker execution states
   const [progressInfo, setProgressInfo] = useState<CalculationProgressInfo | null>(null);
+  const [maxObservedCards, setMaxObservedCards] = useState<number>(0);
   const [elapsedTimeMs, setElapsedTimeMs] = useState<number>(0);
   const workerRef = useRef<Worker | null>(null);
   const stopwatchIntervalRef = useRef<any>(null);
@@ -430,6 +431,7 @@ export const CalculationProgressModal: React.FC<CalculationProgressModalProps> =
     setStatusText('Инициализация параметров и подготовка заготовок...');
     setElapsedTimeMs(0);
     setProgressInfo(null);
+    setMaxObservedCards(0);
     latestSolutionRef.current = null;
 
     if (workerRef.current) {
@@ -574,6 +576,9 @@ export const CalculationProgressModal: React.FC<CalculationProgressModalProps> =
           setProgressInfo(payload);
           setProgressPercent(payload.percent);
           setStatusText(payload.stageName);
+          if (payload.uniqueCardsCount && payload.uniqueCardsCount > 0) {
+            setMaxObservedCards((prev) => Math.max(prev, payload.uniqueCardsCount));
+          }
         } else if (type === 'COMPREHENSIVE_DONE') {
           latestSolutionRef.current = payload.bestSolution;
           finishComprehensiveSuite(payload.suite, payload.bestSolution);
@@ -1586,12 +1591,25 @@ export const CalculationProgressModal: React.FC<CalculationProgressModalProps> =
                   <span className="text-[10px] uppercase text-slate-500 font-bold block">
                     Уникальных карт
                   </span>
-                  <div className="text-base sm:text-lg font-mono font-extrabold text-blue-700 mt-0.5">
-                    {progressInfo?.uniqueCardsCount ?? '—'}
-                    <span className="text-xs text-slate-500 font-normal"> схем</span>
+                  <div className="flex items-baseline gap-1.5 mt-0.5">
+                    <div className="text-base sm:text-lg font-mono font-extrabold text-blue-700">
+                      {progressInfo?.uniqueCardsCount ?? '—'}
+                      <span className="text-xs text-slate-500 font-normal"> схем</span>
+                    </div>
+                    {maxObservedCards > 0 &&
+                      progressInfo?.uniqueCardsCount &&
+                      progressInfo.uniqueCardsCount < maxObservedCards && (
+                        <span className="text-[10px] font-mono font-bold text-emerald-700 bg-emerald-100/90 px-1.5 py-0.2 rounded border border-emerald-300">
+                          -{maxObservedCards - progressInfo.uniqueCardsCount} карт
+                        </span>
+                      )}
                   </div>
-                  <span className="text-[10px] text-slate-500 block mt-0.5">
-                    Минимум переналадок
+                  <span className="text-[10px] text-slate-500 block mt-0.5 truncate">
+                    {maxObservedCards > 0 &&
+                    progressInfo?.uniqueCardsCount &&
+                    progressInfo.uniqueCardsCount < maxObservedCards
+                      ? 'Сжатие и объединение'
+                      : 'Минимум переналадок'}
                   </span>
                 </div>
 

@@ -246,6 +246,56 @@ export const SettingsSidebar: React.FC<SettingsSidebarProps> = ({
                   </button>
                 </div>
 
+                {/* Быстрые пресеты конфигурации */}
+                <div className="flex items-center gap-1">
+                  <span className="text-[10px] text-blue-900/80 font-semibold mr-0.5">Пресет:</span>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      updateSetting('customStrategyConfig', {
+                        maxPassesMultiplier: 0.5,
+                        enable2Opt: true,
+                        twoOptRounds: 6,
+                        enableTailConsolidation: true,
+                        tailConsolidationMaxBars: 5,
+                        cardMergeScrapToleranceMm: 60,
+                        preferFewerCards: true,
+                        remnantTargetMinLength: 1500,
+                      });
+                    }}
+                    className="text-[10px] font-medium px-1.5 py-0.5 rounded bg-white hover:bg-blue-100 text-blue-800 border border-blue-200 cursor-pointer transition-colors"
+                  >
+                    Быстрый
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      updateSetting('customStrategyConfig', getDefaultCustomConfig());
+                    }}
+                    className="text-[10px] font-medium px-1.5 py-0.5 rounded bg-white hover:bg-blue-100 text-blue-800 border border-blue-200 cursor-pointer transition-colors"
+                  >
+                    Баланс
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      updateSetting('customStrategyConfig', {
+                        maxPassesMultiplier: 2.0,
+                        enable2Opt: true,
+                        twoOptRounds: 30,
+                        enableTailConsolidation: true,
+                        tailConsolidationMaxBars: 15,
+                        cardMergeScrapToleranceMm: 600,
+                        preferFewerCards: true,
+                        remnantTargetMinLength: 1500,
+                      });
+                    }}
+                    className="text-[10px] font-medium px-1.5 py-0.5 rounded bg-white hover:bg-blue-100 text-blue-800 border border-blue-200 cursor-pointer transition-colors"
+                  >
+                    Макс. сжатие
+                  </button>
+                </div>
+
                 {/* 1. Множитель проходов / глубина поиска */}
                 <div className="space-y-1">
                   <div className="flex items-center justify-between text-[11px]">
