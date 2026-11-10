@@ -1417,33 +1417,16 @@ export function solveLinearCutting(
             }
           }
 
-          // Differentiate candidate ordering by Strategy:
-          if (
-            settings.optimizationGoal === 'variants' ||
-            (isCustom && customCfg?.preferFewerCards)
-          ) {
-            // «По вариантам» / «Пользовательская с приоритетом карт»: группируем самые массовые детали вместе
-            // Это формирует однородные карты с огромной кратностью повторения -> МЕНЬШЕ ВСЕГО КАРТ!
-            candidateItems.sort((a, b) => {
-              const cntA = freqMap.get(a) || 0;
-              const cntB = freqMap.get(b) || 0;
-              if (cntB !== cntA) return cntB - cntA;
-              return b - a;
-            });
-          } else if (settings.optimizationGoal === 'min_bars') {
-            // «Минимум хлыстов»: First Fit Decreasing по длине (максимальная плотность набивки хлыста)
-            candidateItems.sort((a, b) => b - a);
-          } else {
-            candidateItems = sortLongArray(candidateItems, sort);
-          }
+          // Candidate ordering: sortLongArray applies Excel VBA sorting heuristics (sort = 0..maxSort)
+          candidateItems = sortLongArray(candidateItems, sort);
 
           let arrEl: number[] | null = null;
           if (v === 0) {
             arrEl = greedyAlgo(candidateItems, sm);
           } else {
             let dm = 0;
-            if (settings.optimizationGoal === 'min_waste') {
-              // «Минимум отходов»: ищем нулевой или сверхмалый отход (dm = 0, 1, 2, 4)
+            if (settings.optimizationGoal === 'min_waste' || settings.optimizationGoal === 'variants') {
+              // Ищем нулевой или сверхмалый отход (dm = 0, 1, 2, 4, 8, 12, 16...)
               if (v === 1) dm = 0;
               else if (v === 2) dm = 1;
               else if (v === 3) dm = 2;
@@ -1474,7 +1457,7 @@ export function solveLinearCutting(
                 arrEl = longSumEl(candidateItems, sm, dm);
               }
             } else {
-              // «По вариантам» или базовый:
+              // Базовый:
               const ceilDiv = Math.ceil(sumData / sm);
               dm = ceilDiv > 0 ? Math.floor((sm - Math.floor(sumData / ceilDiv)) / 2) : 0;
               arrEl = longSumEl(candidateItems, sm, dm);
@@ -1586,11 +1569,9 @@ export function solveLinearCutting(
                 effectiveBatchCount = 1;
               }
             } else {
-              // Если пакетный рез выключен, по умолчанию режем по 1 хлысту
-              // (за исключением стратегии «По вариантам», где последовательные одинаковые хлысты группируются)
-              if (settings.optimizationGoal !== 'variants') {
-                effectiveBatchCount = 1;
-              }
+              // Если пакетный рез выключен, рассчитываем по 1 хлысту на этапе подбора
+              // (все одинаковые карты в финале гарантированно группируются в партии через canonicalKey)
+              effectiveBatchCount = 1;
             }
 
             for (let b = 0; b < effectiveBatchCount; b++) {
@@ -1670,13 +1651,15 @@ export function solveLinearCutting(
           settings.optimizationGoal === 'variants' ||
           (isCustom && customCfg?.preferFewerCards)
         ) {
-          // 1. ПО ВАРИАНТАМ / ПОЛЬЗОВАТЕЛЬСКАЯ (ПРИОРИТЕТ КАРТ): строго минимизирует количество карт/наладок (kolVar)!
+          // 1. ПО ВАРИАНТАМ / ПОЛЬЗОВАТЕЛЬСКАЯ (ПРИОРИТЕТ КАРТ):
+          // Главный критерий экономии: минимум расхода хлыстов (не перерасходовать металл).
+          // При одинаковом расходе хлыстов строго побеждает решение с МЕНЬШИМ ЧИСЛОМ КАРТ/НАЛАДОК (kolVar)!
           if (ostSm !== best.ostSm) {
             bIsVarBest = ostSm < best.ostSm;
-          } else if (kolVar !== best.kolVarBest) {
-            bIsVarBest = kolVar < best.kolVarBest; // Меньше карт побеждает!
           } else if (kout !== best.kout) {
-            bIsVarBest = kout < best.kout;
+            bIsVarBest = kout < best.kout; // Меньше хлыстов побеждает!
+          } else if (kolVar !== best.kolVarBest) {
+            bIsVarBest = kolVar < best.kolVarBest; // При равных хлыстах меньше карт побеждает!
           } else {
             bIsVarBest = othSm < best.othSm;
           }
