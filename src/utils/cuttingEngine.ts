@@ -597,9 +597,20 @@ function run2OptLocalSearch(
       kout = pieces.length;
     }
 
-    // 2. Piece Swap (1-1 swap between bar i and bar j)
+    // Precompute pattern counts to protect homogeneous batches from fragmentation
+    const sigCounts = new Map<string, number>();
+    const barSigs = new Array<string>(kout);
+    for (let idx = 0; idx < kout; idx++) {
+      const s = `${smIsh[idx]}:${[...pieces[idx]].sort((a, b) => b - a).join(',')}`;
+      barSigs[idx] = s;
+      sigCounts.set(s, (sigCounts.get(s) || 0) + 1);
+    }
+
+    // 2. Piece Swap (1-1 swap between tail bar i and tail bar j)
     for (let i = 0; i < kout; i++) {
+      if ((sigCounts.get(barSigs[i]) || 0) >= 4) continue;
       for (let j = i + 1; j < kout; j++) {
+        if ((sigCounts.get(barSigs[j]) || 0) >= 4) continue;
         const capI = smIsh[i];
         const capJ = smIsh[j];
 
@@ -658,12 +669,14 @@ function run2OptLocalSearch(
       if (roundImproved) break;
     }
 
-    // 3. Cluster Swap (2 pieces from bar i for 1 piece from bar j)
+    // 3. Cluster Swap (2 pieces from tail bar i for 1 piece from tail bar j)
     if (!roundImproved) {
       for (let i = 0; i < kout; i++) {
+        if ((sigCounts.get(barSigs[i]) || 0) >= 4) continue;
         if (pieces[i].length < 2) continue;
         for (let j = 0; j < kout; j++) {
           if (i === j) continue;
+          if ((sigCounts.get(barSigs[j]) || 0) >= 4) continue;
           const capI = smIsh[i];
           const capJ = smIsh[j];
 
@@ -847,7 +860,7 @@ function consolidateTailPatterns(
   const maxPoolBars = customConfig?.tailConsolidationMaxBars ?? 15;
   const scrapTolerance =
     customConfig?.cardMergeScrapToleranceMm ??
-    (goal === 'variants' ? 600 : 120);
+    (goal === 'variants' ? 800 : 500);
 
   const candidateThresholds = [1, 2, 3, 4, 5, 6, 8, 10, 15].filter((t) => t <= maxPoolBars);
   if (candidateThresholds.length === 0) candidateThresholds.push(Math.min(maxPoolBars, 2));
@@ -1916,21 +1929,49 @@ export function solveLinearCutting(
     };
   }
 
-  // Sort solution patterns (matching VBA sort: outSmIsh, outSm, outTxt)
-  const patternList: { smIsh: number; sm: number; txt: string; pieceLengths: number[] }[] = [];
+  // Sort and group solution patterns by canonical multiset key
+  const getCanonicalPatternKey = (smIsh: number, pieces: number[]): string => {
+    const sorted = [...pieces].sort((a, b) => b - a);
+    return `${smIsh}:${sorted.join(',')}`;
+  };
+
+  interface PatternItem {
+    smIsh: number;
+    sm: number;
+    txt: string;
+    pieceLengths: number[];
+    canonicalKey: string;
+  }
+
+  const patternList: PatternItem[] = [];
   for (let i = 0; i < best.kout; i++) {
+    const pLengths = best.outPieces[i] || [];
     patternList.push({
       smIsh: best.outSmIsh[i],
       sm: best.outSm[i],
       txt: best.outTxt[i],
-      pieceLengths: best.outPieces[i] || [],
+      pieceLengths: pLengths,
+      canonicalKey: getCanonicalPatternKey(best.outSmIsh[i], pLengths),
     });
   }
 
+  // Count frequencies of each canonical pattern to place largest batches first
+  const patternFreq = new Map<string, number>();
+  for (const item of patternList) {
+    patternFreq.set(item.canonicalKey, (patternFreq.get(item.canonicalKey) || 0) + 1);
+  }
+
   patternList.sort((a, b) => {
+    // 1. Group by bar size (descending)
     if (b.smIsh !== a.smIsh) return b.smIsh - a.smIsh;
-    if (b.sm !== a.sm) return b.sm - a.sm;
-    return a.txt.localeCompare(b.txt);
+    // 2. Group by pattern multiplicity (descending: 76 bars, then 27 bars, then 1 bar)
+    const freqA = patternFreq.get(a.canonicalKey) || 0;
+    const freqB = patternFreq.get(b.canonicalKey) || 0;
+    if (freqB !== freqA) return freqB - freqA;
+    // 3. Group by canonical key to keep identical patterns strictly contiguous
+    if (a.canonicalKey !== b.canonicalKey) return a.canonicalKey.localeCompare(b.canonicalKey);
+    // 4. By spent
+    return b.sm - a.sm;
   });
 
   // Group patterns if bGroupe is true
@@ -1942,8 +1983,7 @@ export function solveLinearCutting(
   }
 
   const groupedRows: GroupedRow[] = [];
-  let curTxt = '';
-  let curSmIsh = 0;
+  let curKey = '';
   let curK = 0;
 
   for (let i = 0; i < patternList.length; i++) {
@@ -1951,7 +1991,7 @@ export function solveLinearCutting(
     const barSize = item.smIsh * nod + krm;
     const spent = item.sm * nod + krm;
 
-    if (item.txt !== curTxt || item.smIsh !== curSmIsh || !bGroupe) {
+    if (item.canonicalKey !== curKey || !bGroupe) {
       curK = 1;
       groupedRows.push({
         barSize,
@@ -1959,8 +1999,7 @@ export function solveLinearCutting(
         count: curK,
         pieceLengths: [...item.pieceLengths],
       });
-      curTxt = item.txt;
-      curSmIsh = item.smIsh;
+      curKey = item.canonicalKey;
     } else {
       curK++;
       groupedRows[groupedRows.length - 1].count = curK;
