@@ -27,6 +27,7 @@ import {
   ExternalLink,
   Sparkles,
   Loader2,
+  Play,
 } from 'lucide-react';
 import {
   FullOptimizationSolution,
@@ -116,6 +117,10 @@ export const CalculationProgressModal: React.FC<CalculationProgressModalProps> =
   const workerRef = useRef<Worker | null>(null);
   const stopwatchIntervalRef = useRef<any>(null);
   const latestSolutionRef = useRef<FullOptimizationSolution | null>(null);
+  const runsRef = useRef<CalculationRun[]>([]);
+  const isStoppingRef = useRef<boolean>(false);
+  const currentStocksRef = useRef<StockItem[]>([]);
+  const currentDemandsRef = useRef<DemandItem[]>([]);
 
   // Deficit modal state (Point 9)
   const [deficitModalRun, setDeficitModalRun] = useState<CalculationRun | null>(null);
@@ -478,8 +483,14 @@ export const CalculationProgressModal: React.FC<CalculationProgressModalProps> =
         notes: d.notes,
       }));
 
+    currentStocksRef.current = stocks;
+    currentDemandsRef.current = demands;
+    isStoppingRef.current = false;
+
     // Point 5: Generate Baselines (Эталон-12 и Эталон-6) as references
     let baseRuns = ensureBaselines(existingRunsList, stocks, demands, settingsToRun, inputSignature);
+    setRuns(baseRuns);
+    runsRef.current = baseRuns;
 
     const finishRun = (sol: FullOptimizationSolution) => {
       if (stopwatchIntervalRef.current) {
@@ -491,27 +502,32 @@ export const CalculationProgressModal: React.FC<CalculationProgressModalProps> =
         workerRef.current = null;
       }
 
-      const nextIndex = baseRuns.filter((r) => r.index > 0).length + 1;
+      const isStopped = isStoppingRef.current;
+      const currentBase = runsRef.current && runsRef.current.length > 0 ? runsRef.current : baseRuns;
+      const nextIndex = currentBase.filter((r) => r.index > 0).length + 1;
       const newRun: CalculationRun = {
         id: `run_${Date.now()}_${nextIndex}`,
         index: nextIndex,
-        title: `Расчет #${nextIndex}`,
+        title: isStopped ? `Расчет #${nextIndex} (Остановлен)` : `Расчет #${nextIndex}`,
+        badge: isStopped ? 'Остановлен' : undefined,
         timestamp: Date.now(),
         settings: { ...settingsToRun },
         solution: sol,
         inputSignature,
       };
 
-      const updated = [...baseRuns, newRun];
+      const updated = [...currentBase, newRun];
       setRuns(updated);
+      runsRef.current = updated;
       setActiveRunId(newRun.id);
       if (onSaveRuns) onSaveRuns(updated);
       if (onApplySolutionAndSettings) onApplySolutionAndSettings(sol, settingsToRun);
       setProgressPercent(100);
-      setStatusText('Расчет успешно выполнен!');
+      setStatusText(isStopped ? 'Расчет остановлен и сохранен текущий результат' : 'Расчет успешно выполнен!');
       setPhase('done');
       setIsRecalculating(false);
       setIsStopping(false);
+      isStoppingRef.current = false;
       if (onFinished) onFinished(sol);
     };
 
@@ -528,7 +544,8 @@ export const CalculationProgressModal: React.FC<CalculationProgressModalProps> =
         workerRef.current = null;
       }
 
-      let curIdx = baseRuns.filter((r) => r.index > 0).length;
+      const currentBase = runsRef.current && runsRef.current.length > 0 ? runsRef.current : baseRuns;
+      let curIdx = currentBase.filter((r) => r.index > 0).length;
       const newRuns: CalculationRun[] = [];
 
       for (const item of suite) {
@@ -549,8 +566,9 @@ export const CalculationProgressModal: React.FC<CalculationProgressModalProps> =
         });
       }
 
-      const updated = [...baseRuns, ...newRuns];
+      const updated = [...currentBase, ...newRuns];
       setRuns(updated);
+      runsRef.current = updated;
       const bestRun = newRuns.find((r) => r.solution === bestSol) || newRuns[0];
       if (bestRun) {
         setActiveRunId(bestRun.id);
@@ -565,6 +583,7 @@ export const CalculationProgressModal: React.FC<CalculationProgressModalProps> =
       setPhase('done');
       setIsRecalculating(false);
       setIsStopping(false);
+      isStoppingRef.current = false;
       if (onFinished && bestRun) onFinished(bestRun.solution);
     };
 
@@ -648,6 +667,7 @@ export const CalculationProgressModal: React.FC<CalculationProgressModalProps> =
   const handleStopAndApply = () => {
     if (isStopping) return;
     setIsStopping(true);
+    isStoppingRef.current = true;
     setStatusText('Остановка расчета: завершаем текущий шаг и сохраняем лучший вариант...');
 
     if (workerRef.current) {
@@ -665,31 +685,60 @@ export const CalculationProgressModal: React.FC<CalculationProgressModalProps> =
           stopwatchIntervalRef.current = null;
         }
 
-        const solToApply = latestSolutionRef.current || solution;
-        if (solToApply) {
-          const nextIdx = runs.filter((r) => r.index > 0).length + 1;
-          const newRun: CalculationRun = {
-            id: `run_${Date.now()}_${nextIdx}`,
-            index: nextIdx,
-            title: `Расчет #${nextIdx} (Остановлен)`,
-            timestamp: Date.now(),
-            settings: { ...modalSettings },
-            solution: solToApply,
-            inputSignature,
-          };
-          const updated = [...runs, newRun];
-          setRuns(updated);
-          setActiveRunId(newRun.id);
-          if (onSaveRuns) onSaveRuns(updated);
-          if (onApplySolutionAndSettings) onApplySolutionAndSettings(solToApply, modalSettings);
+        let solToApply: FullOptimizationSolution | null = latestSolutionRef.current;
+        if (!solToApply || !solToApply.rows || solToApply.rows.length === 0) {
+          if (solution && solution.rows && solution.rows.length > 0) {
+            solToApply = solution;
+          }
         }
+        if (!solToApply || !solToApply.rows || solToApply.rows.length === 0) {
+          try {
+            solToApply = onExecuteCalculation({ ...modalSettings, searchSpeed: 'fast' });
+          } catch (e) {
+            console.warn('Fallback onExecuteCalculation failed:', e);
+          }
+        }
+        if (!solToApply || !solToApply.rows || solToApply.rows.length === 0) {
+          const baseRun = (runsRef.current || []).find((r) => r.solution && r.solution.rows.length > 0);
+          if (baseRun) {
+            solToApply = baseRun.solution;
+          } else {
+            solToApply = solveNaiveSequentialCutting(
+              currentStocksRef.current.length > 0 ? currentStocksRef.current : (stockItems as any) || [],
+              currentDemandsRef.current.length > 0 ? currentDemandsRef.current : (demandItems as any) || [],
+              modalSettings,
+              12000
+            );
+          }
+        }
+
+        const currentBase = runsRef.current && runsRef.current.length > 0 ? runsRef.current : [];
+        const nextIdx = currentBase.filter((r) => r.index > 0).length + 1;
+        const newRun: CalculationRun = {
+          id: `run_${Date.now()}_${nextIdx}`,
+          index: nextIdx,
+          title: `Расчет #${nextIdx} (Остановлен)`,
+          badge: 'Остановлен',
+          timestamp: Date.now(),
+          settings: { ...modalSettings },
+          solution: solToApply,
+          inputSignature,
+        };
+        const updated = [...currentBase, newRun];
+        setRuns(updated);
+        runsRef.current = updated;
+        setActiveRunId(newRun.id);
+        if (onSaveRuns) onSaveRuns(updated);
+        if (onApplySolutionAndSettings) onApplySolutionAndSettings(solToApply, modalSettings);
+
         setProgressPercent(100);
-        setStatusText('Расчет прерван пользователем и применен текущий результат');
+        setStatusText('Расчет остановлен пользователем и применен текущий результат');
         setPhase('done');
         setIsRecalculating(false);
         setIsStopping(false);
+        isStoppingRef.current = false;
       }
-    }, 350);
+    }, 250);
   };
 
   // Reset or run initial calculation on open, preserving prior results when settings and input conditions match
@@ -779,6 +828,7 @@ export const CalculationProgressModal: React.FC<CalculationProgressModalProps> =
     // DO NOT run calculation! Just display the existing results.
     if (optimizationRuns.length > 0 && !isExplicitCalcTrigger) {
       setRuns(existingRuns);
+      runsRef.current = existingRuns;
       const lastOpt = optimizationRuns[optimizationRuns.length - 1];
       setActiveRunId(lastOpt?.id || existingRuns[existingRuns.length - 1]?.id);
       setProgressPercent(100);
@@ -798,6 +848,7 @@ export const CalculationProgressModal: React.FC<CalculationProgressModalProps> =
 
       if (matchRun) {
         setRuns(existingRuns);
+        runsRef.current = existingRuns;
         setActiveRunId(matchRun.id);
         setProgressPercent(100);
         setStatusText('Расчет успешно выполнен!');
@@ -2373,12 +2424,17 @@ export const CalculationProgressModal: React.FC<CalculationProgressModalProps> =
                                             );
                                           }
                                           if (r.badge) {
+                                            const isStopped = r.badge.includes('Остановлен');
                                             return (
                                               <span
-                                                className="text-[9.5px] font-semibold px-1.5 py-0.2 rounded border bg-indigo-50 text-indigo-700 border-indigo-200"
+                                                className={`text-[9.5px] font-semibold px-1.5 py-0.2 rounded border ${
+                                                  isStopped
+                                                    ? 'bg-amber-50 text-amber-800 border-amber-300'
+                                                    : 'bg-indigo-50 text-indigo-700 border-indigo-200'
+                                                }`}
                                                 title={r.badge}
                                               >
-                                                {r.badge}
+                                                {isStopped ? '⏹️ Остановлен' : r.badge}
                                               </span>
                                             );
                                           }
@@ -2489,6 +2545,23 @@ export const CalculationProgressModal: React.FC<CalculationProgressModalProps> =
                           </tbody>
                         </table>
                       </div>
+                    </div>
+                  )}
+
+                  {runs.length === 0 && !activeSolution && (
+                    <div className="p-8 text-center bg-slate-50 border border-slate-200 rounded-xl space-y-3">
+                      <div className="text-slate-600 text-sm font-semibold">Варианты раскроя еще не сформированы</div>
+                      <p className="text-xs text-slate-500 max-w-md mx-auto">
+                        Нажмите кнопку «Рассчитать раскрой», чтобы запустить подбор оптимальных карт раскроя.
+                      </p>
+                      <button
+                        type="button"
+                        onClick={() => executeRecalculateWithSettings(modalSettings)}
+                        className="inline-flex items-center gap-2 px-4 py-2 bg-blue-600 text-white rounded-lg text-xs font-bold hover:bg-blue-700 transition-colors shadow-xs"
+                      >
+                        <Play className="w-3.5 h-3.5 fill-white" />
+                        <span>Рассчитать раскрой</span>
+                      </button>
                     </div>
                   )}
                 </div>

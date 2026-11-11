@@ -1898,6 +1898,13 @@ export function solveLinearCutting(
   });
 
   if (!best || best.kout === 0) {
+    if (rawRng.length > 0) {
+      try {
+        return solveNaiveSequentialCutting(stockInput, demandInput, settings, 12000);
+      } catch (e) {
+        console.warn('Fallback solveNaiveSequentialCutting failed on early exit:', e);
+      }
+    }
     return {
       totalStockLength: 0,
       totalSpentLength: 0,

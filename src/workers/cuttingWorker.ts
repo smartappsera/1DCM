@@ -2,7 +2,12 @@
  * Web Worker for Linear Cutting Optimization
  * Executes off-thread to prevent browser tab freezing and maintain 60fps UI responsiveness
  */
-import { solveLinearCutting, runComprehensiveSuite, ComprehensiveSuiteItem } from '../utils/cuttingEngine';
+import {
+  solveLinearCutting,
+  runComprehensiveSuite,
+  ComprehensiveSuiteItem,
+  solveNaiveSequentialCutting,
+} from '../utils/cuttingEngine';
 import { StockItem, DemandItem, AppSettings, CalculationProgressInfo, FullOptimizationSolution } from '../types/cutting';
 
 export interface WorkerStartPayload {
@@ -81,20 +86,30 @@ self.onmessage = (e: MessageEvent<WorkerInMessage>) => {
         });
         self.postMessage({ type: 'DONE', payload: result.bestSolution });
       } else {
-        const solution = solveLinearCutting(stockInput, demandInput, settings, {
+        let solution = solveLinearCutting(stockInput, demandInput, settings, {
           onProgress: (progress: CalculationProgressInfo) => {
             self.postMessage({ type: 'PROGRESS', payload: progress });
           },
           shouldAbort: () => isAborted,
         });
 
+        if ((!solution || solution.rows.length === 0) && demandInput.length > 0) {
+          solution = solveNaiveSequentialCutting(stockInput, demandInput, settings, 12000);
+        }
+
         self.postMessage({ type: 'DONE', payload: solution });
       }
     } catch (err: any) {
-      self.postMessage({
-        type: 'ERROR',
-        payload: err?.message || 'Непредвиденная ошибка в процессе оптимизации раскроя',
-      });
+      console.warn('Worker execution error, falling back to sequential:', err);
+      try {
+        const fallback = solveNaiveSequentialCutting(stockInput, demandInput, settings, 12000);
+        self.postMessage({ type: 'DONE', payload: fallback });
+      } catch (e2: any) {
+        self.postMessage({
+          type: 'ERROR',
+          payload: err?.message || 'Непредвиденная ошибка в процессе оптимизации раскроя',
+        });
+      }
     }
   }
 };
