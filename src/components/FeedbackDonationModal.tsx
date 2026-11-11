@@ -33,7 +33,7 @@ interface AttachedImage {
 const TON_ADDRESS = 'UQBL6WfzOITTHkFjFkKaxJcEH191mKPomK6otxMoq4Za_w1Jo';
 const TRC20_ADDRESS = 'TYeQrerTaXWfyn4rTbkSF7UhyQ75CrH1kc';
 const FEEDBACK_EMAIL = 'virus.dev.adm@gmail.com';
-const TELEGRAM_USERNAME = 'smartappsera';
+const TELEGRAM_USERNAME = 'madness_ua';
 
 export const FeedbackDonationModal: React.FC<FeedbackDonationModalProps> = ({
   isOpen,
@@ -182,22 +182,14 @@ export const FeedbackDonationModal: React.FC<FeedbackDonationModalProps> = ({
     return lines.join('\n');
   };
 
-  const handleSendEmail = () => {
-    if (!message.trim()) {
-      showToast('Пожалуйста, напишите сообщение перед отправкой');
-      return;
-    }
-
-    const subject = encodeURIComponent(`[Линейный Раскрой] ${getCategoryTitle()}`);
-    const body = encodeURIComponent(
-      buildFeedbackText() +
-        (screenshots.length > 0
-          ? `\n\n(Внимание: при необходимости прикрепите файлы скриншотов к письму)`
-          : '')
-    );
-
-    window.location.href = `mailto:${FEEDBACK_EMAIL}?subject=${subject}&body=${body}`;
-    showToast('Открываем почтовый клиент...');
+  const openExternalLink = (url: string) => {
+    const link = document.createElement('a');
+    link.href = url;
+    link.target = '_blank';
+    link.rel = 'noopener noreferrer';
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
   };
 
   const handleSendTelegram = () => {
@@ -210,12 +202,53 @@ export const FeedbackDonationModal: React.FC<FeedbackDonationModalProps> = ({
     // Copy to clipboard so user can simply paste into chat along with any screenshots
     navigator.clipboard.writeText(fullText);
 
-    const tgUrl = `https://t.me/${TELEGRAM_USERNAME}?text=${encodeURIComponent(
-      `Здравствуйте! Сообщение из приложения «Линейный Раскрой»:\n\n${message.trim()}`
-    )}`;
+    const tgUrl = `https://t.me/${TELEGRAM_USERNAME}`;
+    openExternalLink(tgUrl);
+    showToast('Текст скопирован! Открываем чат с @madness_ua в Telegram...');
+  };
 
-    window.open(tgUrl, '_blank', 'noopener,noreferrer');
-    showToast('Текст скопирован! Переход в Telegram...');
+  const handleOpenGmail = () => {
+    if (!message.trim()) {
+      showToast('Пожалуйста, напишите сообщение перед отправкой');
+      return;
+    }
+
+    const fullText = buildFeedbackText();
+    navigator.clipboard.writeText(fullText);
+
+    const subject = encodeURIComponent(`[Линейный Раскрой] ${getCategoryTitle()}`);
+    const body = encodeURIComponent(
+      fullText +
+        (screenshots.length > 0
+          ? '\n\n(При необходимости прикрепите файлы скриншотов к письму)'
+          : '')
+    );
+
+    const gmailUrl = `https://mail.google.com/mail/?view=cm&fs=1&to=${FEEDBACK_EMAIL}&su=${subject}&body=${body}`;
+    openExternalLink(gmailUrl);
+    showToast('Текст скопирован! Открываем черновик в Gmail...');
+  };
+
+  const handleSendMailto = () => {
+    if (!message.trim()) {
+      showToast('Пожалуйста, напишите сообщение перед отправкой');
+      return;
+    }
+
+    const fullText = buildFeedbackText();
+    navigator.clipboard.writeText(fullText);
+
+    const subject = encodeURIComponent(`[Линейный Раскрой] ${getCategoryTitle()}`);
+    const body = encodeURIComponent(
+      fullText +
+        (screenshots.length > 0
+          ? '\n\n(При необходимости прикрепите файлы скриншотов к письму)'
+          : '')
+    );
+
+    const mailtoUrl = `mailto:${FEEDBACK_EMAIL}?subject=${subject}&body=${body}`;
+    openExternalLink(mailtoUrl);
+    showToast('Текст скопирован! Открываем почтовую программу...');
   };
 
   const handleCopyReport = () => {
@@ -445,41 +478,61 @@ export const FeedbackDonationModal: React.FC<FeedbackDonationModalProps> = ({
                 )}
               </div>
 
-              {/* Action Buttons: Telegram / Mail / Copy */}
-              <div className="pt-2 border-t border-slate-200 space-y-2">
-                <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+              {/* Action Buttons: Telegram / Gmail / Mailto / Copy */}
+              <div className="pt-2 border-t border-slate-200 space-y-2.5">
+                <div className="grid grid-cols-1 sm:grid-cols-3 gap-2">
                   <button
                     type="button"
                     onClick={handleSendTelegram}
-                    className="flex items-center justify-center gap-2 py-2.5 px-4 bg-sky-500 hover:bg-sky-400 active:bg-sky-600 text-white font-bold rounded-xl shadow-xs transition-colors cursor-pointer text-xs"
+                    className="flex items-center justify-center gap-1.5 py-2.5 px-3 bg-sky-500 hover:bg-sky-400 active:bg-sky-600 text-white font-bold rounded-xl shadow-xs transition-colors cursor-pointer text-xs"
+                    title="Открыть диалог с @madness_ua в Telegram"
                   >
-                    <Send className="w-4 h-4 fill-current" />
-                    <span>Отправить в Telegram</span>
+                    <Send className="w-3.5 h-3.5 fill-current shrink-0" />
+                    <span className="truncate">Telegram (@madness_ua)</span>
                   </button>
 
                   <button
                     type="button"
-                    onClick={handleSendEmail}
-                    className="flex items-center justify-center gap-2 py-2.5 px-4 bg-blue-600 hover:bg-blue-500 active:bg-blue-700 text-white font-bold rounded-xl shadow-xs transition-colors cursor-pointer text-xs"
+                    onClick={handleOpenGmail}
+                    className="flex items-center justify-center gap-1.5 py-2.5 px-3 bg-rose-600 hover:bg-rose-500 active:bg-rose-700 text-white font-bold rounded-xl shadow-xs transition-colors cursor-pointer text-xs"
+                    title="Открыть черновик письма в веб-версии Gmail"
                   >
-                    <Mail className="w-4 h-4" />
-                    <span>Отправить на Email</span>
+                    <Mail className="w-3.5 h-3.5 shrink-0" />
+                    <span className="truncate">Веб-версия Gmail</span>
+                  </button>
+
+                  <button
+                    type="button"
+                    onClick={handleSendMailto}
+                    className="flex items-center justify-center gap-1.5 py-2.5 px-3 bg-slate-800 hover:bg-slate-700 active:bg-slate-900 text-white font-bold rounded-xl shadow-xs transition-colors cursor-pointer text-xs"
+                    title="Открыть в стандартной почтовой программе (Outlook, Mail и др.)"
+                  >
+                    <ExternalLink className="w-3.5 h-3.5 shrink-0" />
+                    <span className="truncate">Почтовое приложение</span>
                   </button>
                 </div>
 
-                <div className="flex items-center justify-between gap-2 pt-1 text-xs text-slate-500">
+                <div className="flex flex-wrap items-center justify-between gap-2 p-2.5 bg-slate-50 border border-slate-200 rounded-xl text-xs">
                   <button
                     type="button"
                     onClick={handleCopyReport}
-                    className="flex items-center gap-1.5 text-slate-600 hover:text-slate-900 font-medium hover:underline cursor-pointer"
+                    className="flex items-center gap-1.5 text-blue-600 hover:text-blue-700 font-semibold cursor-pointer"
                   >
-                    <Copy className="w-3.5 h-3.5" />
+                    <Copy className="w-3.5 h-3.5 shrink-0" />
                     <span>Скопировать готовый текст</span>
                   </button>
 
-                  <span className="text-[11px] text-slate-400">
-                    Почта: <span className="font-mono text-slate-600">{FEEDBACK_EMAIL}</span>
-                  </span>
+                  <div className="flex items-center gap-1.5 text-slate-600">
+                    <span className="text-[11px] text-slate-400">Почта:</span>
+                    <button
+                      type="button"
+                      onClick={() => handleCopy(FEEDBACK_EMAIL, 'email', 'Email адрес')}
+                      className="font-mono text-xs font-semibold text-slate-900 hover:text-blue-600 underline cursor-pointer"
+                      title="Нажмите, чтобы скопировать адрес"
+                    >
+                      {FEEDBACK_EMAIL}
+                    </button>
+                  </div>
                 </div>
               </div>
 
