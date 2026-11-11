@@ -47,11 +47,17 @@ export const PrintReports: React.FC<PrintReportsProps> = ({
     window.print();
   };
 
-  // Requirement 14: Revised Download HTML with clean dividers, bold values, and no graphic between header and table
   const handleDownloadHtml = () => {
-    const safeOrder = params.orderNumber || '1';
-    const safeProject = params.projectName || 'Без названия';
-    const safeMat = params.materialName || 'Профиль';
+    const escapeXml = (str: unknown) =>
+      String(str ?? '')
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;');
+
+    const safeOrder = escapeXml(params.orderNumber || '1');
+    const safeProject = escapeXml(params.projectName || 'Без названия');
+    const safeMat = escapeXml(params.materialName || 'Профиль');
 
     let cardsHtml = '';
     result.patterns.forEach((pattern) => {
@@ -75,6 +81,84 @@ export const PrintReports: React.FC<PrintReportsProps> = ({
         ? ` &middot; Деловой остаток: <strong>${pattern.wasteLength} мм</strong>`
         : '';
 
+      // --- Graphic Cutting Bar (SVG) for standalone HTML fidelity ---
+      const stockL = Math.max(1, pattern.stockLength);
+      const svgWidth = 1000;
+      const svgHeight = 44;
+      const sx = svgWidth / stockL;
+
+      let graphicBarSvg = `<svg viewBox="0 0 ${svgWidth} ${svgHeight}" width="100%" height="${svgHeight}" preserveAspectRatio="none" style="display:block; border:1.5px solid #334155; border-radius:6px; overflow:hidden; background:#f8fafc;">`;
+
+      let curX = 0;
+      if (pattern.trimStart > 0) {
+        const trimW = Math.max(14, pattern.trimStart * sx);
+        graphicBarSvg += `
+          <rect x="0" y="0" width="${trimW.toFixed(1)}" height="${svgHeight}" fill="#0f172a">
+            <title>Торцовка: ${pattern.trimStart} мм</title>
+          </rect>
+          <text x="${(trimW / 2).toFixed(1)}" y="26" fill="#ffffff" font-size="11" font-family="monospace" font-weight="bold" text-anchor="middle">Т</text>
+        `;
+        curX = pattern.trimStart * sx;
+      }
+
+      pattern.cuts.forEach((cut, cIdx) => {
+        const cutW = cut.length * sx;
+        const color = cut.color || '#93C5FD';
+        const labelX = (curX + cutW / 2).toFixed(1);
+        const showLength = cutW > 24;
+        const showMark = cutW > 60 && cut.mark;
+
+        graphicBarSvg += `
+          <rect class="cut-rect" x="${curX.toFixed(1)}" y="0" width="${cutW.toFixed(1)}" height="${svgHeight}" fill="${color}" stroke="#0f172a" stroke-width="1.5" stroke-dasharray="3,2">
+            <title>${escapeXml(cut.mark || `Деталь #${cIdx + 1}`)}: ${cut.length} мм</title>
+          </rect>
+        `;
+
+        if (showLength) {
+          const textY = showMark ? 19 : 26;
+          graphicBarSvg += `
+            <text x="${labelX}" y="${textY}" fill="#0f172a" font-size="11" font-family="monospace" font-weight="bold" text-anchor="middle">
+              ${cut.length}
+            </text>
+          `;
+        }
+
+        if (showMark) {
+          graphicBarSvg += `
+            <text x="${labelX}" y="33" fill="#1e293b" font-size="9" font-family="sans-serif" font-weight="600" text-anchor="middle">
+              ${escapeXml(cut.mark)}
+            </text>
+          `;
+        }
+
+        curX += (cut.length + params.bladeWidth) * sx;
+      });
+
+      if (pattern.wasteLength > 0) {
+        const wasteW = Math.max(0, svgWidth - curX);
+        const isReusable = pattern.isReusableWaste;
+        const wasteFill = isReusable ? '#fef3c7' : '#e2e8f0';
+        const wasteStroke = isReusable ? '#f59e0b' : '#94a3b8';
+        const wasteTextColor = isReusable ? '#92400e' : '#475569';
+        const wasteLabel = isReusable ? `${pattern.wasteLength} (Ост)` : `${pattern.wasteLength} (Лом)`;
+
+        graphicBarSvg += `
+          <rect class="cut-rect" x="${curX.toFixed(1)}" y="0" width="${wasteW.toFixed(1)}" height="${svgHeight}" fill="${wasteFill}" stroke="${wasteStroke}" stroke-width="1.5">
+            <title>${isReusable ? 'Деловой остаток' : 'Невозвратный лом'}: ${pattern.wasteLength} мм</title>
+          </rect>
+        `;
+
+        if (wasteW > 30) {
+          graphicBarSvg += `
+            <text x="${(curX + wasteW / 2).toFixed(1)}" y="26" fill="${wasteTextColor}" font-size="10" font-family="monospace" font-weight="bold" text-anchor="middle">
+              ${wasteLabel}
+            </text>
+          `;
+        }
+      }
+
+      graphicBarSvg += `</svg>`;
+
       let tableRows = '';
       if (pattern.trimStart > 0) {
         tableRows += `
@@ -94,8 +178,8 @@ export const PrintReports: React.FC<PrintReportsProps> = ({
           <tr>
             <td style="text-align:center; font-family:monospace; font-weight:bold;">${idx + 1}</td>
             <td style="text-align:right; font-family:monospace; font-weight:bold; color:#1e40af; background:#eff6ff;">${stopPosition} мм</td>
-            <td style="font-weight:600;">${cut.mark} (${cut.length} мм)</td>
-            <td style="color:#64748b;">${cut.notes || '&mdash;'}</td>
+            <td style="font-weight:600;">${escapeXml(cut.mark)} (${cut.length} мм)</td>
+            <td style="color:#64748b;">${escapeXml(cut.notes || '&mdash;')}</td>
           </tr>`;
       });
 
@@ -116,13 +200,25 @@ export const PrintReports: React.FC<PrintReportsProps> = ({
           <div class="card-header">
             <div>
               <span class="badge">Карта #${pattern.patternIndex}</span>
-              <strong>${pattern.stockName} &mdash; ${pattern.stockLength} мм</strong>
+              <strong>${escapeXml(pattern.stockName)} &mdash; ${pattern.stockLength} мм</strong>
               &nbsp;&middot;&nbsp; Количество хлыстов: <strong>${pattern.count} шт</strong>
             </div>
             <div style="font-family:monospace; font-size:12px;">
               Отходы: <strong>${wasteText}</strong>${reusableBadge} &nbsp;&middot;&nbsp; КИМ: <strong>${pattern.efficiencyPercent}%</strong>
             </div>
           </div>
+
+          <div class="cutting-bar-container">
+            ${graphicBarSvg}
+            <div class="bar-scale">
+              <span>0 мм</span>
+              <span style="font-family:sans-serif; font-weight:600; color:#334155;">
+                Хлыст: ${pattern.stockLength} мм (${escapeXml(pattern.stockName)}) &bull; ${pattern.count} шт
+              </span>
+              <span>${pattern.stockLength} мм</span>
+            </div>
+          </div>
+
           <hr class="divider" />
           <table>
             <thead>
@@ -180,10 +276,17 @@ export const PrintReports: React.FC<PrintReportsProps> = ({
     .card-block { border: 1px solid #94a3b8; border-radius: 8px; padding: 14px; margin-bottom: 20px; page-break-inside: avoid; break-inside: avoid; }
     .card-header { display: flex; justify-content: space-between; align-items: center; }
     .badge { background: #0f172a; color: #fff; padding: 2px 6px; border-radius: 4px; font-family: monospace; font-size: 11px; font-weight: bold; margin-right: 8px; }
+    .cutting-bar-container { margin: 12px 0 14px 0; }
+    .bar-scale { display: flex; justify-content: space-between; font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; font-size: 10px; color: #64748b; margin-top: 4px; }
+    .cut-rect { transition: opacity 0.15s; }
+    .cut-rect:hover { opacity: 0.85; }
     table { width: 100%; border-collapse: collapse; margin-top: 8px; font-size: 12px; }
     th, td { border: 1px solid #cbd5e1; padding: 6px 10px; }
     th { background: #f1f5f9; text-align: left; font-weight: bold; }
-    @media print { body { margin: 0; } .card-block { border-color: #000; } }
+    @media print {
+      body { margin: 0; -webkit-print-color-adjust: exact !important; print-color-adjust: exact !important; }
+      .card-block { border-color: #000; }
+    }
   </style>
 </head>
 <body>
