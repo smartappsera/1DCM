@@ -12,6 +12,7 @@ import { SolutionOutputView } from './components/SolutionOutputView';
 import { PrintReports } from './components/PrintReports';
 import { ExcelPasteModal } from './components/ExcelPasteModal';
 import { CalculationProgressModal, CalculationRun } from './components/CalculationProgressModal';
+import { FeedbackDonationModal } from './components/FeedbackDonationModal';
 import { solveLinearCutting, recalculateSolutionWithSettings, getDefaultDemandColor } from './utils/cuttingEngine';
 import { exportSolutionToExcel } from './utils/dataIO';
 import {
@@ -42,6 +43,7 @@ export default function App() {
   };
 
   const [isPasteModalOpen, setIsPasteModalOpen] = useState(false);
+  const [isFeedbackModalOpen, setIsFeedbackModalOpen] = useState(false);
   const [pasteTarget, setPasteTarget] = useState<'stock' | 'demand'>('demand');
   const [isProgressModalOpen, setIsProgressModalOpen] = useState(false);
   const [calcTriggerNonce, setCalcTriggerNonce] = useState(0);
@@ -496,6 +498,7 @@ export default function App() {
         activeTab={activeTab}
         setActiveTab={handleTabChange}
         onCalculate={handleStartCalculation}
+        onOpenFeedback={() => setIsFeedbackModalOpen(true)}
         onPrint={() => handleTabChange('reports')}
         onExportExcel={handleExportExcel}
         hasResults={Boolean(solution && solution.rows.length > 0)}
@@ -849,6 +852,12 @@ export default function App() {
         onClose={() => setIsPasteModalOpen(false)}
         onImport={handleImportClipboard}
         targetTitle={pasteTarget === 'stock' ? 'Есть (Склад)' : 'Нужно (Спецификация)'}
+      />
+
+      {/* Feedback and Crypto Donation Modal */}
+      <FeedbackDonationModal
+        isOpen={isFeedbackModalOpen}
+        onClose={() => setIsFeedbackModalOpen(false)}
       />
     </div>
   );

@@ -1,10 +1,11 @@
 import React from 'react';
-import { Play, Sparkles } from 'lucide-react';
+import { Sparkles, MessageSquareHeart } from 'lucide-react';
 
 interface HeaderProps {
   activeTab: 'workspace' | 'visualizer' | 'reports';
   setActiveTab: (tab: 'workspace' | 'visualizer' | 'reports') => void;
-  onCalculate: () => void;
+  onCalculate?: () => void;
+  onOpenFeedback: () => void;
   onPrint?: () => void;
   onExportExcel?: () => void;
   hasResults: boolean;
@@ -15,6 +16,7 @@ export const Header: React.FC<HeaderProps> = ({
   activeTab,
   setActiveTab,
   onCalculate,
+  onOpenFeedback,
   onPrint,
   hasResults,
   onLoadBenchmarkExample,
@@ -83,11 +85,12 @@ export const Header: React.FC<HeaderProps> = ({
 
 
           <button
-            onClick={onCalculate}
-            className="flex items-center gap-2 px-3.5 sm:px-4 py-2 text-xs font-semibold text-white bg-blue-600 hover:bg-blue-500 rounded-lg shadow-sm transition-colors whitespace-nowrap shrink-0 cursor-pointer"
+            onClick={onOpenFeedback}
+            title="Обратная связь и поддержка проекта"
+            className="flex items-center gap-1.5 px-3.5 sm:px-4 py-2 text-xs font-bold text-slate-950 bg-amber-400 hover:bg-amber-300 active:bg-amber-500 rounded-lg shadow-xs transition-colors whitespace-nowrap shrink-0 cursor-pointer"
           >
-            <Play className="w-3.5 h-3.5 fill-current" />
-            <span>Рассчитать раскрой</span>
+            <MessageSquareHeart className="w-4 h-4 text-slate-950" />
+            <span>Обратная связь</span>
           </button>
         </div>
       </div>
