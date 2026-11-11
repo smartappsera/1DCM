@@ -383,7 +383,7 @@ export function runComprehensiveSuite(
         },
         {
           goal: 'variants',
-          title: 'По вариантам (Серийный)',
+          title: 'Минимум наладок (Серийный)',
           badge: '⚡ Меньше наладок',
           description: 'Минимум уникальных карт для максимальной повторяемости',
         },
@@ -397,7 +397,7 @@ export function runComprehensiveSuite(
         },
         {
           goal: 'variants',
-          title: 'По вариантам',
+          title: 'Минимум наладок',
           badge: '⚡ Меньше наладок',
           description: 'Минимум уникальных карт для быстрой резки на станке',
         },
@@ -1248,7 +1248,7 @@ export function solveLinearCutting(
   }
 
   // Expand stock bars: smArr array in VBA
-  const isPrioritizeRemnants = settings.optimizationGoal === 'prioritize_remnants';
+  const isPrioritizeRemnants = settings.optimizationGoal === 'prioritize_remnants' || settings.prioritizeRemnants === true;
   const targetRemnantKIM = Math.min(99, Math.max(1, settings.targetRemnantKIM ?? 75));
 
   const totalDemandLength = rawRng.reduce((a, b) => a + b, 0);
@@ -2494,10 +2494,10 @@ export function optimizeLinearCutting(
     ),
     totalPartsLength: r.spent,
     totalKerfLength: r.pieces.reduce((sum, p) => sum + p.count * settings.bladeWidth, 0),
-    wasteLength: r.waste,
+    wasteLength: r.isReusable ? (r.reusableRemnant || 0) : (r.scrapRemnant || r.waste),
     isReusableWaste: r.isReusable,
-    reusableLength: r.isReusable ? r.waste : 0,
-    scrapLength: !r.isReusable ? r.waste : 0,
+    reusableLength: r.isReusable ? (r.reusableRemnant || 0) : 0,
+    scrapLength: r.isReusable ? r.waste : (r.scrapRemnant || r.waste),
     efficiencyPercent: r.efficiency,
     count: r.barsCount,
   }));

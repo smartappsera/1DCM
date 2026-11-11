@@ -64,7 +64,8 @@ export const PrintReports: React.FC<PrintReportsProps> = ({
       let progressiveStop = pattern.trimStart || 0;
       const cutsCount = pattern.cuts.length + (pattern.trimStart > 0 ? 1 : 0) + 1;
       const kerfLoss = params.bladeWidth * cutsCount;
-      const scrapPart = pattern.isReusableWaste ? 0 : pattern.wasteLength;
+      const reusableRemnantMm = pattern.reusableLength || (pattern.isReusableWaste ? pattern.wasteLength : 0);
+      const scrapPart = pattern.scrapLength ?? (pattern.isReusableWaste ? 0 : pattern.wasteLength);
 
       let wasteText = '';
       if (pattern.trimStart > 0 && scrapPart > 0) {
@@ -77,8 +78,8 @@ export const PrintReports: React.FC<PrintReportsProps> = ({
         wasteText = `${kerfLoss} мм (стружка)`;
       }
 
-      const reusableBadge = pattern.isReusableWaste
-        ? ` &middot; Деловой остаток: <strong>${pattern.wasteLength} мм</strong>`
+      const reusableBadge = pattern.isReusableWaste && reusableRemnantMm > 0
+        ? ` &middot; Деловой остаток: <strong>${reusableRemnantMm} мм</strong>`
         : '';
 
       // --- Graphic Cutting Bar (SVG) for standalone HTML fidelity ---
@@ -134,17 +135,18 @@ export const PrintReports: React.FC<PrintReportsProps> = ({
         curX += (cut.length + params.bladeWidth) * sx;
       });
 
-      if (pattern.wasteLength > 0) {
+      if (pattern.wasteLength > 0 || (pattern.isReusableWaste && reusableRemnantMm > 0)) {
         const wasteW = Math.max(0, svgWidth - curX);
-        const isReusable = pattern.isReusableWaste;
+        const isReusable = pattern.isReusableWaste && reusableRemnantMm > 0;
+        const displayTailMm = isReusable ? reusableRemnantMm : (pattern.scrapLength || pattern.wasteLength);
         const wasteFill = isReusable ? '#fef3c7' : '#e2e8f0';
         const wasteStroke = isReusable ? '#f59e0b' : '#94a3b8';
         const wasteTextColor = isReusable ? '#92400e' : '#475569';
-        const wasteLabel = isReusable ? `${pattern.wasteLength} (Ост)` : `${pattern.wasteLength} (Лом)`;
+        const wasteLabel = isReusable ? `${displayTailMm} (Ост)` : `${displayTailMm} (Лом)`;
 
         graphicBarSvg += `
           <rect class="cut-rect" x="${curX.toFixed(1)}" y="0" width="${wasteW.toFixed(1)}" height="${svgHeight}" fill="${wasteFill}" stroke="${wasteStroke}" stroke-width="1.5">
-            <title>${isReusable ? 'Деловой остаток' : 'Невозвратный лом'}: ${pattern.wasteLength} мм</title>
+            <title>${isReusable ? 'Деловой остаток' : 'Невозвратный лом'}: ${displayTailMm} мм</title>
           </rect>
         `;
 
@@ -238,21 +240,21 @@ export const PrintReports: React.FC<PrintReportsProps> = ({
     });
 
     const STRATEGY_TITLES: Record<string, string> = {
-      variants: 'Оптимизация вариантов (схем)',
+      variants: 'Минимум наладок',
       min_waste: 'Минимум отходов',
       min_bars: 'Минимум хлыстов',
       max_reusable: 'Максимум делового остатка',
-      prioritize_remnants: 'Приоритет складских остатков',
+      prioritize_remnants: 'Приоритет остатков со склада',
       comprehensive: 'Комплексный подбор',
     };
 
     const SPEED_TITLES: Record<string, string> = {
-      fast: 'Быстро (~10-15 сек)',
-      standard: 'Стандарт (~1-2 мин)',
-      deep: 'Глубокий перебор (от 2 мин)',
+      fast: 'Быстро',
+      standard: 'Стандарт',
+      deep: 'Глубокий',
     };
 
-    const strategyLabel = STRATEGY_TITLES[params.strategy || 'variants'] || params.strategy || 'Оптимизация вариантов';
+    const strategyLabel = STRATEGY_TITLES[params.strategy || 'variants'] || params.strategy || 'Минимум наладок';
     const speedLabel = SPEED_TITLES[params.searchSpeed || 'standard'] || params.searchSpeed || 'Стандарт';
 
     const doc = `<!DOCTYPE html>
@@ -322,7 +324,7 @@ export const PrintReports: React.FC<PrintReportsProps> = ({
       <div class="geom-item">Рез под углом 45°: <strong>${params.cutAngle45 ? 'Да (косой рез)' : 'Нет (прямой 90°)'}</strong></div>
       <div class="geom-item">Режим резки: <strong>${params.dualProfileCut ? 'Пакетный рез (от 2 шт.)' : 'Одиночный (по 1 хлысту)'}</strong></div>
       <div class="geom-item">Стратегия: <strong>${strategyLabel}</strong></div>
-      <div class="geom-item">Скорость: <strong>${speedLabel}</strong></div>
+      <div class="geom-item">Производительность: <strong>${speedLabel}</strong></div>
       <div class="geom-item">Упор / стружка: <strong>Учтены в картах</strong></div>
     </div>
   </div>
@@ -503,7 +505,8 @@ export const PrintReports: React.FC<PrintReportsProps> = ({
               let progressiveStop = pattern.trimStart || 0;
               const cutsCount = pattern.cuts.length + (pattern.trimStart > 0 ? 1 : 0) + 1;
               const kerfLoss = params.bladeWidth * cutsCount;
-              const scrapPart = pattern.isReusableWaste ? 0 : pattern.wasteLength;
+              const reusableRemnantMm = pattern.reusableLength || (pattern.isReusableWaste ? pattern.wasteLength : 0);
+              const scrapPart = pattern.scrapLength ?? (pattern.isReusableWaste ? 0 : pattern.wasteLength);
 
               // Format Отходы according to Requirement 10
               let wasteText = '';
@@ -537,9 +540,9 @@ export const PrintReports: React.FC<PrintReportsProps> = ({
 
                     <div className="text-xs text-slate-700 font-mono">
                       Отходы: <strong>{wasteText}</strong>
-                      {pattern.isReusableWaste && (
+                      {pattern.isReusableWaste && reusableRemnantMm > 0 && (
                         <span className="text-amber-800 font-bold ml-1.5">
-                          · Деловой: {pattern.wasteLength} мм
+                          · Деловой: {reusableRemnantMm} мм
                         </span>
                       )}{' '}
                       · КИМ: <strong>{pattern.efficiencyPercent}%</strong>
@@ -605,24 +608,26 @@ export const PrintReports: React.FC<PrintReportsProps> = ({
                         });
                       })()}
 
-                      {pattern.wasteLength > 0 && (
+                      {(pattern.wasteLength > 0 || (pattern.isReusableWaste && reusableRemnantMm > 0)) && (
                         <div
-                          style={{ width: `${(pattern.wasteLength / pattern.stockLength) * 100}%` }}
+                          style={{
+                            width: `${(((pattern.isReusableWaste && reusableRemnantMm > 0 ? reusableRemnantMm : scrapPart) / pattern.stockLength) * 100)}%`,
+                          }}
                           title={`${
-                            pattern.isReusableWaste ? 'Деловой остаток' : 'Невозвратный лом'
-                          }: ${pattern.wasteLength} мм`}
+                            pattern.isReusableWaste && reusableRemnantMm > 0 ? 'Деловой остаток' : 'Невозвратный лом'
+                          }: ${pattern.isReusableWaste && reusableRemnantMm > 0 ? reusableRemnantMm : scrapPart} мм`}
                           className={`h-full flex-1 flex items-center justify-center font-mono font-bold text-[10px] select-none px-1 border-l ${
                             highlightedCut?.patternId === pattern.id
                               ? 'opacity-25 grayscale brightness-90'
                               : ''
                           } ${
-                            pattern.isReusableWaste
+                            pattern.isReusableWaste && reusableRemnantMm > 0
                               ? 'bg-amber-100 text-amber-900 border-amber-400'
                               : 'bg-slate-200 text-slate-700 border-slate-400'
                           }`}
                         >
                           <span>
-                            {pattern.wasteLength} {pattern.isReusableWaste ? '(Ост)' : '(Лом)'}
+                            {pattern.isReusableWaste && reusableRemnantMm > 0 ? `${reusableRemnantMm} (Ост)` : `${scrapPart} (Лом)`}
                           </span>
                         </div>
                       )}
@@ -838,16 +843,19 @@ export const PrintReports: React.FC<PrintReportsProps> = ({
             </thead>
             <tbody className="divide-y divide-slate-100 font-mono">
               {result.patterns
-                .filter((p) => p.isReusableWaste && p.wasteLength > 0)
-                .map((p, idx) => (
-                  <tr key={p.id} className="hover:bg-amber-50/40">
-                    <td className="py-2 px-3 text-center text-slate-400">{idx + 1}</td>
-                    <td className="py-2 px-3 font-sans font-semibold">Карта #{p.patternIndex} ({p.stockLength} мм)</td>
-                    <td className="py-2 px-3 text-right font-bold text-amber-800">{p.wasteLength}</td>
-                    <td className="py-2 px-3 text-right font-bold text-blue-700">{p.count}</td>
-                    <td className="py-2 px-3 font-sans text-slate-700">Годен к повторному использованию</td>
-                  </tr>
-                ))}
+                .filter((p) => p.isReusableWaste && ((p.reusableLength || p.wasteLength) > 0))
+                .map((p, idx) => {
+                  const remLen = p.reusableLength || p.wasteLength;
+                  return (
+                    <tr key={p.id} className="hover:bg-amber-50/40">
+                      <td className="py-2 px-3 text-center text-slate-400">{idx + 1}</td>
+                      <td className="py-2 px-3 font-sans font-semibold">Карта #{p.patternIndex} ({p.stockLength} мм)</td>
+                      <td className="py-2 px-3 text-right font-bold text-amber-800">{remLen}</td>
+                      <td className="py-2 px-3 text-right font-bold text-blue-700">{p.count}</td>
+                      <td className="py-2 px-3 font-sans text-slate-700">Годен к повторному использованию</td>
+                    </tr>
+                  );
+                })}
             </tbody>
           </table>
         </div>

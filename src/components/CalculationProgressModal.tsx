@@ -26,6 +26,7 @@ import {
   TrendingUp,
   ExternalLink,
   Sparkles,
+  Loader2,
 } from 'lucide-react';
 import {
   FullOptimizationSolution,
@@ -104,6 +105,7 @@ export const CalculationProgressModal: React.FC<CalculationProgressModalProps> =
   const [highlightedRunId, setHighlightedRunId] = useState<string | null>(null);
   const [duplicateWarning, setDuplicateWarning] = useState<string | null>(null);
   const [isRecalculating, setIsRecalculating] = useState<boolean>(false);
+  const [isStopping, setIsStopping] = useState<boolean>(false);
   const [progressPercent, setProgressPercent] = useState<number>(10);
   const [statusText, setStatusText] = useState<string>('Инициализация параметров...');
 
@@ -509,6 +511,7 @@ export const CalculationProgressModal: React.FC<CalculationProgressModalProps> =
       setStatusText('Расчет успешно выполнен!');
       setPhase('done');
       setIsRecalculating(false);
+      setIsStopping(false);
       if (onFinished) onFinished(sol);
     };
 
@@ -561,6 +564,7 @@ export const CalculationProgressModal: React.FC<CalculationProgressModalProps> =
       setStatusText('Комплексный расчет выполнен! Добавлено 4 стратегии для сравнения.');
       setPhase('done');
       setIsRecalculating(false);
+      setIsStopping(false);
       if (onFinished && bestRun) onFinished(bestRun.solution);
     };
 
@@ -642,21 +646,28 @@ export const CalculationProgressModal: React.FC<CalculationProgressModalProps> =
    * Stop & apply best result found so far
    */
   const handleStopAndApply = () => {
+    if (isStopping) return;
+    setIsStopping(true);
+    setStatusText('Остановка расчета: завершаем текущий шаг и сохраняем лучший вариант...');
+
     if (workerRef.current) {
       workerRef.current.postMessage({ type: 'ABORT' });
-      setTimeout(() => {
-        if (phase === 'calculating') {
-          if (workerRef.current) {
-            workerRef.current.terminate();
-            workerRef.current = null;
-          }
-          if (stopwatchIntervalRef.current) {
-            clearInterval(stopwatchIntervalRef.current);
-            stopwatchIntervalRef.current = null;
-          }
+    }
 
-          const solToApply = latestSolutionRef.current || onExecuteCalculation({ ...modalSettings, searchSpeed: 'fast' });
-          const nextIdx = runs.length + 1;
+    setTimeout(() => {
+      if (phase === 'calculating') {
+        if (workerRef.current) {
+          workerRef.current.terminate();
+          workerRef.current = null;
+        }
+        if (stopwatchIntervalRef.current) {
+          clearInterval(stopwatchIntervalRef.current);
+          stopwatchIntervalRef.current = null;
+        }
+
+        const solToApply = latestSolutionRef.current || solution;
+        if (solToApply) {
+          const nextIdx = runs.filter((r) => r.index > 0).length + 1;
           const newRun: CalculationRun = {
             id: `run_${Date.now()}_${nextIdx}`,
             index: nextIdx,
@@ -671,16 +682,14 @@ export const CalculationProgressModal: React.FC<CalculationProgressModalProps> =
           setActiveRunId(newRun.id);
           if (onSaveRuns) onSaveRuns(updated);
           if (onApplySolutionAndSettings) onApplySolutionAndSettings(solToApply, modalSettings);
-          setProgressPercent(100);
-          setStatusText('Расчет прерван пользователем и применен текущий результат');
-          setPhase('done');
-          setIsRecalculating(false);
         }
-      }, 250);
-    } else {
-      setPhase('done');
-      setIsRecalculating(false);
-    }
+        setProgressPercent(100);
+        setStatusText('Расчет прерван пользователем и применен текущий результат');
+        setPhase('done');
+        setIsRecalculating(false);
+        setIsStopping(false);
+      }
+    }, 350);
   };
 
   // Reset or run initial calculation on open, preserving prior results when settings and input conditions match
@@ -690,6 +699,7 @@ export const CalculationProgressModal: React.FC<CalculationProgressModalProps> =
       setProgressPercent(10);
       setHighlightedRunId(null);
       setDuplicateWarning(null);
+      setIsStopping(false);
       if (workerRef.current) {
         workerRef.current.terminate();
         workerRef.current = null;
@@ -704,6 +714,7 @@ export const CalculationProgressModal: React.FC<CalculationProgressModalProps> =
     setModalSettings({ ...settings });
     setHighlightedRunId(null);
     setDuplicateWarning(null);
+    setIsStopping(false);
 
     // Gather all existing previous runs: from savedRuns, or synthesized from the completed solution on page
     let existingRuns: CalculationRun[] = savedRuns && savedRuns.length > 0 ? [...savedRuns] : [];
@@ -752,6 +763,30 @@ export const CalculationProgressModal: React.FC<CalculationProgressModalProps> =
 
     // Filter optimization runs (excluding baselines which are economic benchmarks)
     const optimizationRuns = existingRuns.filter((r) => !r.isBaseline && r.index > 0);
+
+    // Explicit calculation trigger check: user pressed "Рассчитать раскрой" (calcTriggerNonce was incremented)
+    const isExplicitCalcTrigger =
+      calcTriggerNonce !== undefined &&
+      calcTriggerNonce > 0 &&
+      calcTriggerNonce !== lastNonceRef.current;
+
+    if (isExplicitCalcTrigger) {
+      lastNonceRef.current = calcTriggerNonce;
+    }
+
+    // POINT 6 FIX: If previous runs/solutions exist and this is NOT an explicit calculate trigger
+    // (e.g. user just clicked the vertical spoiler tab to view comparison statistics):
+    // DO NOT run calculation! Just display the existing results.
+    if (optimizationRuns.length > 0 && !isExplicitCalcTrigger) {
+      setRuns(existingRuns);
+      const lastOpt = optimizationRuns[optimizationRuns.length - 1];
+      setActiveRunId(lastOpt?.id || existingRuns[existingRuns.length - 1]?.id);
+      setProgressPercent(100);
+      setStatusText('Просмотр сохраненных расчетов');
+      setPhase('done');
+      setIsRecalculating(false);
+      return;
+    }
 
     if (optimizationRuns.length > 0) {
       // Check if an identical optimization run matches BOTH settings AND inputSignature
@@ -977,7 +1012,7 @@ export const CalculationProgressModal: React.FC<CalculationProgressModalProps> =
   const getStrategyLabel = (goal?: string) => {
     switch (goal) {
       case 'variants':
-        return 'По вариантам';
+        return 'Минимум наладок';
       case 'min_waste':
         return 'Минимум отходов';
       case 'min_bars':
@@ -1632,14 +1667,30 @@ export const CalculationProgressModal: React.FC<CalculationProgressModalProps> =
               <div className="pt-2 text-center space-y-1.5">
                 <button
                   type="button"
+                  disabled={isStopping}
                   onClick={handleStopAndApply}
-                  className="inline-flex items-center gap-2 px-5 py-2.5 bg-rose-50 hover:bg-rose-100 text-rose-700 hover:text-rose-800 border border-rose-300 rounded-xl font-bold text-xs transition-all shadow-xs hover:shadow-md cursor-pointer active:scale-95"
+                  className={`inline-flex items-center gap-2 px-5 py-2.5 rounded-xl font-bold text-xs transition-all shadow-xs ${
+                    isStopping
+                      ? 'bg-amber-100 text-amber-900 border border-amber-300 cursor-wait'
+                      : 'bg-rose-50 hover:bg-rose-100 text-rose-700 hover:text-rose-800 border border-rose-300 cursor-pointer active:scale-95 hover:shadow-md'
+                  }`}
                 >
-                  <Square className="w-3.5 h-3.5 fill-rose-600 text-rose-600" />
-                  <span>Остановить и применить текущий результат</span>
+                  {isStopping ? (
+                    <>
+                      <Loader2 className="w-3.5 h-3.5 animate-spin text-amber-700" />
+                      <span>Остановка вычислений... Сохраняем лучший вариант</span>
+                    </>
+                  ) : (
+                    <>
+                      <Square className="w-3.5 h-3.5 fill-rose-600 text-rose-600" />
+                      <span>Остановить и применить текущий результат</span>
+                    </>
+                  )}
                 </button>
-                <p className="text-[11px] text-slate-400">
-                  Вы можете прервать расчет в любой момент — будет сохранен и применен лучший найденный вариант раскроя
+                <p className="text-[11px] text-slate-500">
+                  {isStopping
+                    ? 'Завершаем текущую итерацию и подготавливаем результаты раскроя...'
+                    : 'Вы можете прервать расчет в любой момент — будет сохранен и применен лучший найденный вариант раскроя'}
                 </p>
               </div>
             </div>
@@ -2098,22 +2149,22 @@ export const CalculationProgressModal: React.FC<CalculationProgressModalProps> =
                               </th>
 
                               <th
-                                onClick={() => handleSortToggle('speed')}
-                                className="py-2 px-2.5 cursor-pointer hover:bg-slate-200 transition-colors group whitespace-nowrap"
-                              >
-                                <div className="flex items-center gap-1">
-                                  <span>Скорость</span>
-                                  {renderSortIndicator('speed')}
-                                </div>
-                              </th>
-
-                              <th
                                 onClick={() => handleSortToggle('strategy')}
                                 className="py-2 px-2.5 cursor-pointer hover:bg-slate-200 transition-colors group whitespace-nowrap"
                               >
                                 <div className="flex items-center gap-1">
                                   <span>Стратегия</span>
                                   {renderSortIndicator('strategy')}
+                                </div>
+                              </th>
+
+                              <th
+                                onClick={() => handleSortToggle('speed')}
+                                className="py-2 px-2.5 cursor-pointer hover:bg-slate-200 transition-colors group whitespace-nowrap"
+                              >
+                                <div className="flex items-center gap-1">
+                                  <span>Производительность</span>
+                                  {renderSortIndicator('speed')}
                                 </div>
                               </th>
 
@@ -2304,15 +2355,6 @@ export const CalculationProgressModal: React.FC<CalculationProgressModalProps> =
                                       </span>
                                     </td>
 
-                                    {/* Скорость */}
-                                    <td className="py-2 px-2.5 text-[11px] whitespace-nowrap text-slate-600">
-                                      {isBaseline ? (
-                                        <span className="text-slate-400 font-medium">—</span>
-                                      ) : (
-                                        getSpeedLabel(r.settings.searchSpeed)
-                                      )}
-                                    </td>
-
                                     {/* Стратегия */}
                                     <td className="py-2 px-2.5 text-[11px] whitespace-nowrap">
                                       <div className="flex items-center gap-1.5">
@@ -2351,6 +2393,15 @@ export const CalculationProgressModal: React.FC<CalculationProgressModalProps> =
                                           );
                                         })()}
                                       </div>
+                                    </td>
+
+                                    {/* Производительность */}
+                                    <td className="py-2 px-2.5 text-[11px] whitespace-nowrap text-slate-600">
+                                      {isBaseline ? (
+                                        <span className="text-slate-400 font-medium">—</span>
+                                      ) : (
+                                        getSpeedLabel(r.settings.searchSpeed)
+                                      )}
                                     </td>
 
                                     {/* 2 профиля */}
@@ -2727,7 +2778,7 @@ export const CalculationProgressModal: React.FC<CalculationProgressModalProps> =
                         onChange={(e) => setDeficitStrategy(e.target.value)}
                         className="w-full bg-white border border-slate-300 rounded-lg text-xs py-1 px-2 font-medium"
                       >
-                        <option value="variants">По вариантам (меньше карт)</option>
+                        <option value="variants">Минимум наладок</option>
                         <option value="min_waste">Минимум отходов</option>
                         <option value="min_bars">Минимум хлыстов</option>
                         <option value="max_reusable">Максимум делового</option>

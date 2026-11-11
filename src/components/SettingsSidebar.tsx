@@ -102,36 +102,21 @@ export const SettingsSidebar: React.FC<SettingsSidebarProps> = ({
 
       {/* Sidebar Scrollable Body */}
       <div className="flex-1 overflow-y-auto p-3.5 space-y-3.5 text-xs">
-        {/* Block 1: Алгоритм и стратегия (ОПТИМИЗАЦИЯ И СКОРОСТЬ) */}
+        {/* Block 1: Алгоритм и стратегия (СТРАТЕГИЯ И ПРОИЗВОДИТЕЛЬНОСТЬ) */}
         <div className="bg-slate-50/70 border border-slate-200 rounded-xl p-3 space-y-2.5">
           <div className="flex items-center justify-between">
             <div className="text-[11px] font-bold text-slate-800 uppercase tracking-wider">
-              Оптимизация и скорость
+              Стратегия и производительность
             </div>
             <div
               className="cursor-help text-slate-400 hover:text-blue-600 transition-colors"
-              title={"• Скорость расчета: «Быстро» (10–15 сек) — быстрый эвристический перебор с локальной оптимизацией; «Стандарт» (1–2 мин) — многопроходный генератор карт; «Глубокий» (от 2 мин) — максимальный комбинаторный перебор и отжиг.\n• Стратегия оптимизации: «Схемы» — минимум разных карт раскроя; «Минимум отходов» — наивысший КИМ и минимум лома; «Минимум хлыстов» — экономия исходного проката; «Максимум делового» — получение крупных полезных обрезков; «Приоритет остатков» — первоочередной раскрой коротких складских заготовок."}
+              title={"• Стратегия оптимизации: «Минимум наладок» — меньше разных карт раскроя; «Минимум отходов» — наивысший КИМ и минимум лома; «Минимум хлыстов» — экономия исходного проката; «Максимум делового» — получение крупных полезных обрезков.\n• Производительность: «Быстро» — быстрый расчет; «Стандарт» — многопроходный генератор карт; «Глубокий» — максимальный комбинаторный перебор."}
             >
               <HelpCircle className="w-3.5 h-3.5" />
             </div>
           </div>
 
           <div className="space-y-2.5">
-            <div>
-              <label className="text-[11px] font-semibold text-slate-600 block mb-1">
-                Скорость расчета:
-              </label>
-              <select
-                value={settings.searchSpeed}
-                onChange={(e) => updateSetting('searchSpeed', e.target.value as any)}
-                className="w-full text-xs bg-white border border-slate-300 rounded-lg px-2.5 py-1.5 font-medium text-slate-800 focus:outline-hidden cursor-pointer"
-              >
-                <option value="fast">Быстро (~10-15 сек)</option>
-                <option value="standard">Стандарт (~1-2 мин)</option>
-                <option value="deep">Глубокий перебор (от 2 мин)</option>
-              </select>
-            </div>
-
             <div>
               <label className="text-[11px] font-semibold text-slate-600 block mb-1">
                 Стратегия оптимизации:
@@ -141,13 +126,27 @@ export const SettingsSidebar: React.FC<SettingsSidebarProps> = ({
                 onChange={(e) => updateSetting('optimizationGoal', e.target.value as any)}
                 className="w-full text-xs bg-white border border-slate-300 rounded-lg px-2.5 py-1.5 font-medium text-slate-800 focus:outline-hidden cursor-pointer"
               >
-                <option value="variants">Оптимизация вариантов (схем)</option>
+                <option value="variants">Минимум наладок</option>
                 <option value="min_waste">Минимум отходов</option>
                 <option value="min_bars">Минимум хлыстов</option>
                 <option value="max_reusable">Максимум делового остатка</option>
-                <option value="prioritize_remnants">Приоритет остатков со склада</option>
                 <option value="comprehensive">Комплексный подбор (4 стратегии)</option>
                 <option value="custom">Пользовательская (настраиваемая)</option>
+              </select>
+            </div>
+
+            <div>
+              <label className="text-[11px] font-semibold text-slate-600 block mb-1">
+                Производительность:
+              </label>
+              <select
+                value={settings.searchSpeed}
+                onChange={(e) => updateSetting('searchSpeed', e.target.value as any)}
+                className="w-full text-xs bg-white border border-slate-300 rounded-lg px-2.5 py-1.5 font-medium text-slate-800 focus:outline-hidden cursor-pointer"
+              >
+                <option value="fast">Быстро</option>
+                <option value="standard">Стандарт</option>
+                <option value="deep">Глубокий</option>
               </select>
             </div>
 
@@ -636,6 +635,26 @@ export const SettingsSidebar: React.FC<SettingsSidebarProps> = ({
                 />
                 <span className="text-xs text-blue-700 font-mono font-bold">%</span>
               </div>
+            </div>
+
+            {/* Приоритет остатков со склада */}
+            <div className="pt-2 border-t border-slate-200">
+              <label className="flex items-center gap-2 cursor-pointer select-none">
+                <input
+                  type="checkbox"
+                  checked={settings.prioritizeRemnants ?? false}
+                  onChange={(e) => updateSetting('prioritizeRemnants', e.target.checked)}
+                  className="w-4 h-4 rounded text-blue-600 focus:ring-blue-500 cursor-pointer"
+                />
+                <div>
+                  <span className="text-[11px] font-bold text-slate-900 block">
+                    Приоритет остатков со склада
+                  </span>
+                  <span className="text-[10px] text-slate-500 block leading-tight">
+                    Первоочередной раскрой коротких заготовок
+                  </span>
+                </div>
+              </label>
             </div>
           </div>
         </div>

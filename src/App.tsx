@@ -59,6 +59,7 @@ export default function App() {
     reusableRemnantMin: 250, // Yields 98.60% KIM matching Screenshot 5 & 6
     cutAngle45: false,
     dualProfileCut: true,
+    prioritizeRemnants: false,
     fillControlEnabled: false,
     fillControlThreshold: 50,
     groupSolutions: true,
@@ -758,10 +759,10 @@ export default function App() {
                   (sum, p) => sum + p.count * settings.bladeWidth,
                   0
                 ),
-                wasteLength: r.waste,
+                wasteLength: r.isReusable ? (r.reusableRemnant || 0) : (r.scrapRemnant || r.waste),
                 isReusableWaste: r.isReusable,
-                reusableLength: r.isReusable ? r.waste : 0,
-                scrapLength: !r.isReusable ? r.waste : 0,
+                reusableLength: r.isReusable ? (r.reusableRemnant || 0) : 0,
+                scrapLength: r.isReusable ? r.waste : (r.scrapRemnant || r.waste),
                 efficiencyPercent: r.efficiency,
                 count: r.barsCount,
               })),

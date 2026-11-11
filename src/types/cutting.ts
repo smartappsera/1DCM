@@ -108,6 +108,7 @@ export interface AppSettings {
   reusableRemnantMin: number; // Деловой остат., мм (по умолчанию 0 или 250)
   cutAngle45: boolean; // Рез под 45 градусов
   dualProfileCut: boolean; // Раскрой в два профиля
+  prioritizeRemnants?: boolean; // Приоритет остатков со склада (чекбокс в блоке пакетного раскроя)
   fillControlEnabled?: boolean; // Контроль заполнения крайней пары
   fillControlThreshold?: number; // Порог КИМ для контроля заполнения, % (по умолчанию 50)
   groupSolutions: boolean; // Группировать решение
