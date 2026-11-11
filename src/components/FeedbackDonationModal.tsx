@@ -338,15 +338,15 @@ export const FeedbackDonationModal: React.FC<FeedbackDonationModalProps> = ({
 
               {/* QR Code Presentation Box */}
               <div className="flex flex-col items-center justify-center">
-                <div className="bg-white p-3 rounded-2xl border-2 border-slate-200 shadow-md flex items-center justify-center max-w-[280px]">
+                <div className="bg-white p-4 rounded-2xl border-2 border-slate-200 shadow-md flex items-center justify-center max-w-[260px]">
                   <img
                     src={
                       cryptoNetwork === 'TON'
-                        ? '/assets/aistudio/qr_ton_card.png'
-                        : '/assets/aistudio/qr_trc20_card.png'
+                        ? '/assets/aistudio/tonscan_f9a1d1e9.png'
+                        : '/assets/aistudio/usdttrc20tonscan_c35f15d6.png'
                     }
                     alt={cryptoNetwork === 'TON' ? 'QR-код TON' : 'QR-код USDT TRC20'}
-                    className="w-full h-auto rounded-xl object-contain shadow-2xs"
+                    className="w-full h-auto rounded-lg object-contain"
                   />
                 </div>
               </div>
