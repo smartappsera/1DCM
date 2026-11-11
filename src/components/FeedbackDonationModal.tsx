@@ -342,8 +342,8 @@ export const FeedbackDonationModal: React.FC<FeedbackDonationModalProps> = ({
                   <img
                     src={
                       cryptoNetwork === 'TON'
-                        ? '/assets/aistudio/tonscan_f447efce.svg'
-                        : '/assets/aistudio/usdttrc20tonscan_b6bcffb3.svg'
+                        ? '/assets/qr_ton.svg'
+                        : '/assets/qr_trc20.svg'
                     }
                     alt={cryptoNetwork === 'TON' ? 'QR-код TON' : 'QR-код USDT TRC20'}
                     className="w-full h-full object-contain"
