@@ -32,9 +32,14 @@ export const Header: React.FC<HeaderProps> = ({
             e.preventDefault();
             setActiveTab('workspace');
           }}
-          className="text-base sm:text-lg font-bold tracking-tight text-white whitespace-nowrap shrink-0 flex items-center gap-2"
+          className="text-base sm:text-lg font-bold tracking-tight text-white whitespace-nowrap shrink-0 flex items-center gap-2.5 group"
         >
-          <span>Линейный Раскрой Про</span>
+          <img
+            src="/logo.png"
+            alt="Логотип сайта"
+            className="w-7 h-7 sm:w-8 sm:h-8 rounded-lg object-contain shrink-0 shadow-xs group-hover:scale-105 transition-transform"
+          />
+          <span className="group-hover:text-blue-200 transition-colors">Линейный Раскрой Про</span>
         </a>
 
         {/* Zone 2: Navigation Links for Desktop (md and up) */}
