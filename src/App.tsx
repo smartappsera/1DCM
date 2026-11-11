@@ -67,21 +67,11 @@ export default function App() {
   });
 
   // Stocks («Есть») initialized with pinned standard bars + benchmark remnants
-  // Point 10: Default state of standard bars checkboxes: unchecked (isActive: false)
+  // Stocks («Есть») initialized with pinned standard bars disabled by default
   const [stockItems, setStockItems] = useState<DynamicRowItem[]>([
     {
-      id: 's_std_6000',
-      orderIndex: 1,
-      length: 6000,
-      quantity: 0,
-      isStandard: true,
-      isActive: false,
-      isStandardUnlimited: true,
-      mark: 'Стандарт',
-    },
-    {
       id: 's_std_12000',
-      orderIndex: 2,
+      orderIndex: 1,
       length: 12000,
       quantity: 0,
       isStandard: true,
@@ -89,35 +79,20 @@ export default function App() {
       isStandardUnlimited: true,
       mark: 'Стандарт',
     },
-    { id: 's2', orderIndex: 3, length: 2630, quantity: 18, mark: 'Склад', isActive: true },
-    { id: 's3', orderIndex: 4, length: 580, quantity: 100, mark: 'Склад', isActive: true },
+    {
+      id: 's_std_6000',
+      orderIndex: 2,
+      length: 6000,
+      quantity: 0,
+      isStandard: true,
+      isActive: false,
+      isStandardUnlimited: true,
+      mark: 'Стандарт',
+    },
   ]);
 
-  // Demands («Нужно») initialized with fixed distinct colors for each piece
-  const [demandItems, setDemandItems] = useState<DynamicRowItem[]>([
-    { id: 'd1', orderIndex: 1, length: 5230, quantity: 31, mark: '1', color: '#F87171' },
-    { id: 'd2', orderIndex: 2, length: 150, quantity: 400, mark: '2', color: '#4ADE80' },
-    { id: 'd3', orderIndex: 3, length: 320, quantity: 30, mark: '3', color: '#6366F1' },
-    { id: 'd4', orderIndex: 4, length: 280, quantity: 50, mark: '4', color: '#FACC15' },
-    { id: 'd5', orderIndex: 5, length: 800, quantity: 150, mark: '5', color: '#E879F9' },
-    { id: 'd6', orderIndex: 6, length: 810, quantity: 150, mark: '6', color: '#38BDF8' },
-    { id: 'd7', orderIndex: 7, length: 564, quantity: 1200, mark: '7', color: '#FB923C' },
-    { id: 'd8', orderIndex: 8, length: 312, quantity: 112, mark: '8', color: '#2DD4BF' },
-    { id: 'd9', orderIndex: 9, length: 85, quantity: 1224, mark: '9', color: '#A78BFA' },
-    { id: 'd10', orderIndex: 10, length: 5300, quantity: 1120, mark: '10', color: '#F472B6' },
-    { id: 'd11', orderIndex: 11, length: 788, quantity: 15, mark: '11', color: '#34D399' },
-    { id: 'd12', orderIndex: 12, length: 99, quantity: 12, mark: '12', color: '#60A5FA' },
-    { id: 'd13', orderIndex: 13, length: 780, quantity: 130, mark: '13', color: '#FBBF24' },
-    { id: 'd14', orderIndex: 14, length: 1144, quantity: 780, mark: '14', color: '#C084FC' },
-    { id: 'd15', orderIndex: 15, length: 3288, quantity: 600, mark: '15', color: '#F43F5E' },
-    { id: 'd16', orderIndex: 16, length: 2500, quantity: 600, mark: '16', color: '#14B8A6' },
-    { id: 'd17', orderIndex: 17, length: 1320, quantity: 600, mark: '17', color: '#818CF8' },
-    { id: 'd18', orderIndex: 18, length: 4212, quantity: 35, mark: '18', color: '#FB7185' },
-    { id: 'd19', orderIndex: 19, length: 4220, quantity: 140, mark: '19', color: '#A3E635' },
-    { id: 'd20', orderIndex: 20, length: 879, quantity: 4500, mark: '20', color: '#06B6D4' },
-    { id: 'd21', orderIndex: 21, length: 1111, quantity: 4500, mark: '21', color: '#E11D48' },
-    { id: 'd22', orderIndex: 22, length: 400, quantity: 100, mark: '22', color: '#0EA5E9' },
-  ]);
+  // Demands («Нужно») initialized empty by default
+  const [demandItems, setDemandItems] = useState<DynamicRowItem[]>([]);
 
   // Solution is initially null: results page is NOT visible until calculate is pressed!
   const [solution, setSolution] = useState<FullOptimizationSolution | null>(null);
@@ -432,9 +407,9 @@ export default function App() {
 
     setStockItems([
       {
-        id: 's_std_6000',
+        id: 's_std_12000',
         orderIndex: 1,
-        length: 6000,
+        length: 12000,
         quantity: 0,
         isStandard: true,
         isActive: true,
@@ -442,9 +417,9 @@ export default function App() {
         mark: 'Стандарт',
       },
       {
-        id: 's_std_12000',
+        id: 's_std_6000',
         orderIndex: 2,
-        length: 12000,
+        length: 6000,
         quantity: 0,
         isStandard: true,
         isActive: true,
@@ -456,12 +431,28 @@ export default function App() {
     ]);
 
     setDemandItems([
-      { id: 'd1', orderIndex: 1, length: 5230, quantity: 30, color: '#F87171' },
-      { id: 'd2', orderIndex: 2, length: 150, quantity: 400, color: '#4ADE80' },
-      { id: 'd3', orderIndex: 3, length: 320, quantity: 30, color: '#6366F1' },
-      { id: 'd4', orderIndex: 4, length: 280, quantity: 50, color: '#FACC15' },
-      { id: 'd5', orderIndex: 5, length: 800, quantity: 150, color: '#E879F9' },
-      { id: 'd6', orderIndex: 6, length: 810, quantity: 150, color: '#38BDF8' },
+      { id: 'd1', orderIndex: 1, length: 5230, quantity: 31, mark: '1', color: '#F87171' },
+      { id: 'd2', orderIndex: 2, length: 150, quantity: 400, mark: '2', color: '#4ADE80' },
+      { id: 'd3', orderIndex: 3, length: 320, quantity: 30, mark: '3', color: '#6366F1' },
+      { id: 'd4', orderIndex: 4, length: 280, quantity: 50, mark: '4', color: '#FACC15' },
+      { id: 'd5', orderIndex: 5, length: 800, quantity: 150, mark: '5', color: '#E879F9' },
+      { id: 'd6', orderIndex: 6, length: 810, quantity: 150, mark: '6', color: '#38BDF8' },
+      { id: 'd7', orderIndex: 7, length: 564, quantity: 1200, mark: '7', color: '#FB923C' },
+      { id: 'd8', orderIndex: 8, length: 312, quantity: 112, mark: '8', color: '#2DD4BF' },
+      { id: 'd9', orderIndex: 9, length: 85, quantity: 1224, mark: '9', color: '#A78BFA' },
+      { id: 'd10', orderIndex: 10, length: 5300, quantity: 1120, mark: '10', color: '#F472B6' },
+      { id: 'd11', orderIndex: 11, length: 788, quantity: 15, mark: '11', color: '#34D399' },
+      { id: 'd12', orderIndex: 12, length: 99, quantity: 12, mark: '12', color: '#60A5FA' },
+      { id: 'd13', orderIndex: 13, length: 780, quantity: 130, mark: '13', color: '#FBBF24' },
+      { id: 'd14', orderIndex: 14, length: 1144, quantity: 780, mark: '14', color: '#C084FC' },
+      { id: 'd15', orderIndex: 15, length: 3288, quantity: 600, mark: '15', color: '#F43F5E' },
+      { id: 'd16', orderIndex: 16, length: 2500, quantity: 600, mark: '16', color: '#14B8A6' },
+      { id: 'd17', orderIndex: 17, length: 1320, quantity: 600, mark: '17', color: '#818CF8' },
+      { id: 'd18', orderIndex: 18, length: 4212, quantity: 35, mark: '18', color: '#FB7185' },
+      { id: 'd19', orderIndex: 19, length: 4220, quantity: 140, mark: '19', color: '#A3E635' },
+      { id: 'd20', orderIndex: 20, length: 879, quantity: 4500, mark: '20', color: '#06B6D4' },
+      { id: 'd21', orderIndex: 21, length: 1111, quantity: 4500, mark: '21', color: '#E11D48' },
+      { id: 'd22', orderIndex: 22, length: 400, quantity: 100, mark: '22', color: '#0EA5E9' },
     ]);
 
     setSolution(null);

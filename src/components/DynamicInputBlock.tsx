@@ -96,6 +96,7 @@ export const DynamicInputBlock: React.FC<DynamicInputBlockProps> = ({
     notes: false,
     usedOrPlaced: false, // Default hidden per req 12
     remainingOrUnplaced: false, // Default hidden per req 12
+    order: false, // Default hidden in СТОЛБЦЫ, can be activated
   });
 
   // Table sorting (Requirement 11)
@@ -295,33 +296,50 @@ export const DynamicInputBlock: React.FC<DynamicInputBlockProps> = ({
     );
   };
 
-  const handleMoveUp = (index: number) => {
+  const handleMoveUp = (id: string) => {
     if (isLocked && title === 'Нужно') {
       onRequestUnlock?.();
       return;
     }
-    if (index === 0) return;
+    setSortField(null);
     setItems((prev) => {
+      const idx = prev.findIndex((i) => i.id === id);
+      if (idx === -1) return prev;
+      const minIndex =
+        title === 'Есть'
+          ? prev.filter((i) => i.isStandard || i.length === 6000 || i.length === 12000).length
+          : 0;
+      if (idx <= minIndex) return prev;
+
       const arr = [...prev];
-      const temp = arr[index - 1];
-      arr[index - 1] = arr[index];
-      arr[index] = temp;
-      return arr.map((item, idx) => ({ ...item, orderIndex: idx + 1 }));
+      const temp = arr[idx - 1];
+      arr[idx - 1] = arr[idx];
+      arr[idx] = temp;
+      return arr.map((item, i) => ({ ...item, orderIndex: i + 1 }));
     });
   };
 
-  const handleMoveDown = (index: number) => {
+  const handleMoveDown = (id: string) => {
     if (isLocked && title === 'Нужно') {
       onRequestUnlock?.();
       return;
     }
-    if (index >= items.length - 1) return;
+    setSortField(null);
     setItems((prev) => {
+      const idx = prev.findIndex((i) => i.id === id);
+      if (idx === -1 || idx >= prev.length - 1) return prev;
+      if (
+        title === 'Есть' &&
+        (prev[idx].isStandard || prev[idx].length === 6000 || prev[idx].length === 12000)
+      ) {
+        return prev;
+      }
+
       const arr = [...prev];
-      const temp = arr[index + 1];
-      arr[index + 1] = arr[index];
-      arr[index] = temp;
-      return arr.map((item, idx) => ({ ...item, orderIndex: idx + 1 }));
+      const temp = arr[idx + 1];
+      arr[idx + 1] = arr[idx];
+      arr[idx] = temp;
+      return arr.map((item, i) => ({ ...item, orderIndex: i + 1 }));
     });
   };
 
@@ -734,6 +752,17 @@ export const DynamicInputBlock: React.FC<DynamicInputBlockProps> = ({
                         {title === 'Есть' ? 'Не использовано' : 'Не разложено'}
                       </span>
                     </label>
+                    <label className="flex items-center gap-2 cursor-pointer select-none">
+                      <input
+                        type="checkbox"
+                        checked={columnsConfig.order}
+                        onChange={(e) =>
+                          setColumnsConfig((prev) => ({ ...prev, order: e.target.checked }))
+                        }
+                        className="w-3.5 h-3.5 text-blue-600 rounded"
+                      />
+                      <span className="font-medium">Порядок (перемещение)</span>
+                    </label>
                   </div>
                 )}
               </div>
@@ -930,7 +959,7 @@ export const DynamicInputBlock: React.FC<DynamicInputBlockProps> = ({
                     </div>
                   </th>
                 )}
-                <th className="py-2 px-2 text-center w-14">Порядок</th>
+                {columnsConfig.order && <th className="py-2 px-2 text-center w-14 select-none">Порядок</th>}
               </tr>
 
               {/* Summary Row inside the table matching height */}
@@ -960,8 +989,8 @@ export const DynamicInputBlock: React.FC<DynamicInputBlockProps> = ({
                 <td className="py-1 px-3 font-semibold w-44 min-w-[170px] max-w-[170px]">
                   {hasAutoStandard
                     ? fixedQtyTotal > 0
-                      ? `Всего: ${fixedQtyTotal.toLocaleString('ru-RU')} шт. + по потр.`
-                      : 'Всего: по потребности'
+                    ? `Всего: ${fixedQtyTotal.toLocaleString('ru-RU')} шт. + по потр.`
+                    : 'Всего: по потребности'
                     : fixedQtyTotal > 0
                     ? `Всего: ${fixedQtyTotal.toLocaleString('ru-RU')} шт.`
                     : '—'}
@@ -986,7 +1015,7 @@ export const DynamicInputBlock: React.FC<DynamicInputBlockProps> = ({
                   </td>
                 )}
                 {columnsConfig.notes && <td className="py-1 px-3">—</td>}
-                <td className="py-1 px-2 text-center"></td>
+                {columnsConfig.order && <td className="py-1 px-2 text-center"></td>}
               </tr>
             </thead>
 
@@ -995,13 +1024,15 @@ export const DynamicInputBlock: React.FC<DynamicInputBlockProps> = ({
                 <tr>
                   <td
                     colSpan={
-                      3 +
+                      2 +
                       (title === 'Нужно' ? 1 : 0) +
                       (columnsConfig.mark ? 1 : 0) +
-                      (columnsConfig.notes ? 1 : 0) +
+                      1 +
+                      1 +
                       (columnsConfig.usedOrPlaced ? 1 : 0) +
                       (columnsConfig.remainingOrUnplaced ? 1 : 0) +
-                      1
+                      (columnsConfig.notes ? 1 : 0) +
+                      (columnsConfig.order ? 1 : 0)
                     }
                     className="py-8 text-center text-slate-400 text-xs"
                   >
@@ -1015,6 +1046,14 @@ export const DynamicInputBlock: React.FC<DynamicInputBlockProps> = ({
                     (item.isStandard || item.length === 6000 || item.length === 12000);
                   const isAutoCalculated =
                     isStandardLength && (item.quantity === 0 || item.isStandardUnlimited);
+
+                  const actualIdx = items.findIndex((i) => i.id === item.id);
+                  const minMovableIndex =
+                    title === 'Есть'
+                      ? items.filter((i) => i.isStandard || i.length === 6000 || i.length === 12000).length
+                      : 0;
+                  const isUpDisabled = isStandardLength || actualIdx <= minMovableIndex;
+                  const isDownDisabled = isStandardLength || actualIdx === -1 || actualIdx >= items.length - 1;
 
                   return (
                     <tr
@@ -1053,7 +1092,7 @@ export const DynamicInputBlock: React.FC<DynamicInputBlockProps> = ({
 
                       {/* Index */}
                       <td className="py-1.5 px-2 text-center font-mono font-bold text-slate-700 bg-slate-50/80 border-r border-slate-200">
-                        {idx + 1}
+                        {item.orderIndex}
                       </td>
 
                       {/* Color indicator in НУЖНО */}
@@ -1239,40 +1278,42 @@ export const DynamicInputBlock: React.FC<DynamicInputBlockProps> = ({
                       )}
 
                       {/* Row Reordering (Up/Down): Disabled for standard fixed rows */}
-                      <td className="py-1 px-1 text-center flex items-center justify-center gap-0.5">
-                        {isStandardLength ? (
-                          <span className="text-slate-300 font-mono text-[10px] select-none">—</span>
-                        ) : (
-                          <>
-                            <button
-                              type="button"
-                              onClick={() => handleMoveUp(idx)}
-                              disabled={idx === 0}
-                              title="Поднять вверх"
-                              className={`p-1 rounded ${
-                                idx === 0
-                                  ? 'text-slate-300 cursor-not-allowed'
-                                  : 'text-slate-500 hover:text-slate-900 hover:bg-slate-200 cursor-pointer'
-                              }`}
-                            >
-                              <ChevronUp className="w-3.5 h-3.5" />
-                            </button>
-                            <button
-                              type="button"
-                              onClick={() => handleMoveDown(idx)}
-                              disabled={idx === items.length - 1}
-                              title="Опустить вниз"
-                              className={`p-1 rounded ${
-                                idx === items.length - 1
-                                  ? 'text-slate-300 cursor-not-allowed'
-                                  : 'text-slate-500 hover:text-slate-900 hover:bg-slate-200 cursor-pointer'
-                              }`}
-                            >
-                              <ChevronDown className="w-3.5 h-3.5" />
-                            </button>
-                          </>
-                        )}
-                      </td>
+                      {columnsConfig.order && (
+                        <td className="py-1 px-1 text-center flex items-center justify-center gap-0.5">
+                          {isStandardLength ? (
+                            <span className="text-slate-300 font-mono text-[10px] select-none">—</span>
+                          ) : (
+                            <>
+                              <button
+                                type="button"
+                                onClick={() => handleMoveUp(item.id)}
+                                disabled={isUpDisabled}
+                                title="Поднять вверх"
+                                className={`p-1 rounded ${
+                                  isUpDisabled
+                                    ? 'text-slate-300 cursor-not-allowed'
+                                    : 'text-slate-500 hover:text-slate-900 hover:bg-slate-200 cursor-pointer'
+                                }`}
+                              >
+                                <ChevronUp className="w-3.5 h-3.5" />
+                              </button>
+                              <button
+                                type="button"
+                                onClick={() => handleMoveDown(item.id)}
+                                disabled={isDownDisabled}
+                                title="Опустить вниз"
+                                className={`p-1 rounded ${
+                                  isDownDisabled
+                                    ? 'text-slate-300 cursor-not-allowed'
+                                    : 'text-slate-500 hover:text-slate-900 hover:bg-slate-200 cursor-pointer'
+                                }`}
+                              >
+                                <ChevronDown className="w-3.5 h-3.5" />
+                              </button>
+                            </>
+                          )}
+                        </td>
+                      )}
                     </tr>
                   );
                 })

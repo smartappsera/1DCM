@@ -73,11 +73,11 @@ export const Header: React.FC<HeaderProps> = ({
           {!hasResults && onLoadBenchmarkExample && (
             <button
               onClick={onLoadBenchmarkExample}
-              title="Загрузить контрольный пример (82 хлыста, КИМ 98.6%)"
+              title="Загрузить пример"
               className="flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold text-blue-200 bg-blue-950/70 hover:bg-blue-900 border border-blue-700/70 rounded-lg transition-colors whitespace-nowrap shrink-0 cursor-pointer shadow-xs"
             >
               <Sparkles className="w-3.5 h-3.5 text-blue-400" />
-              <span>Пример (82 хлыста)</span>
+              <span>Пример</span>
             </button>
           )}
 
