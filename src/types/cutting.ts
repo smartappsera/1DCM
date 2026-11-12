@@ -87,6 +87,31 @@ export interface FullOptimizationSolution {
   remainingWarehouseStock: RemnantItem[]; // Блок «Осталось»
   unplacedDemand: UnplacedItem[]; // Блок «Не сделано»
   calculationTimeMs: number;
+  telemetry?: CalculationTelemetry;
+}
+
+export interface CalculationTelemetry {
+  calculationId: string;
+  timestamp: number;
+  environment: 'client_worker' | 'client_main' | 'server_node';
+  // Временные метрики (мс)
+  totalDurationMs: number;
+  stageTimingsMs: {
+    stage1Init: number;      // Анализ заготовок, НОД и сортировка
+    stage2Search: number;    // Многопроходный подбор комбинаций
+    stage3Refine: number;    // 2-Opt локальный поиск и схлопывание карт
+  };
+  // Алгоритмическая и вычислительная нагрузка
+  passesEvaluated: number;
+  totalCombinationsChecked: number;
+  twoOptSwapIterations: number;
+  tailConsolidationCardsMerged: number;
+  throughputPartsPerSecond: number;
+  // Память и процессорная среда
+  memoryUsedMb?: number;       // JS Heap (performance.memory / Node heapUsed)
+  memoryDeltaMb?: number;      // Дельта выделенной памяти
+  cpuLoadPercent?: number;     // Загрузка ядра (~100% выделенного ядра Worker во время расчета)
+  workerThreadCount: number;   // Количество потоков (1 для Worker)
 }
 
 export interface CustomStrategyConfig {
@@ -245,6 +270,7 @@ export interface CuttingOptimizationResult {
     missing: number;
   }[];
   calculationTimeMs: number;
+  telemetry?: CalculationTelemetry;
   algorithmName: string;
 }
 

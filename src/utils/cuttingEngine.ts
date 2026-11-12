@@ -17,7 +17,18 @@ import {
   CalculationProgressInfo,
   ComplexityEstimate,
   CustomStrategyConfig,
+  CalculationTelemetry,
 } from '../types/cutting';
+
+/**
+ * Returns current JS Heap memory usage in megabytes (Chromium / Node)
+ */
+export function getMemoryUsageMb(): number | undefined {
+  if (typeof performance !== 'undefined' && (performance as any).memory?.usedJSHeapSize) {
+    return Number(((performance as any).memory.usedJSHeapSize / (1024 * 1024)).toFixed(2));
+  }
+  return undefined;
+}
 
 /**
  * Returns default configuration for Custom Strategy
@@ -1209,6 +1220,11 @@ export function solveLinearCutting(
   }
 
   const startTime = performance.now();
+  const startMemoryMb = getMemoryUsageMb();
+  let stage1EndTime = startTime;
+  let stage2EndTime = startTime;
+  let totalCombinationsChecked = 0;
+  let initialCardsCount = 0;
 
   let dRez = Math.max(0, settings.bladeWidth || 0);
   const krm = Math.max(0, settings.edgeTrim || 0);
@@ -1355,6 +1371,7 @@ export function solveLinearCutting(
   const totalPasses = (maxSortZ + 1) * (maxSort + 1) * (maxVar + 1);
   let currentPass = 0;
   let lastProgressReportTime = performance.now();
+  stage1EndTime = performance.now();
 
   // Search loops matching VBA heuristics with high-performance batch multiplicity
   outerLoopSearch: for (let sortZ = 0; sortZ <= maxSortZ; sortZ++) {
@@ -1397,6 +1414,7 @@ export function solveLinearCutting(
         const curOutPieces: number[][] = [];
 
         while (iSm < smArr.length && data.length > 0) {
+          totalCombinationsChecked++;
           const sm = smArr[iSm];
 
           // 1. Candidate Pool Truncation & Frequency Mapping
@@ -1757,6 +1775,11 @@ export function solveLinearCutting(
         }
       }
     }
+  }
+
+  stage2EndTime = performance.now();
+  if (best) {
+    initialCardsCount = best.kolVarBest;
   }
 
   // Stage 3: 2-Opt Inter-pattern Local Search and Tail Consolidation with granular progress
@@ -2316,6 +2339,45 @@ export function solveLinearCutting(
   }
 
   const endTime = performance.now();
+  const totalDurationMs = Number((endTime - startTime).toFixed(1));
+  const stage1Ms = Number((stage1EndTime - startTime).toFixed(1));
+  const stage2Ms = Number((stage2EndTime - stage1EndTime).toFixed(1));
+  const stage3Ms = Number((endTime - stage2EndTime).toFixed(1));
+
+  const endMemoryMb = getMemoryUsageMb();
+  const memoryDeltaMb =
+    startMemoryMb !== undefined && endMemoryMb !== undefined
+      ? Number((endMemoryMb - startMemoryMb).toFixed(2))
+      : undefined;
+
+  const totalParts = rawRng.length;
+  const throughput =
+    totalDurationMs > 0 ? Number(((totalParts / (totalDurationMs / 1000))).toFixed(1)) : 0;
+
+  const telemetry: CalculationTelemetry = {
+    calculationId: `calc_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`,
+    timestamp: Date.now(),
+    environment:
+      typeof window === 'undefined' && typeof self !== 'undefined'
+        ? 'client_worker'
+        : 'client_main',
+    totalDurationMs,
+    stageTimingsMs: {
+      stage1Init: Math.max(0, stage1Ms),
+      stage2Search: Math.max(0, stage2Ms),
+      stage3Refine: Math.max(0, stage3Ms),
+    },
+    passesEvaluated: currentPass,
+    totalCombinationsChecked: Math.max(currentPass, totalCombinationsChecked),
+    twoOptSwapIterations: customCfg?.twoOptRounds ?? (speed === 'deep' ? 30 : speed === 'standard' ? 15 : 6),
+    tailConsolidationCardsMerged:
+      best && initialCardsCount ? Math.max(0, initialCardsCount - best.kolVarBest) : 0,
+    throughputPartsPerSecond: throughput,
+    memoryUsedMb: endMemoryMb,
+    memoryDeltaMb,
+    cpuLoadPercent: 100,
+    workerThreadCount: 1,
+  };
 
   return {
     totalStockLength,
@@ -2328,7 +2390,8 @@ export function solveLinearCutting(
     rows,
     remainingWarehouseStock,
     unplacedDemand,
-    calculationTimeMs: Number((endTime - startTime).toFixed(1)),
+    calculationTimeMs: totalDurationMs,
+    telemetry,
   };
 }
 
@@ -2528,6 +2591,7 @@ export function optimizeLinearCutting(
       missing: u.quantity,
     })),
     calculationTimeMs: sol.calculationTimeMs,
+    telemetry: sol.telemetry,
     algorithmName: 'Excel VBA Exact Port (MyRaskroy.bas: LongSumEl & SortLongArray)',
   };
 }
@@ -2888,6 +2952,32 @@ export function solveNaiveSequentialCutting(
       ? Number(((totalSpentLength / totalStockLength) * 100).toFixed(2))
       : 0;
 
+  const naiveDurationMs = Number((performance.now() - startTime).toFixed(1));
+  const naivePartsCount = pairQueue.length + singleQueue.length;
+  const naiveTelemetry: CalculationTelemetry = {
+    calculationId: `naive_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`,
+    timestamp: Date.now(),
+    environment:
+      typeof window === 'undefined' && typeof self !== 'undefined'
+        ? 'client_worker'
+        : 'client_main',
+    totalDurationMs: naiveDurationMs,
+    stageTimingsMs: {
+      stage1Init: 0,
+      stage2Search: naiveDurationMs,
+      stage3Refine: 0,
+    },
+    passesEvaluated: 1,
+    totalCombinationsChecked: naivePartsCount,
+    twoOptSwapIterations: 0,
+    tailConsolidationCardsMerged: 0,
+    throughputPartsPerSecond:
+      naiveDurationMs > 0 ? Number(((naivePartsCount / (naiveDurationMs / 1000))).toFixed(1)) : 0,
+    memoryUsedMb: getMemoryUsageMb(),
+    cpuLoadPercent: 100,
+    workerThreadCount: 1,
+  };
+
   return {
     totalStockLength,
     totalSpentLength,
@@ -2899,7 +2989,8 @@ export function solveNaiveSequentialCutting(
     rows,
     remainingWarehouseStock: [],
     unplacedDemand: [],
-    calculationTimeMs: Number((performance.now() - startTime).toFixed(1)),
+    calculationTimeMs: naiveDurationMs,
+    telemetry: naiveTelemetry,
   };
 }
 

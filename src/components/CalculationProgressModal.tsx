@@ -28,6 +28,7 @@ import {
   Sparkles,
   Loader2,
   Play,
+  Activity,
 } from 'lucide-react';
 import {
   FullOptimizationSolution,
@@ -47,6 +48,7 @@ import {
   getDefaultDemandColor,
 } from '../utils/cuttingEngine';
 import { DynamicRowItem } from './DynamicInputBlock';
+import { AuditTelemetryModal } from './AuditTelemetryModal';
 
 export interface CalculationRun {
   id: string;
@@ -107,6 +109,7 @@ export const CalculationProgressModal: React.FC<CalculationProgressModalProps> =
   const [duplicateWarning, setDuplicateWarning] = useState<string | null>(null);
   const [isRecalculating, setIsRecalculating] = useState<boolean>(false);
   const [isStopping, setIsStopping] = useState<boolean>(false);
+  const [isAuditModalOpen, setIsAuditModalOpen] = useState<boolean>(false);
   const [progressPercent, setProgressPercent] = useState<number>(10);
   const [statusText, setStatusText] = useState<string>('Инициализация параметров...');
 
@@ -1906,6 +1909,16 @@ export const CalculationProgressModal: React.FC<CalculationProgressModalProps> =
                             <span>Комплексный расчет (4 стратегии)</span>
                           </button>
 
+                          <button
+                            type="button"
+                            onClick={() => setIsAuditModalOpen(true)}
+                            title="Открыть журнал аудита и телеметрии ресурсов (процессор, память, сложность)"
+                            className="flex items-center gap-1.5 text-[11px] font-semibold text-slate-700 bg-white hover:bg-slate-50 border border-slate-200 px-2.5 py-1 rounded-lg transition-all cursor-pointer shadow-2xs hover:shadow-xs"
+                          >
+                            <Activity className="w-3.5 h-3.5 text-blue-600" />
+                            <span>Аудит ресурсов</span>
+                          </button>
+
                           {runs.length > 1 && (
                             <button
                               type="button"
@@ -2906,6 +2919,22 @@ export const CalculationProgressModal: React.FC<CalculationProgressModalProps> =
           </div>
         </div>
       )}
+
+      {/* System Audit & Resource Telemetry Modal */}
+      <AuditTelemetryModal
+        isOpen={isAuditModalOpen}
+        onClose={() => setIsAuditModalOpen(false)}
+        runs={runs}
+        activeRunId={activeRunId}
+        onSelectRun={(id) => {
+          setActiveRunId(id);
+          const r = runs.find((item) => item.id === id);
+          if (r && onApplySolutionAndSettings) {
+            onApplySolutionAndSettings(r.solution, r.settings);
+          }
+        }}
+        onClearHistory={handleClearRuns}
+      />
     </>
   );
 };

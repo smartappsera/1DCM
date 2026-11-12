@@ -1,11 +1,12 @@
 import React from 'react';
-import { Sparkles, MessageSquareHeart } from 'lucide-react';
+import { Sparkles, MessageSquareHeart, Activity } from 'lucide-react';
 
 interface HeaderProps {
   activeTab: 'workspace' | 'visualizer' | 'reports';
   setActiveTab: (tab: 'workspace' | 'visualizer' | 'reports') => void;
   onCalculate?: () => void;
   onOpenFeedback: () => void;
+  onOpenAudit?: () => void;
   onPrint?: () => void;
   onExportExcel?: () => void;
   hasResults: boolean;
@@ -17,6 +18,7 @@ export const Header: React.FC<HeaderProps> = ({
   setActiveTab,
   onCalculate,
   onOpenFeedback,
+  onOpenAudit,
   onPrint,
   hasResults,
   onLoadBenchmarkExample,
@@ -88,6 +90,17 @@ export const Header: React.FC<HeaderProps> = ({
             </button>
           )}
 
+          {onOpenAudit && (
+            <button
+              type="button"
+              onClick={onOpenAudit}
+              title="Журнал аудита и телеметрии ресурсов (процессорное время, память JS, сложность)"
+              className="flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold text-slate-300 bg-slate-800/90 hover:bg-slate-700 hover:text-white border border-slate-700 rounded-lg transition-colors whitespace-nowrap shrink-0 cursor-pointer shadow-xs"
+            >
+              <Activity className="w-3.5 h-3.5 text-blue-400" />
+              <span className="hidden sm:inline">Ресурсы</span>
+            </button>
+          )}
 
           <button
             onClick={onOpenFeedback}

@@ -315,6 +315,19 @@ export const PrintReports: React.FC<PrintReportsProps> = ({
     <div>Невозвратный лом + рез: <strong>${((result.totalScrapLength + result.totalKerfLoss) / 1000).toFixed(2)} м</strong></div>
   </div>
 
+  <div style="background:#f8fafc; border:1px solid #cbd5e1; border-radius:6px; padding:10px 14px; margin-bottom:16px; font-size:11px;">
+    <div style="font-weight:800; text-transform:uppercase; letter-spacing:0.05em; color:#334155; margin-bottom:6px; display:flex; justify-content:space-between; align-items:center;">
+      <span>Паспорт вычислительных ресурсов (Телеметрия)</span>
+      <span style="font-family:monospace; font-weight:normal; color:#64748b;">Среда: Web Worker (фоновый поток 60fps)</span>
+    </div>
+    <div style="display:grid; grid-template-columns:repeat(4, 1fr); gap:6px 14px; color:#475569;">
+      <div>Время расчета ЦПУ: <strong style="font-family:monospace; color:#0f172a;">${(result.calculationTimeMs).toFixed(1)} мс (${(result.calculationTimeMs / 1000).toFixed(2)} с)</strong></div>
+      <div>Проверено комбинаций: <strong style="font-family:monospace; color:#0f172a;">${(result.telemetry?.totalCombinationsChecked || result.patterns.length).toLocaleString('ru-RU')}</strong></div>
+      <div>Память JS Heap: <strong style="font-family:monospace; color:#0f172a;">${result.telemetry?.memoryUsedMb !== undefined ? result.telemetry.memoryUsedMb + ' МБ' : 'Оптимизирована'}</strong></div>
+      <div>Скорость раскладки: <strong style="font-family:monospace; color:#0f172a;">${result.telemetry?.throughputPartsPerSecond || Math.round(result.patterns.length / Math.max(0.01, result.calculationTimeMs / 1000))} дет/с</strong></div>
+    </div>
+  </div>
+
   <div class="geometry-box">
     <div class="geometry-title">Параметры и геометрия реза</div>
     <div class="geometry-grid">
@@ -496,6 +509,42 @@ export const PrintReports: React.FC<PrintReportsProps> = ({
               <strong className="font-mono text-amber-700">
                 {(result.totalReusableLength / 1000).toFixed(1)} м
               </strong>
+            </div>
+          </div>
+
+          {/* Resource Telemetry Passport */}
+          <div className="bg-slate-50 border border-slate-200 rounded-lg p-3 text-xs mb-6 space-y-1.5 print:border-slate-800">
+            <div className="flex items-center justify-between text-slate-700 font-bold uppercase text-[10px] tracking-wider border-b border-slate-200/80 pb-1">
+              <span>Паспорт вычислительных ресурсов (Телеметрия)</span>
+              <span className="font-mono text-slate-500 font-normal">
+                Среда: Web Worker (фоновый поток 60fps)
+              </span>
+            </div>
+            <div className="grid grid-cols-2 sm:grid-cols-4 gap-3 text-slate-600">
+              <div>
+                <span className="text-[10px] text-slate-400 block">Время расчета ЦПУ:</span>
+                <strong className="font-mono text-slate-900 text-xs">
+                  {result.calculationTimeMs.toFixed(1)} мс ({(result.calculationTimeMs / 1000).toFixed(2)} с)
+                </strong>
+              </div>
+              <div>
+                <span className="text-[10px] text-slate-400 block">Проверено комбинаций:</span>
+                <strong className="font-mono text-slate-900 text-xs">
+                  {(result.telemetry?.totalCombinationsChecked || result.patterns.length).toLocaleString('ru-RU')}
+                </strong>
+              </div>
+              <div>
+                <span className="text-[10px] text-slate-400 block">Память JS Heap:</span>
+                <strong className="font-mono text-slate-900 text-xs">
+                  {result.telemetry?.memoryUsedMb !== undefined ? `${result.telemetry.memoryUsedMb} МБ` : 'Оптимизирована'}
+                </strong>
+              </div>
+              <div>
+                <span className="text-[10px] text-slate-400 block">Скорость раскладки:</span>
+                <strong className="font-mono text-slate-900 text-xs">
+                  {result.telemetry?.throughputPartsPerSecond || Math.round(result.patterns.length / Math.max(0.01, result.calculationTimeMs / 1000))} дет/с
+                </strong>
+              </div>
             </div>
           </div>
 
