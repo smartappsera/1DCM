@@ -28,6 +28,7 @@ import {
   StockItem,
   DemandItem,
 } from './types/cutting';
+import { normalizeLegacySettings } from './constants/cuttingHelp';
 import { Lock, Unlock } from 'lucide-react';
 
 export default function App() {
@@ -70,11 +71,10 @@ export default function App() {
     orderNumber: 'ПР-01',
     bladeWidth: 3,
     edgeTrim: 0,
-    reusableRemnantMin: 250,
-    reusableRemnantMode: 'manual',
+    reusableRemnantMin: 1500,
+    reusableRemnantMode: 'weighted',
     cutAngle45: false,
-    dualProfileCut: true,
-    batchSizeMode: 'auto',
+    dualProfileCut: false,
     batchSizeN: 2,
     prioritizeRemnants: false,
     remnantMinFillPct: 75,
@@ -85,7 +85,7 @@ export default function App() {
     searchSpeed: 'fast',
     multiThreadEnabled: false,
     exactSolverEnabled: false,
-    optimizationGoal: 'variants',
+    optimizationGoal: 'balance',
     shapeRemnantsInSearch: false,
     shapeRemnantsThresholdPct: 50,
   });
@@ -172,7 +172,7 @@ export default function App() {
     () =>
       remnantMode === 'manual'
         ? settings.reusableRemnantMin
-        : computeReusableRemnantMin(demandItems, remnantMode, settings.reusableRemnantMin),
+        : computeReusableRemnantMin(demandItems, remnantMode),
     [demandItems, remnantMode, settings.reusableRemnantMin]
   );
 
@@ -318,7 +318,7 @@ export default function App() {
   }, []);
 
   const performSolve = (customSettings?: AppSettings) => {
-    const currentSettings = customSettings || settings;
+    const currentSettings = normalizeLegacySettings(customSettings || settings, demandItems);
 
     const stocks: StockItem[] = stockItems
       .filter((s) => s.isActive !== false)
@@ -389,7 +389,6 @@ export default function App() {
       (newSettings.remnantMinFillPct ?? newSettings.targetRemnantKIM ?? 75) !==
         (settings.remnantMinFillPct ?? settings.targetRemnantKIM ?? 75) ||
       newSettings.dualProfileCut !== settings.dualProfileCut ||
-      (newSettings.batchSizeMode ?? 'auto') !== (settings.batchSizeMode ?? 'auto') ||
       (newSettings.batchSizeN ?? 2) !== (settings.batchSizeN ?? 2) ||
       newSettings.cutAngle45 !== settings.cutAngle45 ||
       newSettings.groupSolutions !== settings.groupSolutions ||
@@ -928,9 +927,10 @@ export default function App() {
         onSaveRuns={setSavedRuns}
         onExecuteCalculation={(customSettings?: AppSettings) => performSolve(customSettings)}
         onApplySolutionAndSettings={(sol, newSettings) => {
+          const normalized = normalizeLegacySettings(newSettings, demandItems);
           setSolution(sol);
-          setSettings(newSettings);
-          setLastSolvedSettings(newSettings);
+          setSettings(normalized);
+          setLastSolvedSettings(normalized);
         }}
         onGoToResults={() => {
           setIsSettingsOpen(false);

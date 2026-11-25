@@ -52,7 +52,6 @@ export {
   ForcedRemnantShapingStrategy,
   RemnantFillStrategy,
   MinimizeBalanceStrategy,
-  CustomStrategy,
   STRATEGY_REGISTRY,
   registerStrategy,
   resolveStrategyType,

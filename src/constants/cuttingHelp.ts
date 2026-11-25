@@ -1,4 +1,5 @@
 import type { AppSettings, ReusableRemnantMode } from '../types/cutting';
+import { resolveBatchSize } from '../utils/cuttingEngine';
 
 export interface HelpOptionItem<T extends string = string> {
   readonly value: T;
@@ -26,6 +27,12 @@ export function formatHelpList(items: readonly HelpEntry[], indent: string = '')
 
 export const OPTIMIZATION_OPTIONS: readonly HelpOptionItem<AppSettings['optimizationGoal']>[] = [
   {
+    value: 'balance',
+    label: 'Баланс',
+    explanation:
+      'Серия вариантов по компромиссу между расходом материала и числом карт (базой служит минимум материала).',
+  },
+  {
     value: 'variants',
     label: 'Минимум наладок',
     explanation: 'Меньше уникальных карт раскроя и переналадок пилы.',
@@ -34,24 +41,6 @@ export const OPTIMIZATION_OPTIONS: readonly HelpOptionItem<AppSettings['optimiza
     value: 'min_bars',
     label: 'Минимум материала',
     explanation: 'Минимум заготовок; при равенстве меньше карт и отхода.',
-  },
-  {
-    value: 'balance',
-    label: 'Баланс',
-    explanation:
-      'Серия вариантов по компромиссу между расходом материала и числом карт (базой служит минимум материала).',
-  },
-  {
-    value: 'comprehensive',
-    label: 'Комплексный подбор',
-    shortLabel: 'Комплексный',
-    explanation: 'Расчёт основных стратегий для сравнения.',
-  },
-  {
-    value: 'custom',
-    label: 'Пользовательская (настраиваемая)',
-    shortLabel: 'Пользовательская',
-    explanation: 'Ручная настройка параметров поиска.',
   },
 ];
 
@@ -78,22 +67,86 @@ export const OPTIMIZATION_BADGES: Record<AppSettings['optimizationGoal'], Strate
     icon: '⚖️',
     color: 'bg-indigo-50 text-indigo-700 border-indigo-200',
   },
-  comprehensive: {
-    label: 'Комплексный',
-    icon: '✨',
-    color: 'bg-purple-50 text-purple-700 border-purple-200',
-  },
-  custom: {
-    label: 'Настраиваемая',
-    icon: '⚙️',
-    color: 'bg-blue-50 text-blue-700 border-blue-200',
-  },
 };
+
+export function normalizeOptimizationGoal(goal?: string): AppSettings['optimizationGoal'] {
+  if (goal === 'variants' || goal === 'min_bars' || goal === 'balance') {
+    return goal;
+  }
+  if (goal === 'min_setups') {
+    return 'variants';
+  }
+  // Migrates legacy 'comprehensive' and 'custom' (and any unknown goal) to 'min_bars'
+  return 'min_bars';
+}
+
+export const BATCH_SIZE_MIN = 2;
+export const BATCH_SIZE_MAX = 10;
+export const FILL_CONTROL_MIN = 20;
+export const FILL_CONTROL_MAX = 85;
+
+export function clampBatchSizeN(value?: number): number {
+  const n = typeof value === 'number' && Number.isFinite(value) ? Math.floor(value) : BATCH_SIZE_MIN;
+  return Math.min(BATCH_SIZE_MAX, Math.max(BATCH_SIZE_MIN, n));
+}
+
+export function clampFillControlThreshold(value?: number): number {
+  const v = typeof value === 'number' && Number.isFinite(value) ? Math.round(value) : 50;
+  return Math.min(FILL_CONTROL_MAX, Math.max(FILL_CONTROL_MIN, v));
+}
+
+export function normalizeLegacySettings(
+  raw: AppSettings,
+  demandItems: readonly { length: number; quantity: number }[] = []
+): AppSettings {
+  const normalizedGoal = normalizeOptimizationGoal(raw.optimizationGoal);
+  const {
+    customStrategyConfig: legacyCustom,
+    batchSizeMode: legacyBatchMode,
+    ...rest
+  } = raw as AppSettings & {
+    customStrategyConfig?: unknown;
+  };
+
+  let resolvedBatchN: number;
+  if (legacyBatchMode === 'auto' || (legacyBatchMode === undefined && raw.batchSizeN === undefined)) {
+    resolvedBatchN = clampBatchSizeN(resolveBatchSize(demandItems, { batchSizeMode: 'auto' }));
+  } else {
+    resolvedBatchN = clampBatchSizeN(raw.batchSizeN);
+  }
+
+  const normalizedFillThreshold =
+    raw.fillControlThreshold !== undefined
+      ? clampFillControlThreshold(raw.fillControlThreshold)
+      : undefined;
+
+  const unchanged =
+    normalizedGoal === raw.optimizationGoal &&
+    legacyCustom === undefined &&
+    legacyBatchMode === undefined &&
+    raw.batchSizeN === resolvedBatchN &&
+    normalizedFillThreshold === raw.fillControlThreshold;
+
+  if (unchanged) {
+    return raw;
+  }
+
+  return {
+    ...rest,
+    optimizationGoal: normalizedGoal,
+    batchSizeN: resolvedBatchN,
+    ...(normalizedFillThreshold !== undefined
+      ? { fillControlThreshold: normalizedFillThreshold }
+      : {}),
+  };
+}
 
 export function getOptimizationOption(
   goal?: string
 ): HelpOptionItem<AppSettings['optimizationGoal']> | undefined {
-  return OPTIMIZATION_OPTIONS.find((option) => option.value === goal);
+  if (!goal) return undefined;
+  const normalized = normalizeOptimizationGoal(goal);
+  return OPTIMIZATION_OPTIONS.find((option) => option.value === normalized);
 }
 
 export function getOptimizationLabel(goal?: string, compact: boolean = false): string {
@@ -104,10 +157,8 @@ export function getOptimizationLabel(goal?: string, compact: boolean = false): s
 
 export function getOptimizationBadge(goal?: string): StrategyBadgeMeta | null {
   if (!goal) return null;
-  if (goal in OPTIMIZATION_BADGES) {
-    return OPTIMIZATION_BADGES[goal as AppSettings['optimizationGoal']];
-  }
-  return null;
+  const normalized = normalizeOptimizationGoal(goal);
+  return OPTIMIZATION_BADGES[normalized];
 }
 
 export const SEARCH_SPEED_OPTIONS: readonly HelpOptionItem<AppSettings['searchSpeed']>[] = [
@@ -154,11 +205,6 @@ export function getSearchSpeedLabel(speed?: string, compact: boolean = false): s
 
 export const REUSABLE_REMNANT_MODE_OPTIONS: readonly HelpOptionItem<ReusableRemnantMode>[] = [
   {
-    value: 'manual',
-    label: 'Ручной ввод',
-    explanation: 'Пользователь явно задаёт минимальную длину делового остатка в мм.',
-  },
-  {
     value: 'weighted',
     label: 'Средневзвешенное значение',
     explanation:
@@ -169,6 +215,11 @@ export const REUSABLE_REMNANT_MODE_OPTIONS: readonly HelpOptionItem<ReusableRemn
     label: 'Минимальное значение',
     explanation:
       'Длина наименьшей детали заказа + 1 мм, округлённая вверх до 10 мм.',
+  },
+  {
+    value: 'manual',
+    label: 'Ручной ввод',
+    explanation: 'Пользователь явно задаёт минимальную длину делового остатка в мм.',
   },
 ];
 
@@ -205,6 +256,10 @@ export const ALGORITHM_EXTRA_OPTIONS: readonly HelpOptionItem<AlgorithmExtraOpti
   },
 ];
 
+export function getAlgorithmExtraHelp(key: AlgorithmExtraOptionKey): string {
+  return ALGORITHM_EXTRA_OPTIONS.find((item) => item.value === key)?.explanation ?? '';
+}
+
 export const MULTI_THREAD_DEEP_ONLY_HINT = 'Доступно для глубокого перебора';
 export const MULTI_THREAD_UNAVAILABLE_HINT = 'Недоступно на этом устройстве';
 export const EXACT_SOLVER_PRESET_HINT = 'Включено пресетом «Точный поиск»';
@@ -214,20 +269,14 @@ export const REMNANT_MIN_FILL_HELP =
 export const SHAPE_REMNANTS_THRESHOLD_HELP =
   'Перераскрой карт с обрезком выше указанного % от порога делового остатка.';
 export const FILL_CONTROL_THRESHOLD_HELP =
-  'Порог чистого КИМ пакетной карты (%) для дозаполнения по 1 профилю.';
+  'Порог чистого КИМ пакетной карты (20–85%) для дозаполнения по 1 профилю.';
 
-export const ALGORITHM_HELP = [
-  '• Стратегия оптимизации:',
-  formatHelpList(OPTIMIZATION_OPTIONS, '  '),
-  '• Глубина поиска:',
-  formatHelpList(SEARCH_SPEED_OPTIONS, '  '),
-  formatHelpList(ALGORITHM_EXTRA_OPTIONS),
-].join('\n');
+export const REUSABLE_REMNANT_MIN_HELP =
+  'Минимальная длина годного остатка, записываемого в деловые по итогам расчёта (используется и для возврата на склад, и в Индексе раскроя).';
 
 export type GeometryOptionKey =
   | 'bladeWidth'
   | 'edgeTrim'
-  | 'reusableRemnantMin'
   | 'cutAngle45';
 
 export const GEOMETRY_OPTIONS: readonly HelpOptionItem<GeometryOptionKey>[] = [
@@ -242,24 +291,17 @@ export const GEOMETRY_OPTIONS: readonly HelpOptionItem<GeometryOptionKey>[] = [
     explanation: 'Длина технологической торцовки краев профиля (0–50 мм).',
   },
   {
-    value: 'reusableRemnantMin',
-    label: 'Порог делового остатка',
-    explanation:
-      'Минимальная длина годного остатка, записываемого в деловые по итогам расчёта (используется и для возврата на склад, и в Индексе раскроя). Способы задания:\n' +
-      formatHelpList(REUSABLE_REMNANT_MODE_OPTIONS, '  '),
-  },
-  {
     value: 'cutAngle45',
     label: 'Рез под углом 45°',
     explanation: 'Временно отключено: учет косого реза 45° находится в разработке.',
   },
 ];
 
-export const GEOMETRY_HELP = formatHelpList(GEOMETRY_OPTIONS);
+export function getGeometryHelp(key: GeometryOptionKey): string {
+  return GEOMETRY_OPTIONS.find((item) => item.value === key)?.explanation ?? '';
+}
 
-export const ANGLE_45_DISABLED_HINT =
-  GEOMETRY_OPTIONS.find((item) => item.value === 'cutAngle45')?.explanation ??
-  'Временно отключено: учет косого реза 45° находится в разработке.';
+export const ANGLE_45_DISABLED_HINT = getGeometryHelp('cutAngle45');
 
 export type BatchOptionKey = 'dualProfileCut' | 'batchSizeN' | 'fillControl';
 
@@ -274,17 +316,19 @@ export const BATCH_OPTIONS: readonly HelpOptionItem<BatchOptionKey>[] = [
     value: 'batchSizeN',
     label: 'Пакетный рез, шт.',
     explanation:
-      'В режиме «Авто» выбирается наименьший делитель > 1 общего НОД количеств заказа (или 2), либо задаётся вручную от 2 шт.',
+      'Число профилей, зажимаемых и раскраиваемых одновременно одним пакетом (от 2 до 10 шт.).',
   },
   {
     value: 'fillControl',
     label: 'Контроль заполнения',
     explanation:
-      'Если чистый КИМ пакетной карты ниже указанного порога %, алгоритм перераспределяет её по 1 профилю для дозаполнения и экономии материала.',
+      'Если чистый КИМ пакетной карты ниже указанного порога % (20–85%), алгоритм перераспределяет её по 1 профилю для дозаполнения и экономии материала.',
   },
 ];
 
-export const BATCH_HELP = formatHelpList(BATCH_OPTIONS);
+export function getBatchHelp(key: BatchOptionKey): string {
+  return BATCH_OPTIONS.find((item) => item.value === key)?.explanation ?? '';
+}
 
 export type ComparisonMetricKey =
   | 'cuttingIndex'

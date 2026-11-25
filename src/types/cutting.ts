@@ -131,17 +131,6 @@ export interface CalculationTelemetry {
   chunksProcessed?: number;    // Количество обработанных порций проходов (0 в однопоточном режиме)
 }
 
-export interface CustomStrategyConfig {
-  maxPassesMultiplier: number; // Множитель числа проходов (0.25 - 3.0), default 1.0
-  enable2Opt: boolean; // Включить 2-Opt локальный поиск, default true
-  twoOptRounds: number; // Количество раундов 2-Opt (1 - 50), default 15
-  enableTailConsolidation: boolean; // Включить рекомбинацию и схлопывание карт хвостов, default true
-  tailConsolidationMaxBars: number; // Максимум заготовок в пуле хвостов (1 - 20), default 10
-  cardMergeScrapToleranceMm: number; // Допуск по обрезку при слиянии карт, мм (0 - 500), default 120
-  preferFewerCards: boolean; // Приоритет минимального числа карт раскроя, default true
-  remnantTargetMinLength: number; // Целевая мин. длина делового остатка, мм, default 1500
-}
-
 export type ReusableRemnantMode = 'manual' | 'weighted' | 'min_part';
 
 export interface AppSettings {
@@ -155,21 +144,16 @@ export interface AppSettings {
   shapeRemnantsThresholdPct?: number; // Порог отбора карт для доработки в % от порога делового (по умолчанию 50%)
   cutAngle45: boolean; // Рез под 45 градусов
   dualProfileCut: boolean; // Пакетный рез
-  batchSizeMode?: 'auto' | 'manual'; // Режим выбора размера пакета N (по умолчанию 'auto')
-  batchSizeN?: number; // Размер пакета N >= 2 для ручного режима (по умолчанию 2)
+  /** @deprecated Больше не используется; оставлено опционально для миграции старых сохранённых настроек */
+  batchSizeMode?: 'auto' | 'manual';
+  batchSizeN?: number; // Размер пакета N (2..10, по умолчанию 2)
   prioritizeRemnants?: boolean; // Приоритет остатков со склада
   fillControlEnabled?: boolean; // Контроль заполнения крайней пары
-  fillControlThreshold?: number; // Порог КИМ для контроля заполнения, % (по умолчанию 50)
+  fillControlThreshold?: number; // Порог КИМ для контроля заполнения, % (20..85, по умолчанию 50)
   groupSolutions: boolean; // Группировать решение
   showGraphics: boolean; // Отображать графику
   searchSpeed: 'fast' | 'standard' | 'exact' | 'deep'; // Поверхностный / Стандартный / Точный / Глубокий
-  optimizationGoal:
-    | 'variants'
-    | 'min_bars'
-    | 'balance'
-    | 'comprehensive'
-    | 'custom'; // Оптимизация
-  customStrategyConfig?: CustomStrategyConfig; // Параметры пользовательской стратегии
+  optimizationGoal: 'variants' | 'min_bars' | 'balance'; // Оптимизация
   orderComment?: string; // Комментарий к заказу (цех, примечание)
   isMaterialLocked?: boolean; // Блокировка редактирования наименования материала
   materialLockSource?: 'file' | 'manual' | null; // Источник блокировки (из csv/xml или вручную)

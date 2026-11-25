@@ -15,7 +15,6 @@ import {
   CuttingParams,
   CalculationProgressInfo,
   ComplexityEstimate,
-  CustomStrategyConfig,
   CalculationTelemetry,
   ReusableRemnantMode,
 } from '../types/cutting';
@@ -115,7 +114,6 @@ export {
   ForcedRemnantShapingStrategy,
   RemnantFillStrategy,
   MinimizeBalanceStrategy,
-  CustomStrategy,
   STRATEGY_REGISTRY,
   registerStrategy,
   resolveStrategyType,
@@ -213,44 +211,28 @@ export function computeAutoTargetRemnantLength(
 
 /**
  * Resolves effective batch size N >= 2 when batch cutting (`dualProfileCut`) is enabled:
- * - 'manual': max(2, floor(batchSizeN ?? 2))
- * - 'auto' (default): smallest integer divisor > 1 of GCD(active demand quantities); 2 if GCD <= 1
+ * - Default/manual: max(2, floor(batchSizeN ?? 2))
+ * - Legacy migration (`batchSizeMode === 'auto'`): smallest integer divisor > 1 of GCD(active demand quantities); 2 if GCD <= 1
  */
 export function resolveBatchSize(
   demandInput: readonly { length: number; quantity: number }[],
   settings: Pick<AppSettings, 'batchSizeMode' | 'batchSizeN'>
 ): number {
-  if (settings.batchSizeMode === 'manual') {
-    return Math.max(2, Math.floor(settings.batchSizeN ?? 2));
-  }
-  let g = 0;
-  for (let i = 0; i < demandInput.length; i++) {
-    const d = demandInput[i];
-    if (d.length > 0 && d.quantity > 0) {
-      g = g === 0 ? Math.round(d.quantity) : myGcd(g, d.quantity);
+  if (settings.batchSizeMode === 'auto') {
+    let g = 0;
+    for (let i = 0; i < demandInput.length; i++) {
+      const d = demandInput[i];
+      if (d.length > 0 && d.quantity > 0) {
+        g = g === 0 ? Math.round(d.quantity) : myGcd(g, d.quantity);
+      }
     }
+    if (g <= 1) return 2;
+    for (let div = 2; div * div <= g; div++) {
+      if (g % div === 0) return div;
+    }
+    return g;
   }
-  if (g <= 1) return 2;
-  for (let div = 2; div * div <= g; div++) {
-    if (g % div === 0) return div;
-  }
-  return g;
-}
-
-/**
- * Returns default configuration for Custom Strategy
- */
-export function getDefaultCustomConfig(): CustomStrategyConfig {
-  return {
-    maxPassesMultiplier: 1.0,
-    enable2Opt: true,
-    twoOptRounds: 15,
-    enableTailConsolidation: true,
-    tailConsolidationMaxBars: 10,
-    cardMergeScrapToleranceMm: 120,
-    preferFewerCards: true,
-    remnantTargetMinLength: 1500,
-  };
+  return Math.max(2, Math.floor(settings.batchSizeN ?? 2));
 }
 
 /**
@@ -302,7 +284,7 @@ export interface SolveLinearCuttingOptions {
   shouldAbort?: () => boolean;
 }
 
-export interface ComprehensiveSuiteItem {
+export interface SuiteItem {
   goal: 'variants' | 'min_bars' | 'balance';
   title: string;
   badge: string;
@@ -310,8 +292,8 @@ export interface ComprehensiveSuiteItem {
   solution: FullOptimizationSolution;
 }
 
-export interface ComprehensiveResult {
-  suite: ComprehensiveSuiteItem[];
+export interface SuiteResult {
+  suite: SuiteItem[];
   bestSolution: FullOptimizationSolution;
 }
 
@@ -324,124 +306,9 @@ export interface BalanceRunTiming {
   cards: number;
 }
 
-export interface BalanceResult extends ComprehensiveResult {
+export interface BalanceResult extends SuiteResult {
   timings: BalanceRunTiming[];
   totalDurationMs: number;
-}
-
-/**
- * Runs core optimization strategies without duplicating identical runs
- */
-export function runComprehensiveSuite(
-  stockInput: StockItem[],
-  demandInput: DemandItem[],
-  baseSettings: AppSettings,
-  options?: SolveLinearCuttingOptions
-): ComprehensiveResult {
-  const hasActive12m = stockInput.some(
-    (s) => s.isActive !== false && (s.length === 12000 || s.length === 11700)
-  );
-  const hasActive6m = stockInput.some(
-    (s) => s.isActive !== false && s.length === 6000
-  );
-  const isMultiStandard = hasActive12m && hasActive6m;
-
-  const configs: Array<{
-    goal: 'variants' | 'min_bars';
-    title: string;
-    badge: string;
-    description: string;
-    stockModifier?: (stocks: StockItem[]) => StockItem[];
-  }> = isMultiStandard
-    ? [
-        {
-          goal: 'min_bars',
-          title: '12м + 6м Оптимальный',
-          badge: 'Мин. материал',
-          description: 'Минимум заготовок; при равенстве меньше карт и отхода',
-        },
-        {
-          goal: 'min_bars',
-          title: 'Только 12м профили',
-          badge: '📏 Стандарт 12м',
-          description: 'Раскрой исключительно из 12-метрового проката',
-          stockModifier: (stocks) =>
-            stocks.map((s) => (s.length === 6000 ? { ...s, isActive: false } : s)),
-        },
-        {
-          goal: 'min_bars',
-          title: 'Только 6м профили',
-          badge: '📐 Стандарт 6м',
-          description: 'Раскрой исключительно из 6-метрового проката',
-          stockModifier: (stocks) =>
-            stocks.map((s) =>
-              s.length === 12000 || s.length === 11700 ? { ...s, isActive: false } : s
-            ),
-        },
-        {
-          goal: 'variants',
-          title: 'Минимум наладок (Серийный)',
-          badge: '⚡ Меньше наладок',
-          description: 'Минимум уникальных карт для максимальной повторяемости',
-        },
-      ]
-    : [
-        {
-          goal: 'min_bars',
-          title: 'Минимум материала',
-          badge: 'Мин. материал',
-          description: 'Минимум заготовок; при равенстве меньше карт и отхода',
-        },
-        {
-          goal: 'variants',
-          title: 'Минимум наладок',
-          badge: '⚡ Меньше наладок',
-          description: 'Минимум уникальных карт для быстрой резки на станке',
-        },
-      ];
-
-  const suite: ComprehensiveSuiteItem[] = [];
-
-  for (let idx = 0; idx < configs.length; idx++) {
-    if (options?.shouldAbort?.()) break;
-    const cfg = configs[idx];
-    const goalSettings: AppSettings = {
-      ...baseSettings,
-      optimizationGoal: cfg.goal,
-    };
-
-    const currentStock = cfg.stockModifier ? cfg.stockModifier(stockInput) : stockInput;
-
-    const sol = solveLinearCutting(currentStock, demandInput, goalSettings, {
-      onProgress: (p) => {
-        options?.onProgress?.({
-          ...p,
-          stage: idx + 1,
-          totalStages: configs.length,
-          stageName: `Комплексный расчет (${idx + 1}/${configs.length}): ${cfg.title}`,
-          percent: Math.min(99, Math.round(((idx + p.percent / 100) / configs.length) * 100)),
-        });
-      },
-      shouldAbort: options?.shouldAbort,
-    });
-
-    suite.push({
-      goal: cfg.goal,
-      title: cfg.title,
-      badge: cfg.badge,
-      description: cfg.description,
-      solution: sol,
-    });
-  }
-
-  let best = suite[0]?.solution;
-  for (const item of suite) {
-    if (!best || item.solution.overallKIM > best.overallKIM) {
-      best = item.solution;
-    }
-  }
-
-  return { suite, bestSolution: best };
 }
 
 function isRemnantStock(st: StockItem): boolean {
@@ -535,20 +402,12 @@ function buildCutContext(
   const speed = settings.searchSpeed;
   const isDeep = speed === 'deep';
   const isStandard = speed === 'standard' || speed === 'exact';
-  const isCustom = settings.optimizationGoal === 'custom';
-  const customConfig = isCustom
-    ? settings.customStrategyConfig || getDefaultCustomConfig()
-    : undefined;
 
   // Перебор порядков склада имеет смысл только при РАЗНЫХ длинах хлыстов (а не числе строк склада)
   const distinctStockLengths = new Set(scaledStockAll).size;
   const baseSortZ = distinctStockLengths > 1 ? (isDeep ? 5 : isStandard ? 3 : 1) : 0;
   const baseSort = isDeep ? 28 : isStandard ? 14 : 7;
   const baseVar = isDeep ? 16 : isStandard ? 10 : 5;
-
-  const multiplier = isCustom
-    ? Math.max(0.1, customConfig?.maxPassesMultiplier ?? 1.0)
-    : 1.0;
 
   return {
     startTime,
@@ -575,12 +434,11 @@ function buildCutContext(
     totalDemandLengthMm,
     totalPartsCount: rawRng.length,
     totalBarsEstimate: Math.ceil(totalDemandLengthMm / (rawSmArr[0] || 6000)),
-    maxSortZ: Math.max(0, Math.round(baseSortZ * multiplier)),
-    maxSort: Math.max(1, Math.round(baseSort * multiplier)),
-    maxVar: Math.max(1, Math.round(baseVar * multiplier)),
+    maxSortZ: baseSortZ,
+    maxSort: baseSort,
+    maxVar: baseVar,
     stockInput,
     settings,
-    customConfig,
     onProgress: options?.onProgress,
     shouldAbort: options?.shouldAbort,
   };
@@ -2862,7 +2720,7 @@ export function runBalanceSuite(
   const nonDominated = buildParetoFrontier(candidates);
 
   // 6. Label variants cleanly
-  const suite: ComprehensiveSuiteItem[] = nonDominated.map((item, idx) => {
+  const suite: SuiteItem[] = nonDominated.map((item, idx) => {
     const cardsCount = item.solution.rows.length;
     if (nonDominated.length === 1) {
       return {
@@ -2917,10 +2775,6 @@ export function solveLinearCutting(
   settings: AppSettings,
   options?: SolveLinearCuttingOptions
 ): FullOptimizationSolution {
-  if (settings.optimizationGoal === 'comprehensive') {
-    const res = runComprehensiveSuite(stockInput, demandInput, settings, options);
-    return res.bestSolution;
-  }
   if (settings.optimizationGoal === 'balance') {
     const res = runBalanceSuite(stockInput, demandInput, settings, options);
     return res.bestSolution;
@@ -3870,125 +3724,6 @@ function selectFrontPointForCap(
   return chosen;
 }
 
-export async function runComprehensiveSuiteAsync(
-  stockInput: StockItem[],
-  demandInput: DemandItem[],
-  baseSettings: AppSettings,
-  options?: SolveLinearCuttingOptions,
-  parallelExecutor?: ParallelPassExecutor
-): Promise<ComprehensiveResult> {
-  const hasActive12m = stockInput.some(
-    (s) => s.isActive !== false && (s.length === 12000 || s.length === 11700)
-  );
-  const hasActive6m = stockInput.some(
-    (s) => s.isActive !== false && s.length === 6000
-  );
-  const isMultiStandard = hasActive12m && hasActive6m;
-
-  const configs: Array<{
-    goal: 'variants' | 'min_bars';
-    title: string;
-    badge: string;
-    description: string;
-    stockModifier?: (stocks: StockItem[]) => StockItem[];
-  }> = isMultiStandard
-    ? [
-        {
-          goal: 'min_bars',
-          title: '12м + 6м Оптимальный',
-          badge: 'Мин. материал',
-          description: 'Минимум заготовок; при равенстве меньше карт и отхода',
-        },
-        {
-          goal: 'min_bars',
-          title: 'Только 12м профили',
-          badge: '📏 Стандарт 12м',
-          description: 'Раскрой исключительно из 12-метрового проката',
-          stockModifier: (stocks) =>
-            stocks.map((s) => (s.length === 6000 ? { ...s, isActive: false } : s)),
-        },
-        {
-          goal: 'min_bars',
-          title: 'Только 6м профили',
-          badge: '📐 Стандарт 6м',
-          description: 'Раскрой исключительно из 6-метрового проката',
-          stockModifier: (stocks) =>
-            stocks.map((s) =>
-              s.length === 12000 || s.length === 11700 ? { ...s, isActive: false } : s
-            ),
-        },
-        {
-          goal: 'variants',
-          title: 'Минимум наладок (Серийный)',
-          badge: '⚡ Меньше наладок',
-          description: 'Минимум уникальных карт для максимальной повторяемости',
-        },
-      ]
-    : [
-        {
-          goal: 'min_bars',
-          title: 'Минимум материала',
-          badge: 'Мин. материал',
-          description: 'Минимум заготовок; при равенстве меньше карт и отхода',
-        },
-        {
-          goal: 'variants',
-          title: 'Минимум наладок',
-          badge: '⚡ Меньше наладок',
-          description: 'Минимум уникальных карт для быстрой резки на станке',
-        },
-      ];
-
-  const suite: ComprehensiveSuiteItem[] = [];
-
-  for (let idx = 0; idx < configs.length; idx++) {
-    if (options?.shouldAbort?.()) break;
-    const cfg = configs[idx];
-    const goalSettings: AppSettings = {
-      ...baseSettings,
-      optimizationGoal: cfg.goal,
-    };
-
-    const currentStock = cfg.stockModifier ? cfg.stockModifier(stockInput) : stockInput;
-
-    const sol = await solveLinearCuttingAsync(
-      currentStock,
-      demandInput,
-      goalSettings,
-      {
-        onProgress: (p) => {
-          options?.onProgress?.({
-            ...p,
-            stage: idx + 1,
-            totalStages: configs.length,
-            stageName: `Комплексный расчет (${idx + 1}/${configs.length}): ${cfg.title}`,
-            percent: Math.min(99, Math.round(((idx + p.percent / 100) / configs.length) * 100)),
-          });
-        },
-        shouldAbort: options?.shouldAbort,
-      },
-      parallelExecutor
-    );
-
-    suite.push({
-      goal: cfg.goal,
-      title: cfg.title,
-      badge: cfg.badge,
-      description: cfg.description,
-      solution: sol,
-    });
-  }
-
-  let best = suite[0]?.solution;
-  for (const item of suite) {
-    if (!best || item.solution.overallKIM > best.overallKIM) {
-      best = item.solution;
-    }
-  }
-
-  return { suite, bestSolution: best };
-}
-
 export async function runBalanceSuiteAsync(
   stockInput: StockItem[],
   demandInput: DemandItem[],
@@ -4721,7 +4456,7 @@ export async function runBalanceSuiteAsync(
   }
 
   const nonDominated = buildParetoFrontier(candidates);
-  const suite: ComprehensiveSuiteItem[] = nonDominated.map((item, idx) => {
+  const suite: SuiteItem[] = nonDominated.map((item, idx) => {
     const cardsCount = item.solution.rows.length;
     if (nonDominated.length === 1) {
       return {
@@ -4777,16 +4512,6 @@ export async function solveLinearCuttingAsync(
   options?: SolveLinearCuttingOptions,
   parallelExecutor?: ParallelPassExecutor
 ): Promise<FullOptimizationSolution> {
-  if (settings.optimizationGoal === 'comprehensive') {
-    const res = await runComprehensiveSuiteAsync(
-      stockInput,
-      demandInput,
-      settings,
-      options,
-      parallelExecutor
-    );
-    return res.bestSolution;
-  }
   if (settings.optimizationGoal === 'balance') {
     const res = await runBalanceSuiteAsync(
       stockInput,

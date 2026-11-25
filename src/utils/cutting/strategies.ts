@@ -343,7 +343,7 @@ export class RemnantFillStrategy implements CuttingStrategy {
  */
 export class MinimizeBalanceStrategy implements CuttingStrategy {
   readonly type: StrategyType = 'balance';
-  readonly name = 'Баланс';
+  readonly name = 'Баланс (материал:наладки)';
   readonly allowPatternSplitting = false;
 
   constructor(readonly materialCapMm?: number) {}
@@ -426,96 +426,6 @@ export class MinimizeBalanceStrategy implements CuttingStrategy {
 }
 
 /**
- * 4. CustomStrategy (Пользовательская)
- * Configurable pipeline respecting user's CustomStrategyConfig flags.
- */
-export class CustomStrategy implements CuttingStrategy {
-  readonly type: StrategyType = 'custom';
-  readonly name = 'Пользовательская';
-  readonly allowPatternSplitting: boolean;
-
-  constructor(private readonly preferFewerCards = true) {
-    this.allowPatternSplitting = !preferFewerCards;
-  }
-
-  score(cards: readonly CutCard[], metrics: CutMetrics, context: CutContext): number {
-    const searchWasteMm = computeSearchWasteMm(cards, metrics, context);
-    if (metrics.unplacedCount > 0) return unplacedPenaltyScore(metrics, searchWasteMm);
-    const preferCards = context.customConfig?.preferFewerCards ?? this.preferFewerCards;
-    if (preferCards) {
-      const wastePenalty =
-        searchWasteMm <= 1e6
-          ? searchWasteMm * 0.1
-          : 1e5 + ((searchWasteMm - 1e6) / (searchWasteMm - 1e6 + 1e7)) * 4.9e6;
-      return (
-        1e14 -
-        metrics.uniqueCardsCount * 1e11 -
-        metrics.totalBarsUsed * 1e7 -
-        wastePenalty
-      );
-    }
-    const wastePenalty =
-      searchWasteMm <= 5e4
-        ? searchWasteMm
-        : 5e4 + ((searchWasteMm - 5e4) / (searchWasteMm - 5e4 + 5e6)) * 4.5e4;
-    return (
-      8.9e15 -
-      (metrics.totalStockLengthMm + metrics.totalBarsUsed) * 4e7 -
-      metrics.uniqueCardsCount * 1e5 -
-      wastePenalty
-    );
-  }
-
-  getSearchPackingConfig(
-    passVar: number,
-    sm: number,
-    sumData: number
-  ): SearchPackingConfig {
-    if (passVar === 0) {
-      return { useGreedy: true, targetCap: sm, tolerance: 0 };
-    }
-    const ceilDiv = Math.ceil(sumData / sm);
-    const dm = ceilDiv > 0 ? Math.floor((sm - Math.floor(sumData / ceilDiv)) / 2) : 0;
-    return { useGreedy: false, targetCap: sm, tolerance: Math.max(0, dm) };
-  }
-
-  getBatchCount(
-    rawBatchCount: number,
-    _hasScrapWaste: boolean,
-    barKIM: number,
-    context: CutContext
-  ): number {
-    if (!context.dualProfileCut) return 1;
-    if (context.fillControlEnabled && barKIM < context.fillControlThreshold) {
-      return 1;
-    }
-    return rawBatchCount;
-  }
-
-  buildPipeline(context: CutContext): readonly PipelineStep[] {
-    const cfg = context.customConfig;
-    const steps: PipelineStep[] = [
-      StepGenerateBasePatterns,
-      StepGroupIdenticalCards,
-    ];
-    if (cfg?.enableTailConsolidation !== false && cfg?.preferFewerCards) {
-      steps.push(StepConsolidateSetups);
-    }
-    if (cfg?.enable2Opt !== false) {
-      steps.push(Step2OptPostProcess);
-    }
-    if (cfg?.enableTailConsolidation !== false) {
-      steps.push(StepConsolidateSetups);
-    }
-    if (context.fillControlEnabled && context.dualProfileCut) {
-      steps.push(StepOptimizeWaste);
-    }
-    steps.push(StepGroupIdenticalCards);
-    return steps;
-  }
-}
-
-/**
  * Isolated Strategy Registry
  */
 const strategyRegistry = new Map<StrategyType, CuttingStrategy>([
@@ -523,7 +433,6 @@ const strategyRegistry = new Map<StrategyType, CuttingStrategy>([
   ['min_material', new MinimizeMaterialStrategy()],
   ['remnant_fill', new RemnantFillStrategy()],
   ['balance', new MinimizeBalanceStrategy()],
-  ['custom', new CustomStrategy(true)],
 ]);
 
 export const STRATEGY_REGISTRY: ReadonlyMap<StrategyType, CuttingStrategy> = strategyRegistry;
@@ -536,7 +445,7 @@ export function registerStrategy(strategy: CuttingStrategy): void {
  * Maps UI AppSettings optimizationGoal + flags to canonical StrategyType.
  */
 export function resolveStrategyType(
-  goal: AppSettings['optimizationGoal'] | StrategyType,
+  goal: AppSettings['optimizationGoal'] | StrategyType | string,
   _settings?: AppSettings
 ): StrategyType {
   if (goal === 'balance') {
@@ -551,20 +460,14 @@ export function resolveStrategyType(
   if (goal === 'remnant_fill') {
     return 'remnant_fill';
   }
-  if (goal === 'custom') {
-    return 'custom';
-  }
   return 'min_material';
 }
 
 export function getStrategy(
-  goalOrType: AppSettings['optimizationGoal'] | StrategyType,
+  goalOrType: AppSettings['optimizationGoal'] | StrategyType | string,
   settings?: AppSettings
 ): CuttingStrategy {
   const resolved = resolveStrategyType(goalOrType, settings);
-  if (resolved === 'custom') {
-    return new CustomStrategy(settings?.customStrategyConfig?.preferFewerCards ?? true);
-  }
   const found = strategyRegistry.get(resolved);
   if (!found) {
     throw new Error(`Strategy "${resolved}" is not registered in STRATEGY_REGISTRY.`);

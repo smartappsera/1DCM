@@ -1720,15 +1720,13 @@ export const Step2OptPostProcess: PipelineStep = (
 ): CutState => {
   const ctx = state.context;
   if (state.metrics.totalBarsUsed <= 1) return state;
-  if (ctx.customConfig && ctx.customConfig.enable2Opt === false) return state;
 
   const maxRounds =
-    ctx.customConfig?.twoOptRounds ??
-    (ctx.searchSpeed === 'deep'
+    ctx.searchSpeed === 'deep'
       ? 30
       : ctx.searchSpeed === 'standard' || ctx.searchSpeed === 'exact'
         ? 15
-        : 6);
+        : 6;
 
   let currentState = state;
   const nod = ctx.nod;
@@ -2311,16 +2309,9 @@ export const StepConsolidateSetups: PipelineStep = (
 ): CutState => {
   const ctx = state.context;
   if (state.metrics.totalBarsUsed <= 2 || state.cards.length <= 1) return state;
-  if (ctx.customConfig && ctx.customConfig.enableTailConsolidation === false) return state;
 
   let currentState = state;
-  const maxPoolBars = ctx.customConfig?.tailConsolidationMaxBars ?? 15;
-  const candidateThresholds = [1, 2, 3, 4, 5, 6, 8, 10, 15].filter(
-    (t) => t <= maxPoolBars
-  );
-  if (candidateThresholds.length === 0) {
-    candidateThresholds.push(Math.min(maxPoolBars, 2));
-  }
+  const candidateThresholds = [1, 2, 3, 4, 5, 6, 8, 10, 15];
 
   const nod = ctx.nod;
   const dRez = ctx.bladeWidth;

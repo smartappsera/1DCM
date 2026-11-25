@@ -39,23 +39,25 @@ import {
 import {
   DEFICIT_OPTIMIZATION_OPTIONS,
   OPTIMIZATION_OPTIONS,
+  clampBatchSizeN,
+  clampFillControlThreshold,
   formatCuttingIndexRowTooltip,
   formatUnplacedDeficitTooltip,
   getComparisonMetricHelp,
   getOptimizationBadge,
   getOptimizationLabel,
   getSearchSpeedLabel,
+  normalizeLegacySettings,
+  normalizeOptimizationGoal,
 } from '../constants/cuttingHelp';
 import {
   estimateCalculationComplexity,
-  runComprehensiveSuite,
   runBalanceSuite,
   solveNaiveSequentialCutting,
   solveLinearCutting,
   getPrimaryStandardSize,
-  ComprehensiveSuiteItem,
+  SuiteItem,
   getDefaultDemandColor,
-  getDefaultCustomConfig,
   computeCuttingIndexFromSolution,
   computeCuttingIndexScale,
   computeMaxReusableRemnantFromSolution,
@@ -118,7 +120,6 @@ type ComparisonColumnKey =
   | 'batchSize'
   | 'fillControl'
   | 'groupSolutions'
-  | 'customParams'
   | 'cuttingIndex'
   | 'kim'
   | 'netKim'
@@ -155,7 +156,6 @@ const COMPARISON_COLUMNS: readonly ComparisonColumnDef[] = [
   { key: 'batchSize', label: 'Размер пакета' },
   { key: 'fillControl', label: 'Контроль' },
   { key: 'groupSolutions', label: 'Группировка' },
-  { key: 'customParams', label: 'Настройки польз.' },
   { key: 'cuttingIndex', label: 'Индекс' },
   { key: 'kim', label: 'КИМ (вал.)' },
   { key: 'netKim', label: 'Мгн. КИМ' },
@@ -373,7 +373,6 @@ export const CalculationProgressModal: React.FC<CalculationProgressModalProps> =
     | 'batchSize'
     | 'fillControl'
     | 'groupSolutions'
-    | 'customParams'
     | 'cuttingIndex'
     | 'kim'
     | 'netKim'
@@ -484,7 +483,7 @@ export const CalculationProgressModal: React.FC<CalculationProgressModalProps> =
   const liveTargetRemnantMinLength = resolveIndexTargetRemnantLength(settings);
 
   const areSettingsEqual = (a: AppSettings, b: AppSettings): boolean => {
-    const basicEqual =
+    return (
       a.bladeWidth === b.bladeWidth &&
       a.edgeTrim === b.edgeTrim &&
       a.reusableRemnantMin === b.reusableRemnantMin &&
@@ -493,39 +492,25 @@ export const CalculationProgressModal: React.FC<CalculationProgressModalProps> =
       (a.shapeRemnantsThresholdPct ?? 50) === (b.shapeRemnantsThresholdPct ?? 50) &&
       (a.cutAngle45 ?? false) === (b.cutAngle45 ?? false) &&
       (a.dualProfileCut ?? false) === (b.dualProfileCut ?? false) &&
-      (a.batchSizeMode ?? 'auto') === (b.batchSizeMode ?? 'auto') &&
-      (a.batchSizeN ?? 2) === (b.batchSizeN ?? 2) &&
+      clampBatchSizeN(a.batchSizeN) === clampBatchSizeN(b.batchSizeN) &&
       (a.prioritizeRemnants ?? false) === (b.prioritizeRemnants ?? false) &&
       (a.remnantMinFillPct ?? a.targetRemnantKIM ?? 75) ===
         (b.remnantMinFillPct ?? b.targetRemnantKIM ?? 75) &&
       (a.fillControlEnabled ?? false) === (b.fillControlEnabled ?? false) &&
-      (a.fillControlThreshold ?? 50) === (b.fillControlThreshold ?? 50) &&
+      clampFillControlThreshold(a.fillControlThreshold) ===
+        clampFillControlThreshold(b.fillControlThreshold) &&
       (a.groupSolutions ?? true) === (b.groupSolutions ?? true) &&
       (a.showGraphics ?? true) === (b.showGraphics ?? true) &&
       a.searchSpeed === b.searchSpeed &&
       (a.multiThreadEnabled ?? false) === (b.multiThreadEnabled ?? false) &&
       (a.exactSolverEnabled ?? false) === (b.exactSolverEnabled ?? false) &&
-      a.optimizationGoal === b.optimizationGoal &&
+      normalizeOptimizationGoal(a.optimizationGoal) ===
+        normalizeOptimizationGoal(b.optimizationGoal) &&
       (a.material ?? '') === (b.material ?? '') &&
       (a.orderNumber ?? '') === (b.orderNumber ?? '') &&
       (a.orderComment ?? '') === (b.orderComment ?? '') &&
       (a.isMaterialLocked ?? false) === (b.isMaterialLocked ?? false) &&
-      (a.materialLockSource ?? null) === (b.materialLockSource ?? null);
-
-    if (!basicEqual) return false;
-
-    const defaults = getDefaultCustomConfig();
-    const cA = { ...defaults, ...(a.customStrategyConfig || {}) };
-    const cB = { ...defaults, ...(b.customStrategyConfig || {}) };
-    return (
-      cA.maxPassesMultiplier === cB.maxPassesMultiplier &&
-      cA.enable2Opt === cB.enable2Opt &&
-      cA.twoOptRounds === cB.twoOptRounds &&
-      cA.enableTailConsolidation === cB.enableTailConsolidation &&
-      cA.tailConsolidationMaxBars === cB.tailConsolidationMaxBars &&
-      cA.cardMergeScrapToleranceMm === cB.cardMergeScrapToleranceMm &&
-      cA.preferFewerCards === cB.preferFewerCards &&
-      cA.remnantTargetMinLength === cB.remnantTargetMinLength
+      (a.materialLockSource ?? null) === (b.materialLockSource ?? null)
     );
   };
 
@@ -697,10 +682,11 @@ export const CalculationProgressModal: React.FC<CalculationProgressModalProps> =
    * High-performance worker-based calculation runner with live telemetry
    */
   const startOptimizationRun = (
-    settingsToRun: AppSettings,
+    rawSettingsToRun: AppSettings,
     existingRunsList: CalculationRun[],
     onFinished?: (sol: FullOptimizationSolution) => void
   ) => {
+    const settingsToRun = normalizeLegacySettings(rawSettingsToRun, demandItems || []);
     setPhase('calculating');
     setProgressPercent(0);
     setStatusText('Инициализация параметров и подготовка заготовок...');
@@ -808,8 +794,8 @@ export const CalculationProgressModal: React.FC<CalculationProgressModalProps> =
       if (onFinished) onFinished(sol);
     };
 
-    const finishComprehensiveSuite = (
-      suite: ComprehensiveSuiteItem[],
+    const finishSuite = (
+      suite: SuiteItem[],
       bestSol: FullOptimizationSolution
     ) => {
       if (stopwatchIntervalRef.current) {
@@ -860,9 +846,7 @@ export const CalculationProgressModal: React.FC<CalculationProgressModalProps> =
       setStatusText(
         isStopped
           ? formatAbortedStatus(abortedInfo)
-          : settingsToRun.optimizationGoal === 'balance'
-            ? `Расчет «Баланс» выполнен! Вариантов в сравнении: ${suite.length}.`
-            : `Комплексный расчет выполнен! Вариантов для сравнения: ${suite.length}.`
+          : `Расчет «Баланс» выполнен! Вариантов в сравнении: ${suite.length}.`
       );
       setPhase('done');
       setIsStopping(false);
@@ -980,20 +964,17 @@ export const CalculationProgressModal: React.FC<CalculationProgressModalProps> =
             };
             worker.postMessage(resultMsg);
           });
-        } else if (msg.type === 'COMPREHENSIVE_DONE') {
+        } else if (msg.type === 'SUITE_DONE') {
           latestSolutionRef.current = msg.payload.bestSolution;
-          finishComprehensiveSuite(msg.payload.suite, msg.payload.bestSolution);
+          finishSuite(msg.payload.suite, msg.payload.bestSolution);
         } else if (msg.type === 'DONE') {
           latestSolutionRef.current = msg.payload;
           finishRun(msg.payload);
         } else if (msg.type === 'ERROR') {
           console.error('Worker returned error:', msg.payload);
-          if (settingsToRun.optimizationGoal === 'comprehensive') {
-            const comp = runComprehensiveSuite(stocks, demands, settingsToRun);
-            finishComprehensiveSuite(comp.suite, comp.bestSolution);
-          } else if (settingsToRun.optimizationGoal === 'balance') {
+          if (settingsToRun.optimizationGoal === 'balance') {
             const bal = runBalanceSuite(stocks, demands, settingsToRun);
-            finishComprehensiveSuite(bal.suite, bal.bestSolution);
+            finishSuite(bal.suite, bal.bestSolution);
           } else {
             const sol = onExecuteCalculation(settingsToRun);
             finishRun(sol);
@@ -1004,12 +985,9 @@ export const CalculationProgressModal: React.FC<CalculationProgressModalProps> =
       worker.onerror = (err) => {
         console.warn('Worker runtime error, falling back to sync:', err);
         workerRef.current = null;
-        if (settingsToRun.optimizationGoal === 'comprehensive') {
-          const comp = runComprehensiveSuite(stocks, demands, settingsToRun);
-          finishComprehensiveSuite(comp.suite, comp.bestSolution);
-        } else if (settingsToRun.optimizationGoal === 'balance') {
+        if (settingsToRun.optimizationGoal === 'balance') {
           const bal = runBalanceSuite(stocks, demands, settingsToRun);
-          finishComprehensiveSuite(bal.suite, bal.bestSolution);
+          finishSuite(bal.suite, bal.bestSolution);
         } else {
           const sol = onExecuteCalculation(settingsToRun);
           finishRun(sol);
@@ -1022,7 +1000,6 @@ export const CalculationProgressModal: React.FC<CalculationProgressModalProps> =
           stockInput: stocks,
           demandInput: demands,
           settings: settingsToRun,
-          isComprehensive: settingsToRun.optimizationGoal === 'comprehensive',
         },
       };
       worker.postMessage(startMsg);
@@ -1030,12 +1007,9 @@ export const CalculationProgressModal: React.FC<CalculationProgressModalProps> =
       console.warn('Worker spawn error, using synchronous execution:', err);
       setTimeout(() => {
         try {
-          if (settingsToRun.optimizationGoal === 'comprehensive') {
-            const comp = runComprehensiveSuite(stocks, demands, settingsToRun);
-            finishComprehensiveSuite(comp.suite, comp.bestSolution);
-          } else if (settingsToRun.optimizationGoal === 'balance') {
+          if (settingsToRun.optimizationGoal === 'balance') {
             const bal = runBalanceSuite(stocks, demands, settingsToRun);
-            finishComprehensiveSuite(bal.suite, bal.bestSolution);
+            finishSuite(bal.suite, bal.bestSolution);
           } else {
             const sol = onExecuteCalculation(settingsToRun);
             finishRun(sol);
@@ -1078,13 +1052,20 @@ export const CalculationProgressModal: React.FC<CalculationProgressModalProps> =
       return;
     }
 
-    setModalSettings({ ...settings });
+    const normalizedSettings = normalizeLegacySettings(settings, demandItems || []);
+    setModalSettings(normalizedSettings);
     setHighlightedRunId(null);
     setDuplicateWarning(null);
     setIsStopping(false);
 
     // Gather all existing previous runs: from savedRuns, or synthesized from the completed solution on page
-    let existingRuns: CalculationRun[] = savedRuns && savedRuns.length > 0 ? [...savedRuns] : [];
+    let existingRuns: CalculationRun[] =
+      savedRuns && savedRuns.length > 0
+        ? savedRuns.map((r) => ({
+            ...r,
+            settings: normalizeLegacySettings(r.settings, demandItems || []),
+          }))
+        : [];
     if (existingRuns.length === 0 && solution) {
       existingRuns = [
         {
@@ -1092,7 +1073,7 @@ export const CalculationProgressModal: React.FC<CalculationProgressModalProps> =
           index: 1,
           title: 'Расчет #1',
           timestamp: Date.now() - 2000,
-          settings: { ...(lastSolvedSettings || settings) },
+          settings: normalizeLegacySettings(lastSolvedSettings || normalizedSettings, demandItems || []),
           solution: solution,
           inputSignature: undefined,
         },
@@ -1126,7 +1107,7 @@ export const CalculationProgressModal: React.FC<CalculationProgressModalProps> =
         notes: d.notes,
       }));
 
-    existingRuns = ensureBaselines(existingRuns, stocks, demands, settings, inputSignature);
+    existingRuns = ensureBaselines(existingRuns, stocks, demands, normalizedSettings, inputSignature);
 
     // Filter optimization runs (excluding baselines which are economic benchmarks)
     const optimizationRuns = existingRuns.filter((r) => !r.isBaseline && r.index > 0);
@@ -1159,7 +1140,7 @@ export const CalculationProgressModal: React.FC<CalculationProgressModalProps> =
       // Check if an identical optimization run matches BOTH settings AND inputSignature
       const matchRun = optimizationRuns.find(
         (r) =>
-          areSettingsEqual(r.settings, settings) &&
+          areSettingsEqual(r.settings, normalizedSettings) &&
           (!r.inputSignature || !inputSignature || r.inputSignature === inputSignature)
       );
 
@@ -1174,12 +1155,12 @@ export const CalculationProgressModal: React.FC<CalculationProgressModalProps> =
       }
 
       // User modified settings or changed input conditions -> run optimization and append run to comparison table
-      startOptimizationRun(settings, existingRuns);
+      startOptimizationRun(normalizedSettings, existingRuns);
       return;
     }
 
     // No user optimization runs exist yet: start optimization run!
-    startOptimizationRun(settings, existingRuns);
+    startOptimizationRun(normalizedSettings, existingRuns);
   }, [isOpen, inputSignature]);
 
   // Active run and solution
@@ -1314,16 +1295,20 @@ export const CalculationProgressModal: React.FC<CalculationProgressModalProps> =
   };
 
   const handleSelectRun = (run: CalculationRun) => {
+    const normalized = normalizeLegacySettings(run.settings, demandItems || []);
     setActiveRunId(run.id);
-    setModalSettings({ ...run.settings });
+    setModalSettings(normalized);
     if (onApplySolutionAndSettings) {
-      onApplySolutionAndSettings(run.solution, run.settings);
+      onApplySolutionAndSettings(run.solution, normalized);
     }
   };
 
   const handleConfirmAndGo = () => {
     if (activeRun && onApplySolutionAndSettings) {
-      onApplySolutionAndSettings(activeRun.solution, activeRun.settings);
+      onApplySolutionAndSettings(
+        activeRun.solution,
+        normalizeLegacySettings(activeRun.settings, demandItems || [])
+      );
     }
     onClose();
     onGoToResults();
@@ -1393,17 +1378,6 @@ export const CalculationProgressModal: React.FC<CalculationProgressModalProps> =
       default:
         return 'Ручной';
     }
-  };
-
-  const getCustomParamsSummary = (s: AppSettings): string => {
-    if (s.optimizationGoal !== 'custom') return '';
-    const c = { ...getDefaultCustomConfig(), ...(s.customStrategyConfig || {}) };
-    const twoOptText = c.enable2Opt ? `2Opt:${c.twoOptRounds}` : '2Opt:выкл';
-    const tailText = c.enableTailConsolidation
-      ? `Хв:${c.tailConsolidationMaxBars}(${c.cardMergeScrapToleranceMm}мм)`
-      : 'Хв:выкл';
-    const cardsText = c.preferFewerCards ? 'Мин.карт' : 'Мин.отход';
-    return `${c.maxPassesMultiplier.toFixed(2)}x · ${twoOptText} · ${tailText} · ${cardsText}`;
   };
 
   const getRunCommentSearchText = (r: CalculationRun): string => {
@@ -1515,7 +1489,12 @@ export const CalculationProgressModal: React.FC<CalculationProgressModalProps> =
       if (filterStrategy === 'baseline') {
         list = list.filter((r) => r.isBaseline || r.index <= 0);
       } else {
-        list = list.filter((r) => r.settings.optimizationGoal === filterStrategy && !r.isBaseline && r.index > 0);
+        list = list.filter(
+          (r) =>
+            normalizeOptimizationGoal(r.settings.optimizationGoal) === filterStrategy &&
+            !r.isBaseline &&
+            r.index > 0
+        );
       }
     }
 
@@ -1557,7 +1536,9 @@ export const CalculationProgressModal: React.FC<CalculationProgressModalProps> =
           break;
         }
         case 'strategy':
-          diff = a.settings.optimizationGoal.localeCompare(b.settings.optimizationGoal);
+          diff = normalizeOptimizationGoal(a.settings.optimizationGoal).localeCompare(
+            normalizeOptimizationGoal(b.settings.optimizationGoal)
+          );
           break;
         case 'comments':
           diff = getRunCommentSearchText(a).localeCompare(getRunCommentSearchText(b));
@@ -1640,11 +1621,6 @@ export const CalculationProgressModal: React.FC<CalculationProgressModalProps> =
         }
         case 'groupSolutions':
           diff = Number(a.settings.groupSolutions !== false) - Number(b.settings.groupSolutions !== false);
-          break;
-        case 'customParams':
-          diff = getCustomParamsSummary(a.settings).localeCompare(
-            getCustomParamsSummary(b.settings)
-          );
           break;
         case 'cuttingIndex': {
           const idxA = computeCuttingIndexFromSolution(
@@ -2986,18 +2962,6 @@ export const CalculationProgressModal: React.FC<CalculationProgressModalProps> =
                                 </th>
                               )}
 
-                              {visibleColSet.has('customParams') && (
-                                <th
-                                  onClick={() => handleSortToggle('customParams')}
-                                  className="py-2 px-2.5 cursor-pointer hover:bg-slate-200 transition-colors group whitespace-nowrap"
-                                >
-                                  <div className="flex items-center gap-1">
-                                    <span>Настройки польз.</span>
-                                    {renderSortIndicator('customParams')}
-                                  </div>
-                                </th>
-                              )}
-
                               {visibleColSet.has('cuttingIndex') && (
                                 <th
                                   onClick={() => handleSortToggle('cuttingIndex')}
@@ -3434,8 +3398,7 @@ export const CalculationProgressModal: React.FC<CalculationProgressModalProps> =
                                       <td className="py-2 px-2.5 text-[11px] whitespace-nowrap font-mono">
                                         {r.settings.dualProfileCut ? (
                                           <span className="text-slate-700 font-medium">
-                                            {r.solution.batchInfo?.batchSize ?? r.settings.batchSizeN ?? 2} шт. (
-                                            {(r.settings.batchSizeMode ?? 'auto') === 'auto' ? 'авто' : 'ручн.'})
+                                            {r.solution.batchInfo?.batchSize ?? r.settings.batchSizeN ?? 2} шт.
                                           </span>
                                         ) : (
                                           <span className="text-slate-400 font-normal font-sans">—</span>
@@ -3447,7 +3410,7 @@ export const CalculationProgressModal: React.FC<CalculationProgressModalProps> =
                                       <td className="py-2 px-2.5 text-[11px] whitespace-nowrap font-mono">
                                         {r.settings.dualProfileCut && r.settings.fillControlEnabled ? (
                                           <span className="text-blue-800 font-medium">
-                                            {r.settings.fillControlThreshold ?? 50}%
+                                            {clampFillControlThreshold(r.settings.fillControlThreshold)}%
                                           </span>
                                         ) : (
                                           <span className="text-slate-400 font-normal">—</span>
@@ -3461,16 +3424,6 @@ export const CalculationProgressModal: React.FC<CalculationProgressModalProps> =
                                           <span className="text-slate-700 font-medium">Да</span>
                                         ) : (
                                           <span className="text-slate-400 font-normal">Нет</span>
-                                        )}
-                                      </td>
-                                    )}
-
-                                    {visibleColSet.has('customParams') && (
-                                      <td className="py-2 px-2.5 text-[11px] whitespace-nowrap font-mono text-slate-600">
-                                        {!isBaseline && r.settings.optimizationGoal === 'custom' ? (
-                                          getCustomParamsSummary(r.settings)
-                                        ) : (
-                                          <span className="text-slate-400 font-normal font-sans">—</span>
                                         )}
                                       </td>
                                     )}

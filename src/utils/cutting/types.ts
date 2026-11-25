@@ -1,7 +1,6 @@
 import {
   AppSettings,
   CalculationProgressInfo,
-  CustomStrategyConfig,
   StockItem,
 } from '../../types/cutting';
 
@@ -10,15 +9,13 @@ import {
  * - min_setups: Minimize unique cutting cards (saw setups).
  * - min_material: Minimize total consumed stock bars/meters (including warehouse remnants), breaking ties by fewer cards and less waste.
  * - balance: Minimize unique cutting cards subject to a material consumption cap (totalStockLengthMm <= materialCapMm).
- * - custom: User-configured strategy parameters.
  */
 export type StrategyType =
   | 'min_setups'
   | 'min_material'
   | 'forced_remnant_shaping'
   | 'remnant_fill'
-  | 'balance'
-  | 'custom';
+  | 'balance';
 
 /**
  * Immutable representation of a grouped cutting pattern card.
@@ -102,7 +99,6 @@ export interface CutContext {
   readonly stockInput: readonly StockItem[];
   readonly settings: AppSettings;
   readonly materialCapMm?: number;
-  readonly customConfig?: CustomStrategyConfig;
   readonly onProgress?: (progress: CalculationProgressInfo) => void;
   readonly shouldAbort?: () => boolean;
 }

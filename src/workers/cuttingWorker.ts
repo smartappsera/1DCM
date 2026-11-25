@@ -4,9 +4,8 @@
  */
 import {
   solveLinearCuttingAsync,
-  runComprehensiveSuiteAsync,
   runBalanceSuiteAsync,
-  ComprehensiveSuiteItem,
+  SuiteItem,
   solveNaiveSequentialCutting,
   ParallelPassExecutor,
   ParallelPassSearchRequest,
@@ -27,7 +26,6 @@ export interface WorkerStartPayload {
   stockInput: StockItem[];
   demandInput: DemandItem[];
   settings: AppSettings;
-  isComprehensive?: boolean;
 }
 
 export interface WorkerStartMessage {
@@ -71,10 +69,10 @@ export interface WorkerDoneMessage {
   payload: FullOptimizationSolution;
 }
 
-export interface WorkerComprehensiveDoneMessage {
-  type: 'COMPREHENSIVE_DONE';
+export interface WorkerSuiteDoneMessage {
+  type: 'SUITE_DONE';
   payload: {
-    suite: ComprehensiveSuiteItem[];
+    suite: SuiteItem[];
     bestSolution: FullOptimizationSolution;
   };
 }
@@ -95,7 +93,7 @@ export interface WorkerErrorMessage {
 export type WorkerOutMessage =
   | WorkerProgressMessage
   | WorkerDoneMessage
-  | WorkerComprehensiveDoneMessage
+  | WorkerSuiteDoneMessage
   | WorkerRunPoolInMainMessage
   | WorkerErrorMessage;
 
@@ -164,29 +162,10 @@ self.onmessage = async (e: MessageEvent<WorkerInMessage>) => {
 
   if (data.type === 'START') {
     isAborted = false;
-    const { stockInput, demandInput, settings, isComprehensive } = data.payload;
+    const { stockInput, demandInput, settings } = data.payload;
 
     try {
-      if (isComprehensive || settings.optimizationGoal === 'comprehensive') {
-        const result = await runComprehensiveSuiteAsync(
-          stockInput,
-          demandInput,
-          settings,
-          {
-            onProgress: (progress: CalculationProgressInfo) => {
-              self.postMessage({ type: 'PROGRESS', payload: progress });
-            },
-            shouldAbort: () => isAborted,
-          },
-          parallelExecutor
-        );
-
-        self.postMessage({
-          type: 'COMPREHENSIVE_DONE',
-          payload: result,
-        });
-        self.postMessage({ type: 'DONE', payload: result.bestSolution });
-      } else if (settings.optimizationGoal === 'balance') {
+      if (settings.optimizationGoal === 'balance') {
         const result = await runBalanceSuiteAsync(
           stockInput,
           demandInput,
@@ -201,7 +180,7 @@ self.onmessage = async (e: MessageEvent<WorkerInMessage>) => {
         );
 
         self.postMessage({
-          type: 'COMPREHENSIVE_DONE',
+          type: 'SUITE_DONE',
           payload: { suite: result.suite, bestSolution: result.bestSolution },
         });
       } else {
