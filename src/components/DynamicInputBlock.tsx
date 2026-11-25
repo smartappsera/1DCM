@@ -13,7 +13,6 @@ import {
   ArrowUp,
   ArrowDown,
   Lock,
-  Unlock,
 } from 'lucide-react';
 import {
   exportItemsToCsv,
@@ -21,7 +20,7 @@ import {
   parseItemsFromCsv,
   parseItemsFromXml,
 } from '../utils/dataIO';
-import { getColorForLength, getDefaultDemandColor } from '../utils/cuttingEngine';
+import { getDefaultDemandColor } from '../utils/cuttingEngine';
 import { StockUploadModal } from './StockUploadModal';
 import { RemnantExportModal } from './RemnantExportModal';
 
@@ -1073,8 +1072,8 @@ export const DynamicInputBlock: React.FC<DynamicInputBlockProps> = ({
                             onChange={(e) => handleUpdate(item.id, 'isActive', e.target.checked)}
                             title={
                               item.isActive !== false
-                                ? 'Стандартный хлыст включен в расчет (нажмите чтобы отключить)'
-                                : 'Стандартный хлыст отключен (нажмите чтобы включить)'
+                                ? 'Стандартный профиль включен в расчет (нажмите чтобы отключить)'
+                                : 'Стандартный профиль отключен (нажмите чтобы включить)'
                             }
                             className="w-3.5 h-3.5 text-blue-600 rounded cursor-pointer"
                           />

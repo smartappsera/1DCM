@@ -4,11 +4,8 @@ import { Sparkles, MessageSquareHeart, Activity } from 'lucide-react';
 interface HeaderProps {
   activeTab: 'workspace' | 'visualizer' | 'reports';
   setActiveTab: (tab: 'workspace' | 'visualizer' | 'reports') => void;
-  onCalculate?: () => void;
   onOpenFeedback: () => void;
   onOpenAudit?: () => void;
-  onPrint?: () => void;
-  onExportExcel?: () => void;
   hasResults: boolean;
   onLoadBenchmarkExample?: () => void;
 }
@@ -16,15 +13,13 @@ interface HeaderProps {
 export const Header: React.FC<HeaderProps> = ({
   activeTab,
   setActiveTab,
-  onCalculate,
   onOpenFeedback,
   onOpenAudit,
-  onPrint,
   hasResults,
   onLoadBenchmarkExample,
 }) => {
   return (
-    <header className="no-print bg-slate-900 border-b border-slate-800 text-white static sm:sticky sm:top-0 sm:z-40 shadow-md">
+    <header className="no-print bg-slate-900 border-b border-slate-800 text-white relative z-40 sm:sticky sm:top-0 sm:z-40 shadow-md">
       {/* Main Top Bar */}
       <div className="flex items-center justify-between gap-4 px-4 sm:px-6 py-3">
         {/* Zone 1: Brand Wordmark */}

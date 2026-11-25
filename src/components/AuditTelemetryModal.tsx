@@ -9,12 +9,10 @@ import {
   Zap,
   Download,
   Trash2,
-  CheckCircle2,
-  AlertCircle,
   FileCode2,
 } from 'lucide-react';
 import { CalculationRun } from './CalculationProgressModal';
-import { CalculationTelemetry } from '../types/cutting';
+import { getSolutionWasteBreakdown } from '../utils/wasteBreakdown';
 
 interface AuditTelemetryModalProps {
   isOpen: boolean;
@@ -51,24 +49,29 @@ export const AuditTelemetryModal: React.FC<AuditTelemetryModalProps> = ({
       exportTimestamp: new Date().toISOString(),
       userAgent: typeof navigator !== 'undefined' ? navigator.userAgent : 'unknown',
       totalRunsCount: historyRuns.length,
-      runs: historyRuns.map((r) => ({
-        id: r.id,
-        index: r.index,
-        title: r.title,
-        badge: r.badge,
-        timestamp: new Date(r.timestamp).toISOString(),
-        settings: r.settings,
-        summary: {
-          overallKIM: r.solution.overallKIM,
-          netKIM: r.solution.netKIM,
-          totalStockLengthMeters: (r.solution.totalStockLength || 0) / 1000,
-          totalBarsUsed: r.solution.totalBarsUsed,
-          totalWasteLengthMeters: r.solution.totalWasteLength / 1000,
-          totalReusableMeters: r.solution.totalReusableLength / 1000,
-          calculationTimeMs: r.solution.calculationTimeMs,
-        },
-        telemetry: r.solution.telemetry || null,
-      })),
+      runs: historyRuns.map((r) => {
+        const wb = getSolutionWasteBreakdown(r.solution);
+        return {
+          id: r.id,
+          index: r.index,
+          title: r.title,
+          badge: r.badge,
+          timestamp: new Date(r.timestamp).toISOString(),
+          settings: r.settings,
+          summary: {
+            overallKIM: r.solution.overallKIM,
+            netKIM: r.solution.netKIM,
+            totalStockLengthMeters: (r.solution.totalStockLength || 0) / 1000,
+            totalBarsUsed: r.solution.totalBarsUsed,
+            totalWasteLengthMeters: r.solution.totalWasteLength / 1000,
+            totalOffcutsMeters: wb.offcutsMm / 1000,
+            totalKerfMeters: wb.kerfMm / 1000,
+            totalReusableMeters: r.solution.totalReusableLength / 1000,
+            calculationTimeMs: r.solution.calculationTimeMs,
+          },
+          telemetry: r.solution.telemetry || null,
+        };
+      }),
     };
 
     const blob = new Blob([JSON.stringify(exportData, null, 2)], {
@@ -91,10 +94,13 @@ export const AuditTelemetryModal: React.FC<AuditTelemetryModalProps> = ({
       'Этап 2 Поиск (мс)',
       'Этап 3 2-Opt (мс)',
       'КИМ (%)',
-      'Проверено комбинаций',
+      'Комбинаций',
       'Проходов',
+      'Отсечено проходов',
       'Память JS (МБ)',
       'Скорость (дет/сек)',
+      'Потоков',
+      'Чанков',
       'Среда',
     ];
 
@@ -110,8 +116,11 @@ export const AuditTelemetryModal: React.FC<AuditTelemetryModalProps> = ({
         r.solution.overallKIM,
         t?.totalCombinationsChecked ?? 0,
         t?.passesEvaluated ?? 0,
+        t?.prunedPasses ?? 0,
         t?.memoryUsedMb ?? 'N/A',
         t?.throughputPartsPerSecond ?? 0,
+        t?.workerThreadCount ?? 1,
+        t?.chunksProcessed ?? 0,
         t?.environment ?? 'client_worker',
       ].join(';');
     });
@@ -215,7 +224,13 @@ export const AuditTelemetryModal: React.FC<AuditTelemetryModalProps> = ({
                     {telemetry?.environment === 'client_worker'
                       ? 'Web Worker (фоновый поток)'
                       : 'Основной поток'}
-                  </span>
+                  </span>{' '}
+                  · Потоков: <span className="text-slate-800 font-semibold">{telemetry?.workerThreadCount ?? 1}</span>
+                  {(telemetry?.chunksProcessed ?? 0) > 0 && (
+                    <>
+                      {' '}· Чанков: <span className="text-slate-800 font-semibold">{telemetry?.chunksProcessed}</span>
+                    </>
+                  )}
                 </div>
               </div>
 
@@ -269,7 +284,14 @@ export const AuditTelemetryModal: React.FC<AuditTelemetryModalProps> = ({
                     {(telemetry?.totalCombinationsChecked ?? activeRun.solution.rows.length).toLocaleString('ru-RU')}
                   </div>
                   <div className="text-[10px] text-slate-500 mt-1">
-                    {telemetry?.passesEvaluated ? `${telemetry.passesEvaluated} проходов поиска` : 'Быстрый проход'}
+                    <div>
+                      {telemetry?.passesEvaluated ? `${telemetry.passesEvaluated} проходов поиска` : 'Быстрый проход'}
+                    </div>
+                    {(telemetry?.prunedPasses ?? 0) > 0 && (
+                      <div className="text-emerald-700 font-medium">
+                        из них отсечено: {telemetry?.prunedPasses}
+                      </div>
+                    )}
                   </div>
                 </div>
 
@@ -286,7 +308,7 @@ export const AuditTelemetryModal: React.FC<AuditTelemetryModalProps> = ({
                     <span className="text-xs font-normal text-slate-500">дет/с</span>
                   </div>
                   <div className="text-[10px] text-slate-500 mt-1">
-                    100% поток 1 ядра (без блокировки UI)
+                    Потоков: {telemetry?.workerThreadCount ?? 1} · Чанков: {telemetry?.chunksProcessed ?? 0}
                   </div>
                 </div>
               </div>
@@ -378,6 +400,7 @@ export const AuditTelemetryModal: React.FC<AuditTelemetryModalProps> = ({
                     <th className="py-2.5 px-3 text-right">Комбинаций</th>
                     <th className="py-2.5 px-3 text-right">Память JS</th>
                     <th className="py-2.5 px-3 text-right">Скорость</th>
+                    <th className="py-2.5 px-3 text-right">Потоки / Чанки</th>
                     <th className="py-2.5 px-3 text-center">Статус</th>
                   </tr>
                 </thead>
@@ -428,6 +451,9 @@ export const AuditTelemetryModal: React.FC<AuditTelemetryModalProps> = ({
                           <td className="py-2.5 px-3 text-right font-mono text-slate-600 tabular-nums">
                             {t?.throughputPartsPerSecond ? `${t.throughputPartsPerSecond} дет/с` : '—'}
                           </td>
+                          <td className="py-2.5 px-3 text-right font-mono text-slate-600 tabular-nums">
+                            {t?.workerThreadCount ?? 1} / {t?.chunksProcessed ?? 0}
+                          </td>
                           <td className="py-2.5 px-3 text-center">
                             {isSelected ? (
                               <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[10px] font-bold bg-blue-600 text-white shadow-2xs">
@@ -442,7 +468,7 @@ export const AuditTelemetryModal: React.FC<AuditTelemetryModalProps> = ({
                     })
                   ) : (
                     <tr>
-                      <td colSpan={8} className="py-6 text-center text-slate-400 text-xs">
+                      <td colSpan={9} className="py-6 text-center text-slate-400 text-xs">
                         Нет сохраненных расчетов в текущей сессии
                       </td>
                     </tr>

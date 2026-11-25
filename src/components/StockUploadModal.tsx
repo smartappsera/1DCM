@@ -9,13 +9,11 @@ import {
   RefreshCw,
   Layers,
   Sparkles,
-  Info,
 } from 'lucide-react';
 import {
   deepParseFileForStock,
   DeepParsedStockResult,
   ParsedStockMaterialGroup,
-  ExportableItem,
 } from '../utils/dataIO';
 import { DynamicRowItem } from './DynamicInputBlock';
 
@@ -425,7 +423,7 @@ export const StockUploadModal: React.FC<StockUploadModalProps> = ({
                       className="w-4 h-4 rounded text-blue-600 cursor-pointer"
                     />
                     <span className="font-medium">
-                      Добавить стандартные хлысты 6000 и 12000 мм (рассчитать кол-во)
+                      Добавить стандартные профили 6000 и 12000 мм (рассчитать кол-во)
                     </span>
                   </label>
                 </div>
@@ -502,7 +500,7 @@ export const StockUploadModal: React.FC<StockUploadModalProps> = ({
                                   </span>
                                 ) : (
                                   <span className="inline-block px-2 py-0.5 rounded-full text-[10px] font-bold bg-slate-100 text-slate-700">
-                                    Хлыст
+                                    Профиль
                                   </span>
                                 )}
                               </td>

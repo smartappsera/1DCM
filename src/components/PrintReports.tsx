@@ -6,6 +6,8 @@ import {
   StockBar,
 } from '../types/cutting';
 import { Printer, Tag, FileText, Download } from 'lucide-react';
+import { getBatchRowSplit } from '../utils/cutting/metrics';
+import { getOptimizationLabel, getSearchSpeedLabel } from '../constants/cuttingHelp';
 
 interface PrintReportsProps {
   result: CuttingOptimizationResult | null;
@@ -17,13 +19,11 @@ interface PrintReportsProps {
 export const PrintReports: React.FC<PrintReportsProps> = ({
   result,
   params,
-  demands,
-  stocks,
 }) => {
   const [activeReport, setActiveReport] = useState<'work_order' | 'labels' | 'remnants'>(
     'work_order'
   );
-  const [labelSize, setLabelSize] = useState<'medium' | 'compact'>('medium');
+  const labelSize = 'medium' as 'medium' | 'compact';
   const [highlightedCut, setHighlightedCut] = useState<{
     patternId: string;
     cutIndex: number;
@@ -62,21 +62,16 @@ export const PrintReports: React.FC<PrintReportsProps> = ({
     let cardsHtml = '';
     result.patterns.forEach((pattern) => {
       let progressiveStop = pattern.trimStart || 0;
-      const cutsCount = pattern.cuts.length + (pattern.trimStart > 0 ? 1 : 0) + 1;
-      const kerfLoss = params.bladeWidth * cutsCount;
+      const kerfLoss = pattern.totalKerfLength ?? 0;
       const reusableRemnantMm = pattern.reusableLength || (pattern.isReusableWaste ? pattern.wasteLength : 0);
       const scrapPart = pattern.scrapLength ?? (pattern.isReusableWaste ? 0 : pattern.wasteLength);
+      const offcutsMm = (pattern.trimStart || 0) + scrapPart;
 
-      let wasteText = '';
-      if (pattern.trimStart > 0 && scrapPart > 0) {
-        wasteText = `${pattern.trimStart}+${scrapPart} мм (лом), ${kerfLoss} мм (стружка)`;
-      } else if (scrapPart > 0) {
-        wasteText = `${scrapPart} мм (лом), ${kerfLoss} мм (стружка)`;
-      } else if (pattern.trimStart > 0) {
-        wasteText = `${pattern.trimStart} мм (лом), ${kerfLoss} мм (стружка)`;
-      } else {
-        wasteText = `${kerfLoss} мм (стружка)`;
-      }
+      const offcutsDetail =
+        pattern.trimStart > 0 && scrapPart > 0
+          ? `${offcutsMm} мм (${pattern.trimStart} торц. + ${scrapPart} обр.)`
+          : `${offcutsMm} мм`;
+      const wasteText = `Обрезки: ${offcutsDetail} &middot; Стружка: ${kerfLoss} мм`;
 
       const reusableBadge = pattern.isReusableWaste && reusableRemnantMm > 0
         ? ` &middot; Деловой остаток: <strong>${reusableRemnantMm} мм</strong>`
@@ -142,11 +137,11 @@ export const PrintReports: React.FC<PrintReportsProps> = ({
         const wasteFill = isReusable ? '#fef3c7' : '#e2e8f0';
         const wasteStroke = isReusable ? '#f59e0b' : '#94a3b8';
         const wasteTextColor = isReusable ? '#92400e' : '#475569';
-        const wasteLabel = isReusable ? `${displayTailMm} (Ост)` : `${displayTailMm} (Лом)`;
+        const wasteLabel = isReusable ? `${displayTailMm} (Ост)` : `${displayTailMm} (Обр)`;
 
         graphicBarSvg += `
           <rect class="cut-rect" x="${curX.toFixed(1)}" y="0" width="${wasteW.toFixed(1)}" height="${svgHeight}" fill="${wasteFill}" stroke="${wasteStroke}" stroke-width="1.5">
-            <title>${isReusable ? 'Деловой остаток' : 'Невозвратный лом'}: ${displayTailMm} мм</title>
+            <title>${isReusable ? 'Деловой остаток' : 'Неделовой обрезок'}: ${displayTailMm} мм</title>
           </rect>
         `;
 
@@ -185,17 +180,36 @@ export const PrintReports: React.FC<PrintReportsProps> = ({
           </tr>`;
       });
 
-      if (pattern.wasteLength > 0) {
+      if (reusableRemnantMm > 0 || scrapPart > 0) {
+        const isReus = pattern.isReusableWaste && reusableRemnantMm > 0;
+        const tailLen = isReus ? reusableRemnantMm : scrapPart;
         tableRows += `
-          <tr style="background:${pattern.isReusableWaste ? '#fffbeb' : '#f8fafc'};">
+          <tr style="background:${isReus ? '#fffbeb' : '#f8fafc'};">
             <td style="text-align:center; font-family:monospace; color:#94a3b8;">&mdash;</td>
             <td style="text-align:right; font-family:monospace; color:#475569;">Хвост: ${pattern.stockLength} мм</td>
-            <td style="font-weight:bold; color:${pattern.isReusableWaste ? '#92400e' : '#475569'};">
-              ${pattern.isReusableWaste ? `Деловой остаток (${pattern.wasteLength} мм)` : `Невозвратный лом (${pattern.wasteLength} мм)`}
+            <td style="font-weight:bold; color:${isReus ? '#92400e' : '#475569'};">
+              ${isReus ? `Деловой остаток (${tailLen} мм)` : `Неделовой обрезок (${tailLen} мм)`}
             </td>
-            <td style="font-size:11px;">${pattern.isReusableWaste ? 'Промаркировать и оприходовать' : 'В бункер стружки'}</td>
+            <td style="font-size:11px;">${isReus ? 'Промаркировать и оприходовать' : 'В контейнер обрезков'}</td>
           </tr>`;
       }
+
+      const batchSize =
+        params.groupSolutions !== false ? result.batchInfo?.batchSize : undefined;
+      const split =
+        batchSize && batchSize >= 2
+          ? getBatchRowSplit(pattern.count, batchSize)
+          : null;
+      const showSingleBadge = split
+        ? split.batchCount === 0
+        : Boolean(pattern.isTailSingle);
+      const countLabelHtml =
+        split && split.batchCount > 0 && split.singleCount > 0
+          ? `${pattern.count} шт (${split.batchCount} пакетом + ${split.singleCount} одиночно)`
+          : `${pattern.count} шт`;
+      const singleBadgeHtml = showSingleBadge
+        ? ` <span style="background:#fef3c7; color:#78350f; border:1px solid #fcd34d; border-radius:4px; padding:1px 6px; font-size:10px; font-weight:600; margin-left:6px;">одиночный</span>`
+        : '';
 
       cardsHtml += `
         <div class="card-block">
@@ -203,10 +217,10 @@ export const PrintReports: React.FC<PrintReportsProps> = ({
             <div>
               <span class="badge">Карта #${pattern.patternIndex}</span>
               <strong>${escapeXml(pattern.stockName)} &mdash; ${pattern.stockLength} мм</strong>
-              &nbsp;&middot;&nbsp; Количество хлыстов: <strong>${pattern.count} шт</strong>
+              &nbsp;&middot;&nbsp; Количество профилей: <strong>${countLabelHtml}</strong>${singleBadgeHtml}
             </div>
             <div style="font-family:monospace; font-size:12px;">
-              Отходы: <strong>${wasteText}</strong>${reusableBadge} &nbsp;&middot;&nbsp; КИМ: <strong>${pattern.efficiencyPercent}%</strong>
+              <strong>${wasteText}</strong>${reusableBadge} &nbsp;&middot;&nbsp; КИМ: <strong>${pattern.efficiencyPercent}%</strong>
             </div>
           </div>
 
@@ -215,7 +229,7 @@ export const PrintReports: React.FC<PrintReportsProps> = ({
             <div class="bar-scale">
               <span>0 мм</span>
               <span style="font-family:sans-serif; font-weight:600; color:#334155;">
-                Хлыст: ${pattern.stockLength} мм (${escapeXml(pattern.stockName)}) &bull; ${pattern.count} шт
+                Профиль: ${pattern.stockLength} мм (${escapeXml(pattern.stockName)}) &bull; ${countLabelHtml}
               </span>
               <span>${pattern.stockLength} мм</span>
             </div>
@@ -239,23 +253,24 @@ export const PrintReports: React.FC<PrintReportsProps> = ({
       `;
     });
 
-    const STRATEGY_TITLES: Record<string, string> = {
-      variants: 'Минимум наладок',
-      min_waste: 'Минимум отходов',
-      min_bars: 'Минимум хлыстов',
-      max_reusable: 'Максимум делового остатка',
-      prioritize_remnants: 'Приоритет остатков со склада',
-      comprehensive: 'Комплексный подбор',
-    };
-
-    const SPEED_TITLES: Record<string, string> = {
-      fast: 'Быстро',
-      standard: 'Стандарт',
-      deep: 'Глубокий',
-    };
-
-    const strategyLabel = STRATEGY_TITLES[params.strategy || 'variants'] || params.strategy || 'Минимум наладок';
-    const speedLabel = SPEED_TITLES[params.searchSpeed || 'standard'] || params.searchSpeed || 'Стандарт';
+    const strategyLabel = getOptimizationLabel(params.strategy || 'variants', true);
+    const speedLabel = getSearchSpeedLabel(params.searchSpeed || 'standard', true);
+    let batchBannerHtml = '';
+    if (result.batchInfo) {
+      const { batchSize, batchBarsUsed, tailBarsUsed, nonMultipleDetails } = result.batchInfo;
+      const packagesCount = Math.floor(batchBarsUsed / batchSize);
+      const detailsSuffix =
+        nonMultipleDetails.length > 0
+          ? ` (детали с количеством, не кратным ${batchSize}: ${nonMultipleDetails
+              .map((d) => `${d.length} мм — ${d.quantity} шт. (хвост ${d.tailQuantity})`)
+              .join(', ')})`
+          : '';
+      const batchSummaryHtml =
+        tailBarsUsed > 0 || nonMultipleDetails.length > 0
+          ? `<strong>Пакетный рез по ${batchSize}:</strong> ${batchBarsUsed} заготовок пакетом (${packagesCount} пакетов), ${tailBarsUsed} одиночно${escapeXml(detailsSuffix)}`
+          : `<strong>Пакетный рез по ${batchSize}:</strong> все заготовки пакетом (${batchBarsUsed} заготовок, ${packagesCount} пакетов)`;
+      batchBannerHtml = `<div style="background:#eff6ff; border:1px solid #bfdbfe; border-radius:6px; padding:10px 14px; margin-bottom:16px; font-size:12px; color:#172554;">${batchSummaryHtml}</div>`;
+    }
 
     const doc = `<!DOCTYPE html>
 <html lang="ru">
@@ -269,7 +284,7 @@ export const PrintReports: React.FC<PrintReportsProps> = ({
     .meta-line { font-size: 12px; color: #475569; margin-top: 4px; }
     .divider { border: 0; border-top: 1px solid #e2e8f0; margin: 12px 0; }
     .thick-divider { border: 0; border-top: 2px solid #94a3b8; margin: 20px 0; }
-    .summary-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; padding: 12px; background: #f8fafc; border: 1px solid #e2e8f0; border-radius: 6px; font-size: 12px; margin-bottom: 12px; }
+    .summary-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px 14px; padding: 12px; background: #f8fafc; border: 1px solid #e2e8f0; border-radius: 6px; font-size: 12px; margin-bottom: 12px; }
     .geometry-box { background: #f1f5f9; border: 1px solid #cbd5e1; border-radius: 6px; padding: 12px; margin-bottom: 20px; font-size: 11px; }
     .geometry-title { font-weight: 800; text-transform: uppercase; letter-spacing: 0.05em; color: #334155; margin-bottom: 8px; font-size: 11px; }
     .geometry-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 8px 14px; }
@@ -309,10 +324,12 @@ export const PrintReports: React.FC<PrintReportsProps> = ({
   </div>
 
   <div class="summary-grid">
-    <div>Использовано хлыстов: <strong>${result.totalStockBarsUsed} шт (${(result.totalStockLengthUsed / 1000).toFixed(1)} м)</strong></div>
+    <div>Использовано профилей: <strong>${result.totalStockBarsUsed} шт (${(result.totalStockLengthUsed / 1000).toFixed(1)} м)</strong></div>
     <div>Готовых деталей: <strong>${(result.totalPartsLength / 1000).toFixed(1)} м</strong></div>
     <div>Деловой остаток: <strong>${(result.totalReusableLength / 1000).toFixed(1)} м</strong></div>
-    <div>Невозвратный лом + рез: <strong>${((result.totalScrapLength + result.totalKerfLoss) / 1000).toFixed(2)} м</strong></div>
+    <div>Обрезки (торцовка + остаток): <strong>${(result.totalScrapLength / 1000).toFixed(2)} м (${result.totalScrapLength.toLocaleString('ru-RU')} мм)</strong></div>
+    <div>Стружка (рез пилы): <strong>${(result.totalKerfLoss / 1000).toFixed(2)} м (${result.totalKerfLoss.toLocaleString('ru-RU')} мм)</strong></div>
+    <div>Отходы всего: <strong>${((result.totalScrapLength + result.totalKerfLoss) / 1000).toFixed(2)} м</strong></div>
   </div>
 
   <div style="background:#f8fafc; border:1px solid #cbd5e1; border-radius:6px; padding:10px 14px; margin-bottom:16px; font-size:11px;">
@@ -335,12 +352,14 @@ export const PrintReports: React.FC<PrintReportsProps> = ({
       <div class="geom-item">Торцовка (кромка): <strong>${params.trimStart} мм</strong></div>
       <div class="geom-item">Порог делового остатка: <strong>${params.reusableRemnantMin ?? params.minReusableLength ?? 250} мм</strong></div>
       <div class="geom-item">Рез под углом 45°: <strong>${params.cutAngle45 ? 'Да (косой рез)' : 'Нет (прямой 90°)'}</strong></div>
-      <div class="geom-item">Режим резки: <strong>${params.dualProfileCut ? 'Пакетный рез (от 2 шт.)' : 'Одиночный (по 1 хлысту)'}</strong></div>
+      <div class="geom-item">Режим резки: <strong>${result.batchInfo ? `Пакетный рез по ${result.batchInfo.batchSize} шт.` : params.dualProfileCut ? 'Пакетный рез (от 2 шт.)' : 'Одиночный (по 1 профилю)'}</strong></div>
       <div class="geom-item">Стратегия: <strong>${strategyLabel}</strong></div>
-      <div class="geom-item">Производительность: <strong>${speedLabel}</strong></div>
+      <div class="geom-item">Глубина поиска: <strong>${speedLabel}</strong></div>
       <div class="geom-item">Упор / стружка: <strong>Учтены в картах</strong></div>
     </div>
   </div>
+
+  ${batchBannerHtml}
 
   <div class="cards-container">
     ${cardsHtml}
@@ -486,8 +505,8 @@ export const PrintReports: React.FC<PrintReportsProps> = ({
             </div>
           </div>
 
-          {/* Quick Params */}
-          <div className="grid grid-cols-4 gap-4 p-3 bg-slate-50 border border-slate-200 rounded-lg text-xs mb-6">
+          {/* Quick Params & Waste Split */}
+          <div className="grid grid-cols-2 sm:grid-cols-4 gap-4 p-3 bg-slate-50 border border-slate-200 rounded-lg text-xs mb-6">
             <div>
               <span className="text-slate-500 block">Ширина пропила:</span>
               <strong className="font-mono">{params.bladeWidth} мм</strong>
@@ -507,7 +526,31 @@ export const PrintReports: React.FC<PrintReportsProps> = ({
             <div>
               <span className="text-slate-500 block">Деловой остаток:</span>
               <strong className="font-mono text-amber-700">
-                {(result.totalReusableLength / 1000).toFixed(1)} м
+                {(result.totalReusableLength / 1000).toFixed(2)} м
+              </strong>
+            </div>
+            <div>
+              <span className="text-slate-500 block">Готовых деталей:</span>
+              <strong className="font-mono text-slate-900">
+                {(result.totalPartsLength / 1000).toFixed(2)} м
+              </strong>
+            </div>
+            <div>
+              <span className="text-slate-500 block">Обрезки (торц. + недел.):</span>
+              <strong className="font-mono text-rose-700">
+                {(result.totalScrapLength / 1000).toFixed(2)} м ({result.totalScrapLength.toLocaleString('ru-RU')} мм)
+              </strong>
+            </div>
+            <div>
+              <span className="text-slate-500 block">Стружка (рез):</span>
+              <strong className="font-mono text-slate-700">
+                {(result.totalKerfLoss / 1000).toFixed(2)} м ({result.totalKerfLoss.toLocaleString('ru-RU')} мм)
+              </strong>
+            </div>
+            <div>
+              <span className="text-slate-500 block">Отходы всего:</span>
+              <strong className="font-mono text-slate-900">
+                {((result.totalScrapLength + result.totalKerfLoss) / 1000).toFixed(2)} м
               </strong>
             </div>
           </div>
@@ -548,26 +591,59 @@ export const PrintReports: React.FC<PrintReportsProps> = ({
             </div>
           </div>
 
+          {/* Batch Summary Banner */}
+          {result.batchInfo && (() => {
+            const { batchSize, batchBarsUsed, tailBarsUsed, nonMultipleDetails } = result.batchInfo;
+            const packagesCount = Math.floor(batchBarsUsed / batchSize);
+            return (
+              <div className="bg-blue-50/90 border border-blue-200 rounded-lg px-3.5 py-2.5 text-xs text-blue-950 mb-6 print:border-slate-800">
+                {tailBarsUsed > 0 || nonMultipleDetails.length > 0 ? (
+                  <>
+                    <strong>Пакетный рез по {batchSize}:</strong>{' '}
+                    {batchBarsUsed} заготовок пакетом ({packagesCount} пакетов), {tailBarsUsed} одиночно
+                    {nonMultipleDetails.length > 0 && (
+                      <>
+                        {' '}
+                        (детали с количеством, не кратным {batchSize}:{' '}
+                        {nonMultipleDetails
+                          .map((d) => `${d.length} мм — ${d.quantity} шт. (хвост ${d.tailQuantity})`)
+                          .join(', ')}
+                        )
+                      </>
+                    )}
+                  </>
+                ) : (
+                  <>
+                    <strong>Пакетный рез по {batchSize}:</strong> все заготовки пакетом ({batchBarsUsed} заготовок, {packagesCount} пакетов)
+                  </>
+                )}
+              </div>
+            );
+          })()}
+
           {/* Cutting Maps List */}
           <div className="space-y-6">
             {result.patterns.map((pattern) => {
               let progressiveStop = pattern.trimStart || 0;
-              const cutsCount = pattern.cuts.length + (pattern.trimStart > 0 ? 1 : 0) + 1;
-              const kerfLoss = params.bladeWidth * cutsCount;
+              const kerfLoss = pattern.totalKerfLength ?? 0;
               const reusableRemnantMm = pattern.reusableLength || (pattern.isReusableWaste ? pattern.wasteLength : 0);
               const scrapPart = pattern.scrapLength ?? (pattern.isReusableWaste ? 0 : pattern.wasteLength);
+              const offcutsMm = (pattern.trimStart || 0) + scrapPart;
 
-              // Format Отходы according to Requirement 10
-              let wasteText = '';
-              if (pattern.trimStart > 0 && scrapPart > 0) {
-                wasteText = `${pattern.trimStart}+${scrapPart} мм (лом), ${kerfLoss} мм (стружка)`;
-              } else if (scrapPart > 0) {
-                wasteText = `${scrapPart} мм (лом), ${kerfLoss} мм (стружка)`;
-              } else if (pattern.trimStart > 0) {
-                wasteText = `${pattern.trimStart} мм (лом), ${kerfLoss} мм (стружка)`;
-              } else {
-                wasteText = `${kerfLoss} мм (стружка)`;
-              }
+              const offcutsDetail =
+                pattern.trimStart > 0 && scrapPart > 0
+                  ? `${offcutsMm} мм (${pattern.trimStart} торц. + ${scrapPart} обр.)`
+                  : `${offcutsMm} мм`;
+
+              const batchSize =
+                params.groupSolutions !== false ? result.batchInfo?.batchSize : undefined;
+              const split =
+                batchSize && batchSize >= 2
+                  ? getBatchRowSplit(pattern.count, batchSize)
+                  : null;
+              const showSingleBadge = split
+                ? split.batchCount === 0
+                : Boolean(pattern.isTailSingle);
 
               return (
                 <div
@@ -575,7 +651,7 @@ export const PrintReports: React.FC<PrintReportsProps> = ({
                   className="border border-slate-300 rounded-lg p-4 break-inside-avoid print:border-slate-800 space-y-3"
                 >
                   <div className="flex flex-wrap justify-between items-center pb-2 border-b border-slate-200 gap-2">
-                    <div className="flex items-center gap-2">
+                    <div className="flex flex-wrap items-center gap-2">
                       <span className="bg-slate-900 text-white font-mono font-bold text-xs px-2 py-0.5 rounded">
                         Карта #{pattern.patternIndex}
                       </span>
@@ -583,12 +659,20 @@ export const PrintReports: React.FC<PrintReportsProps> = ({
                         {pattern.stockName} — {pattern.stockLength} мм
                       </span>
                       <span className="text-xs font-bold text-blue-700 bg-blue-50 px-2 py-0.5 rounded font-mono">
-                        Количество хлыстов: {pattern.count} шт
+                        Количество профилей:{' '}
+                        {split && split.batchCount > 0 && split.singleCount > 0
+                          ? `${pattern.count} шт (${split.batchCount} пакетом + ${split.singleCount} одиночно)`
+                          : `${pattern.count} шт`}
                       </span>
+                      {showSingleBadge && (
+                        <span className="bg-amber-100 text-amber-900 border border-amber-300 font-semibold px-2 py-0.5 rounded text-[11px]">
+                          одиночный
+                        </span>
+                      )}
                     </div>
 
                     <div className="text-xs text-slate-700 font-mono">
-                      Отходы: <strong>{wasteText}</strong>
+                      Обрезки: <strong>{offcutsDetail}</strong> · Стружка: <strong>{kerfLoss} мм</strong>
                       {pattern.isReusableWaste && reusableRemnantMm > 0 && (
                         <span className="text-amber-800 font-bold ml-1.5">
                           · Деловой: {reusableRemnantMm} мм
@@ -657,13 +741,13 @@ export const PrintReports: React.FC<PrintReportsProps> = ({
                         });
                       })()}
 
-                      {(pattern.wasteLength > 0 || (pattern.isReusableWaste && reusableRemnantMm > 0)) && (
+                      {(pattern.isReusableWaste && reusableRemnantMm > 0 ? reusableRemnantMm > 0 : scrapPart > 0) && (
                         <div
                           style={{
                             width: `${(((pattern.isReusableWaste && reusableRemnantMm > 0 ? reusableRemnantMm : scrapPart) / pattern.stockLength) * 100)}%`,
                           }}
                           title={`${
-                            pattern.isReusableWaste && reusableRemnantMm > 0 ? 'Деловой остаток' : 'Невозвратный лом'
+                            pattern.isReusableWaste && reusableRemnantMm > 0 ? 'Деловой остаток' : 'Неделовой обрезок'
                           }: ${pattern.isReusableWaste && reusableRemnantMm > 0 ? reusableRemnantMm : scrapPart} мм`}
                           className={`h-full flex-1 flex items-center justify-center font-mono font-bold text-[10px] select-none px-1 border-l ${
                             highlightedCut?.patternId === pattern.id
@@ -676,7 +760,7 @@ export const PrintReports: React.FC<PrintReportsProps> = ({
                           }`}
                         >
                           <span>
-                            {pattern.isReusableWaste && reusableRemnantMm > 0 ? `${reusableRemnantMm} (Ост)` : `${scrapPart} (Лом)`}
+                            {pattern.isReusableWaste && reusableRemnantMm > 0 ? `${reusableRemnantMm} (Ост)` : `${scrapPart} (Обр)`}
                           </span>
                         </div>
                       )}
@@ -780,21 +864,21 @@ export const PrintReports: React.FC<PrintReportsProps> = ({
                           );
                         });
                       })()}
-                      {pattern.wasteLength > 0 && (
+                      {(reusableRemnantMm > 0 || scrapPart > 0) && (
                         <tr className={pattern.isReusableWaste ? 'bg-amber-50/60' : 'bg-slate-50'}>
                           <td className="py-1 px-2 text-center font-mono text-slate-400">—</td>
                           <td className="py-1 px-2 text-right font-mono text-slate-500 bg-blue-50/20">
                             Хвост: {pattern.stockLength} мм
                           </td>
                           <td className="py-1 px-2 font-semibold">
-                            {pattern.isReusableWaste
-                              ? `Деловой остаток (${pattern.wasteLength} мм)`
-                              : `Невозвратный лом (${pattern.wasteLength} мм)`}
+                            {pattern.isReusableWaste && reusableRemnantMm > 0
+                              ? `Деловой остаток (${reusableRemnantMm} мм)`
+                              : `Неделовой обрезок (${scrapPart} мм)`}
                           </td>
                           <td className="py-1 px-2 text-[11px]">
-                            {pattern.isReusableWaste
+                            {pattern.isReusableWaste && reusableRemnantMm > 0
                               ? 'Промаркировать и оприходовать на склад'
-                              : 'В бункер стружки'}
+                              : 'В контейнер обрезков'}
                           </td>
                         </tr>
                       )}

@@ -6,6 +6,14 @@ import {
   AppSettings,
   RemnantItem,
 } from '../types/cutting';
+import { getRowWasteBreakdown, getSolutionWasteBreakdown } from './wasteBreakdown';
+import {
+  computeCuttingIndexFromSolution,
+  computeCuttingIndexScale,
+  computeMaxReusableRemnantFromSolution,
+  getBatchRowSplit,
+} from './cutting/metrics';
+import { resolveIndexTargetRemnantLength } from './cuttingEngine';
 
 export interface ExportableItem {
   length: number;
@@ -263,10 +271,8 @@ export function parseItemsFromCsv(text: string): ExportableItem[] {
     let notes = '';
 
     // Check if first col is index (№)
-    let colOffset = 0;
     if (parts.length >= 3 && /^\d+$/.test(parts[0]) && isNaN(parseFloat(parts[1]))) {
       // Format: №, Обозначение, Длина, Кол-во, Примечание
-      colOffset = 1;
       mark = parts[1];
       len = parseFloat(parts[2]?.replace(',', '.'));
       qty = parseFloat(parts[3]?.replace(',', '.'));
@@ -656,6 +662,17 @@ export function exportSolutionToExcel(
   demandInput: DemandItem[]
 ) {
   const wb = XLSX.utils.book_new();
+  const solWb = getSolutionWasteBreakdown(solution);
+  const maxRemnantMm = computeMaxReusableRemnantFromSolution(solution);
+  const cuttingIndexInfo = computeCuttingIndexFromSolution(
+    solution,
+    stockInput,
+    resolveIndexTargetRemnantLength(settings)
+  );
+  const cuttingIndexScale = computeCuttingIndexScale(cuttingIndexInfo.cuttingIndex);
+
+  const batchInfo = solution.batchInfo;
+  const isGrouped = settings.groupSolutions !== false;
 
   // 1. Лист «Решение раскроя»
   const solutionData: (string | number)[][] = [
@@ -666,25 +683,77 @@ export function exportSolutionToExcel(
     ['СВОДНЫЕ ПОКАЗАТЕЛИ'],
     ['КОЛИЧЕСТВО НАЛАДОК:', `${solution.rows.length}`],
     ['Использовано заготовок (всего):', `${solution.totalBarsUsed} шт.`],
-    ['Суммарная длина материала:', `${solution.totalStockLength.toLocaleString('ru-RU')} мм (${(solution.totalStockLength / 1000).toFixed(2)} м)`],
-    ['Деловой отход:', `${solution.totalReusableLength.toLocaleString('ru-RU')} мм (${(solution.totalReusableLength / 1000).toFixed(2)} м)`],
-    ['Отход (лом):', `${solution.totalWasteLength.toLocaleString('ru-RU')} мм (${(solution.totalWasteLength / 1000).toFixed(2)} м)`],
-    [],
-    ['ДЕТАЛИЗИРОВАННЫЕ КАРТЫ РАСКРОЯ'],
-    ['Карта №', 'Количество (шт)', 'Длина хлыста (мм)', 'Расход (мм)', 'Деловой отход (мм)', 'Отход/Лом (мм)', 'КИМ (%)', 'Раскрой (математическая запись)'],
   ];
 
+  if (batchInfo) {
+    const packagesCount = Math.floor(batchInfo.batchBarsUsed / batchInfo.batchSize);
+    const batchSummaryText =
+      batchInfo.tailBarsUsed > 0 || batchInfo.nonMultipleDetails.length > 0
+        ? `${batchInfo.batchBarsUsed} заготовок пакетом (${packagesCount} пакетов), ${batchInfo.tailBarsUsed} одиночно` +
+          (batchInfo.nonMultipleDetails.length > 0
+            ? ` (детали с количеством, не кратным ${batchInfo.batchSize}: ${batchInfo.nonMultipleDetails
+                .map((d) => `${d.length} мм — ${d.quantity} шт. (хвост ${d.tailQuantity})`)
+                .join(', ')})`
+            : '')
+        : `все заготовки пакетом (${batchInfo.batchBarsUsed} заготовок, ${packagesCount} пакетов)`;
+    solutionData.push([`Пакетный рез по ${batchInfo.batchSize}:`, batchSummaryText]);
+  }
+
+  solutionData.push(
+    ['Суммарная длина материала:', `${solution.totalStockLength.toLocaleString('ru-RU')} мм (${(solution.totalStockLength / 1000).toFixed(2)} м)`],
+    ['Деловой остаток:', `${solution.totalReusableLength.toLocaleString('ru-RU')} мм (${(solution.totalReusableLength / 1000).toFixed(2)} м)`],
+    ['Макс. деловой остаток:', maxRemnantMm > 0 ? `${maxRemnantMm.toLocaleString('ru-RU')} мм (${(maxRemnantMm / 1000).toFixed(2)} м)` : '0 мм'],
+    ['Индекс (шкала 0–100):', cuttingIndexScale],
+    ['Индекс (сырой):', cuttingIndexInfo.cuttingIndex.toFixed(3)],
+    ['Отходы всего (обрезки + стружка):', `${solWb.totalWasteMm.toLocaleString('ru-RU')} мм (${(solWb.totalWasteMm / 1000).toFixed(2)} м)`],
+    ['  в т.ч. обрезки (торцовка + неделовой остаток):', `${solWb.offcutsMm.toLocaleString('ru-RU')} мм (${(solWb.offcutsMm / 1000).toFixed(2)} м)`],
+    ['  в т.ч. стружка (потери на рез):', `${solWb.kerfMm.toLocaleString('ru-RU')} мм (${(solWb.kerfMm / 1000).toFixed(2)} м)`],
+    [],
+    ['ДЕТАЛИЗИРОВАННЫЕ КАРТЫ РАСКРОЯ'],
+    batchInfo && isGrouped
+      ? ['Карта №', 'Количество (шт)', 'Пакетом (шт)', 'Одиночно (шт)', 'Режим резки', 'Длина профиля (мм)', 'Расход (мм)', 'Деловой остаток (мм)', 'Обрезки (мм)', 'Стружка (мм)', 'Отходы всего (мм)', 'КИМ (%)', 'Раскрой (математическая запись)']
+      : ['Карта №', 'Количество (шт)', 'Длина профиля (мм)', 'Расход (мм)', 'Деловой остаток (мм)', 'Обрезки (мм)', 'Стружка (мм)', 'Отходы всего (мм)', 'КИМ (%)', 'Раскрой (математическая запись)']
+  );
+
   solution.rows.forEach((row) => {
-    solutionData.push([
-      `Карта №${row.barIndex}`,
-      row.barsCount,
-      row.barSize,
-      row.spent,
-      row.isReusable ? (row.reusableRemnant || 0) : 0,
-      row.waste,
-      `${row.efficiency}%`,
-      row.formula,
-    ]);
+    const rowWb = getRowWasteBreakdown(row);
+    if (batchInfo && isGrouped) {
+      const split = getBatchRowSplit(row.barsCount, batchInfo.batchSize);
+      const modeText =
+        split.batchCount > 0 && split.singleCount > 0
+          ? `${row.barsCount} шт (${split.batchCount} пакетом + ${split.singleCount} одиночно)`
+          : split.batchCount === 0
+          ? 'одиночный'
+          : `пакет по ${batchInfo.batchSize}`;
+      solutionData.push([
+        `Карта №${row.barIndex}`,
+        row.barsCount,
+        split.batchCount,
+        split.singleCount,
+        modeText,
+        row.barSize,
+        row.spent,
+        row.isReusable ? (row.reusableRemnant || 0) : 0,
+        rowWb.offcutsMm,
+        rowWb.kerfMm,
+        rowWb.totalWasteMm,
+        `${row.efficiency}%`,
+        row.formula,
+      ]);
+    } else {
+      solutionData.push([
+        `Карта №${row.barIndex}`,
+        row.barsCount,
+        row.barSize,
+        row.spent,
+        row.isReusable ? (row.reusableRemnant || 0) : 0,
+        rowWb.offcutsMm,
+        rowWb.kerfMm,
+        rowWb.totalWasteMm,
+        `${row.efficiency}%`,
+        row.formula,
+      ]);
+    }
   });
 
   const wsSolution = XLSX.utils.aoa_to_sheet(solutionData);

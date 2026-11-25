@@ -3,14 +3,11 @@ import {
   CheckCircle2,
   ArrowRight,
   Cpu,
-  RefreshCw,
-  Sliders,
   Scale,
   Check,
   X,
   PackageCheck,
   AlertTriangle,
-  HelpCircle,
   ArrowUpDown,
   ArrowUp,
   ArrowDown,
@@ -28,7 +25,8 @@ import {
   Sparkles,
   Loader2,
   Play,
-  Activity,
+  Table2,
+  Columns3,
 } from 'lucide-react';
 import {
   FullOptimizationSolution,
@@ -39,16 +37,36 @@ import {
   DemandItem,
 } from '../types/cutting';
 import {
+  DEFICIT_OPTIMIZATION_OPTIONS,
+  OPTIMIZATION_OPTIONS,
+  formatCuttingIndexRowTooltip,
+  formatUnplacedDeficitTooltip,
+  getComparisonMetricHelp,
+  getOptimizationBadge,
+  getOptimizationLabel,
+  getSearchSpeedLabel,
+} from '../constants/cuttingHelp';
+import {
   estimateCalculationComplexity,
   runComprehensiveSuite,
+  runBalanceSuite,
   solveNaiveSequentialCutting,
   solveLinearCutting,
   getPrimaryStandardSize,
   ComprehensiveSuiteItem,
   getDefaultDemandColor,
+  getDefaultCustomConfig,
+  computeCuttingIndexFromSolution,
+  computeCuttingIndexScale,
+  computeMaxReusableRemnantFromSolution,
+  resolveIndexTargetRemnantLength,
+  executeWorkerPool,
+  getAvailableHelperThreadLimit,
 } from '../utils/cuttingEngine';
+import type { WorkerInMessage, WorkerOutMessage } from '../workers/cuttingWorker';
+import { getSolutionWasteBreakdown } from '../utils/wasteBreakdown';
 import { DynamicRowItem } from './DynamicInputBlock';
-import { AuditTelemetryModal } from './AuditTelemetryModal';
+import { CuttingStatsTable } from './CuttingStatsTable';
 
 export interface CalculationRun {
   id: string;
@@ -79,8 +97,104 @@ interface CalculationProgressModalProps {
   calcTriggerNonce?: number;
   stockItems?: DynamicRowItem[];
   demandItems?: DynamicRowItem[];
-  onSetDemandItems?: React.Dispatch<React.SetStateAction<DynamicRowItem[]>>;
 }
+
+type ComparisonColumnKey =
+  | 'index'
+  | 'standardSize'
+  | 'strategy'
+  | 'comments'
+  | 'speed'
+  | 'multiThread'
+  | 'exactSolver'
+  | 'prioritizeRemnants'
+  | 'remnantMinFill'
+  | 'shapeRemnants'
+  | 'bladeWidth'
+  | 'edgeTrim'
+  | 'reusableMin'
+  | 'reusableMode'
+  | 'dualProfile'
+  | 'batchSize'
+  | 'fillControl'
+  | 'groupSolutions'
+  | 'customParams'
+  | 'cuttingIndex'
+  | 'kim'
+  | 'netKim'
+  | 'cards'
+  | 'spent'
+  | 'reusable'
+  | 'maxReusable'
+  | 'offcuts'
+  | 'kerf'
+  | 'waste'
+  | 'select';
+
+interface ComparisonColumnDef {
+  key: ComparisonColumnKey;
+  label: string;
+}
+
+const COMPARISON_COLUMNS: readonly ComparisonColumnDef[] = [
+  { key: 'index', label: 'Вариант' },
+  { key: 'standardSize', label: 'Стандарт' },
+  { key: 'strategy', label: 'Стратегия' },
+  { key: 'comments', label: 'Комментарии' },
+  { key: 'speed', label: 'Глубина поиска' },
+  { key: 'multiThread', label: 'Многопоточность' },
+  { key: 'exactSolver', label: 'Точный (LP)' },
+  { key: 'prioritizeRemnants', label: 'Приоритет остатков' },
+  { key: 'remnantMinFill', label: 'Мин. зап. ост.' },
+  { key: 'shapeRemnants', label: 'Форм. деловые' },
+  { key: 'bladeWidth', label: 'Пропил (мм)' },
+  { key: 'edgeTrim', label: 'Кромка (мм)' },
+  { key: 'reusableMin', label: 'Порог ДО (мм)' },
+  { key: 'reusableMode', label: 'Режим порога ДО' },
+  { key: 'dualProfile', label: '2 проф.' },
+  { key: 'batchSize', label: 'Размер пакета' },
+  { key: 'fillControl', label: 'Контроль' },
+  { key: 'groupSolutions', label: 'Группировка' },
+  { key: 'customParams', label: 'Настройки польз.' },
+  { key: 'cuttingIndex', label: 'Индекс' },
+  { key: 'kim', label: 'КИМ (вал.)' },
+  { key: 'netKim', label: 'Мгн. КИМ' },
+  { key: 'cards', label: 'Карт' },
+  { key: 'spent', label: 'Расход (м)' },
+  { key: 'reusable', label: 'Деловой (м)' },
+  { key: 'maxReusable', label: 'Макс. остаток (м)' },
+  { key: 'offcuts', label: 'Обрезки (м)' },
+  { key: 'kerf', label: 'Стружка (м)' },
+  { key: 'waste', label: 'Отходы (м)' },
+  { key: 'select', label: 'Выбор' },
+];
+
+const DEFAULT_VISIBLE_COLUMNS: ComparisonColumnKey[] = [
+  'index',
+  'standardSize',
+  'cuttingIndex',
+  'cards',
+  'spent',
+  'select',
+];
+
+const COMPARISON_COLUMNS_STORAGE_KEY = 'cutmaster_comparison_columns_v1';
+
+const loadInitialVisibleColumns = (): ComparisonColumnKey[] => {
+  try {
+    const raw = localStorage.getItem(COMPARISON_COLUMNS_STORAGE_KEY);
+    if (!raw) return DEFAULT_VISIBLE_COLUMNS;
+    const parsed: unknown = JSON.parse(raw);
+    if (!Array.isArray(parsed)) return DEFAULT_VISIBLE_COLUMNS;
+    const validKeys = new Set<string>(COMPARISON_COLUMNS.map((c) => c.key));
+    const filtered = parsed.filter(
+      (item): item is ComparisonColumnKey => typeof item === 'string' && validKeys.has(item)
+    );
+    return filtered.length > 0 ? filtered : DEFAULT_VISIBLE_COLUMNS;
+  } catch {
+    return DEFAULT_VISIBLE_COLUMNS;
+  }
+};
 
 export const CalculationProgressModal: React.FC<CalculationProgressModalProps> = ({
   isOpen,
@@ -98,19 +212,16 @@ export const CalculationProgressModal: React.FC<CalculationProgressModalProps> =
   calcTriggerNonce,
   stockItems,
   demandItems,
-  onSetDemandItems,
 }) => {
   const [phase, setPhase] = useState<'calculating' | 'done'>('calculating');
-  const [activeSubTab, setActiveSubTab] = useState<'summary' | 'remnants'>('summary');
+  const [activeSubTab, setActiveSubTab] = useState<'summary' | 'details' | 'remnants'>('summary');
   const [modalSettings, setModalSettings] = useState<AppSettings>(settings);
   const [runs, setRuns] = useState<CalculationRun[]>([]);
   const [activeRunId, setActiveRunId] = useState<string>('');
   const [highlightedRunId, setHighlightedRunId] = useState<string | null>(null);
   const [duplicateWarning, setDuplicateWarning] = useState<string | null>(null);
-  const [isRecalculating, setIsRecalculating] = useState<boolean>(false);
   const [isStopping, setIsStopping] = useState<boolean>(false);
-  const [isAuditModalOpen, setIsAuditModalOpen] = useState<boolean>(false);
-  const [progressPercent, setProgressPercent] = useState<number>(10);
+  const [progressPercent, setProgressPercent] = useState<number>(0);
   const [statusText, setStatusText] = useState<string>('Инициализация параметров...');
 
   // Live worker execution states
@@ -118,7 +229,20 @@ export const CalculationProgressModal: React.FC<CalculationProgressModalProps> =
   const [maxObservedCards, setMaxObservedCards] = useState<number>(0);
   const [elapsedTimeMs, setElapsedTimeMs] = useState<number>(0);
   const workerRef = useRef<Worker | null>(null);
-  const stopwatchIntervalRef = useRef<any>(null);
+  const passWorkerPoolRef = useRef<Worker[]>([]);
+  const progressInfoRef = useRef<CalculationProgressInfo | null>(null);
+  const etaTrackerRef = useRef<{
+    phaseKey: string;
+    phaseStartTsMs: number;
+    samples: Array<{ tsMs: number; passes: number }>;
+    lastDisplayedEtaSec: number | null;
+  }>({
+    phaseKey: 'init',
+    phaseStartTsMs: 0,
+    samples: [],
+    lastDisplayedEtaSec: null,
+  });
+  const stopwatchIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const latestSolutionRef = useRef<FullOptimizationSolution | null>(null);
   const runsRef = useRef<CalculationRun[]>([]);
   const isStoppingRef = useRef<boolean>(false);
@@ -233,24 +357,76 @@ export const CalculationProgressModal: React.FC<CalculationProgressModalProps> =
   const [sortField, setSortField] = useState<
     | 'index'
     | 'standardSize'
-    | 'speed'
     | 'strategy'
-    | 'dualProfile'
-    | 'fillControl'
+    | 'comments'
+    | 'speed'
+    | 'multiThread'
+    | 'exactSolver'
+    | 'prioritizeRemnants'
+    | 'remnantMinFill'
+    | 'shapeRemnants'
+    | 'bladeWidth'
+    | 'edgeTrim'
     | 'reusableMin'
+    | 'reusableMode'
+    | 'dualProfile'
+    | 'batchSize'
+    | 'fillControl'
+    | 'groupSolutions'
+    | 'customParams'
+    | 'cuttingIndex'
     | 'kim'
     | 'netKim'
     | 'cards'
     | 'spent'
     | 'reusable'
+    | 'maxReusable'
+    | 'offcuts'
+    | 'kerf'
     | 'waste'
     | 'unplaced'
-  >('index');
-  const [sortDirection, setSortDirection] = useState<'asc' | 'desc'>('asc');
+  >('cuttingIndex');
+  const [sortDirection, setSortDirection] = useState<'asc' | 'desc'>('desc');
   const [filterStatus, setFilterStatus] = useState<'all' | 'complete' | 'unplaced'>('all');
   const [filterStrategy, setFilterStrategy] = useState<string>('all');
   const [filterStandardSize, setFilterStandardSize] = useState<'all' | '12000' | '6000'>('all');
   const [searchQuery, setSearchQuery] = useState<string>('');
+  const [visibleColumns, setVisibleColumns] = useState<ComparisonColumnKey[]>(loadInitialVisibleColumns);
+  const [isColumnsMenuOpen, setIsColumnsMenuOpen] = useState<boolean>(false);
+  const columnsMenuRef = useRef<HTMLDivElement | null>(null);
+
+  const visibleColSet = useMemo(() => new Set<ComparisonColumnKey>(visibleColumns), [visibleColumns]);
+
+  useEffect(() => {
+    try {
+      localStorage.setItem(COMPARISON_COLUMNS_STORAGE_KEY, JSON.stringify(visibleColumns));
+    } catch {
+      // Ignore storage quota errors
+    }
+  }, [visibleColumns]);
+
+  useEffect(() => {
+    if (!isColumnsMenuOpen) return;
+    const handleOutsideClick = (e: MouseEvent) => {
+      if (columnsMenuRef.current && !columnsMenuRef.current.contains(e.target as Node)) {
+        setIsColumnsMenuOpen(false);
+      }
+    };
+    document.addEventListener('mousedown', handleOutsideClick);
+    return () => document.removeEventListener('mousedown', handleOutsideClick);
+  }, [isColumnsMenuOpen]);
+
+  const toggleVisibleColumn = (colKey: ComparisonColumnKey) => {
+    setVisibleColumns((prev) => {
+      const exists = prev.includes(colKey);
+      if (exists) {
+        if (prev.length <= 1) return prev;
+        return prev.filter((k) => k !== colKey);
+      }
+      const nextSet = new Set<ComparisonColumnKey>([...prev, colKey]);
+      return COMPARISON_COLUMNS.map((c) => c.key).filter((k) => nextSet.has(k));
+    });
+  };
 
   // Pre-flight calculation complexity and volume assessment
   const complexityEstimate = useMemo<ComplexityEstimate | null>(() => {
@@ -263,10 +439,10 @@ export const CalculationProgressModal: React.FC<CalculationProgressModalProps> =
         length: s.length,
         quantity: s.quantity,
         isActive: s.isActive !== false,
-        isStandard: s.isStandard || s.length === 6000 || s.length === 12000,
+        isStandard: s.isStandard || s.length === 6000 || s.length === 12000 || s.length === 11700,
         isStandardUnlimited:
           s.isStandardUnlimited ||
-          ((s.length === 6000 || s.length === 12000) && s.quantity <= 0),
+          ((s.length === 6000 || s.length === 12000 || s.length === 11700) && s.quantity <= 0),
         mark: s.mark,
         notes: s.notes,
       }));
@@ -285,39 +461,72 @@ export const CalculationProgressModal: React.FC<CalculationProgressModalProps> =
     return estimateCalculationComplexity(stocks, demands, settings);
   }, [stockItems, demandItems, settings]);
 
+  const mappedStockItems = useMemo<StockItem[]>(
+    () =>
+      (stockItems || [])
+        .filter((s) => s.isActive !== false && s.length > 0)
+        .map((s) => ({
+          id: s.id,
+          orderIndex: s.orderIndex,
+          length: s.length,
+          quantity: s.quantity,
+          isActive: s.isActive !== false,
+          isStandard: s.isStandard || s.length === 6000 || s.length === 12000 || s.length === 11700,
+          isStandardUnlimited:
+            s.isStandardUnlimited ||
+            ((s.length === 6000 || s.length === 12000 || s.length === 11700) && s.quantity <= 0),
+          mark: s.mark,
+          notes: s.notes,
+        })),
+    [stockItems]
+  );
+
+  const liveTargetRemnantMinLength = resolveIndexTargetRemnantLength(settings);
+
   const areSettingsEqual = (a: AppSettings, b: AppSettings): boolean => {
     const basicEqual =
       a.bladeWidth === b.bladeWidth &&
       a.edgeTrim === b.edgeTrim &&
       a.reusableRemnantMin === b.reusableRemnantMin &&
-      (a.targetRemnantMinLength ?? 1500) === (b.targetRemnantMinLength ?? 1500) &&
-      a.cutAngle45 === b.cutAngle45 &&
-      a.dualProfileCut === b.dualProfileCut &&
+      (a.reusableRemnantMode ?? 'manual') === (b.reusableRemnantMode ?? 'manual') &&
+      (a.shapeRemnantsInSearch ?? false) === (b.shapeRemnantsInSearch ?? false) &&
+      (a.shapeRemnantsThresholdPct ?? 50) === (b.shapeRemnantsThresholdPct ?? 50) &&
+      (a.cutAngle45 ?? false) === (b.cutAngle45 ?? false) &&
+      (a.dualProfileCut ?? false) === (b.dualProfileCut ?? false) &&
+      (a.batchSizeMode ?? 'auto') === (b.batchSizeMode ?? 'auto') &&
+      (a.batchSizeN ?? 2) === (b.batchSizeN ?? 2) &&
+      (a.prioritizeRemnants ?? false) === (b.prioritizeRemnants ?? false) &&
+      (a.remnantMinFillPct ?? a.targetRemnantKIM ?? 75) ===
+        (b.remnantMinFillPct ?? b.targetRemnantKIM ?? 75) &&
       (a.fillControlEnabled ?? false) === (b.fillControlEnabled ?? false) &&
       (a.fillControlThreshold ?? 50) === (b.fillControlThreshold ?? 50) &&
+      (a.groupSolutions ?? true) === (b.groupSolutions ?? true) &&
+      (a.showGraphics ?? true) === (b.showGraphics ?? true) &&
       a.searchSpeed === b.searchSpeed &&
+      (a.multiThreadEnabled ?? false) === (b.multiThreadEnabled ?? false) &&
+      (a.exactSolverEnabled ?? false) === (b.exactSolverEnabled ?? false) &&
       a.optimizationGoal === b.optimizationGoal &&
-      a.targetRemnantKIM === b.targetRemnantKIM;
+      (a.material ?? '') === (b.material ?? '') &&
+      (a.orderNumber ?? '') === (b.orderNumber ?? '') &&
+      (a.orderComment ?? '') === (b.orderComment ?? '') &&
+      (a.isMaterialLocked ?? false) === (b.isMaterialLocked ?? false) &&
+      (a.materialLockSource ?? null) === (b.materialLockSource ?? null);
 
     if (!basicEqual) return false;
 
-    if (a.optimizationGoal === 'custom' || b.optimizationGoal === 'custom') {
-      const cA = a.customStrategyConfig;
-      const cB = b.customStrategyConfig;
-      if (!cA && !cB) return true;
-      if (!cA || !cB) return false;
-      return (
-        cA.maxPassesMultiplier === cB.maxPassesMultiplier &&
-        cA.enable2Opt === cB.enable2Opt &&
-        cA.twoOptRounds === cB.twoOptRounds &&
-        cA.enableTailConsolidation === cB.enableTailConsolidation &&
-        cA.tailConsolidationMaxBars === cB.tailConsolidationMaxBars &&
-        cA.cardMergeScrapToleranceMm === cB.cardMergeScrapToleranceMm &&
-        cA.preferFewerCards === cB.preferFewerCards
-      );
-    }
-
-    return true;
+    const defaults = getDefaultCustomConfig();
+    const cA = { ...defaults, ...(a.customStrategyConfig || {}) };
+    const cB = { ...defaults, ...(b.customStrategyConfig || {}) };
+    return (
+      cA.maxPassesMultiplier === cB.maxPassesMultiplier &&
+      cA.enable2Opt === cB.enable2Opt &&
+      cA.twoOptRounds === cB.twoOptRounds &&
+      cA.enableTailConsolidation === cB.enableTailConsolidation &&
+      cA.tailConsolidationMaxBars === cB.tailConsolidationMaxBars &&
+      cA.cardMergeScrapToleranceMm === cB.cardMergeScrapToleranceMm &&
+      cA.preferFewerCards === cB.preferFewerCards &&
+      cA.remnantTargetMinLength === cB.remnantTargetMinLength
+    );
   };
 
   const formatStopwatch = (ms: number): string => {
@@ -330,31 +539,87 @@ export const CalculationProgressModal: React.FC<CalculationProgressModalProps> =
     return `${mm}:${ss}.${tenths}`;
   };
 
-  const formatETA = (progress: CalculationProgressInfo | null, elapsedMs: number): string => {
-    if (!progress) return 'Оценка...';
-    if (progress.etaSeconds !== undefined) {
-      if (progress.etaSeconds <= 0) return 'Завершение...';
-      if (progress.etaSeconds < 2) return 'Менее 2 сек';
-      if (progress.etaSeconds < 60) return `~${progress.etaSeconds} сек`;
-      const min = Math.floor(progress.etaSeconds / 60);
-      const sec = progress.etaSeconds % 60;
-      return `~${min} мин ${sec} сек`;
+  const formatDuration = (seconds: number): string => {
+    const safeSec = Math.max(0, Math.round(seconds));
+    if (safeSec < 60) {
+      return `${safeSec} сек`;
     }
-    if (progress.percent > 5) {
-      const totalEstMs = (elapsedMs / progress.percent) * 100;
-      const remainingSec = Math.max(0, Math.round((totalEstMs - elapsedMs) / 1000));
-      return remainingSec <= 0 ? 'Завершение...' : `~${remainingSec} сек`;
+    if (safeSec < 3600) {
+      const m = Math.floor(safeSec / 60);
+      const s = safeSec % 60;
+      return `${m} мин ${s} сек`;
     }
-    return 'Оценка...';
+    const h = Math.floor(safeSec / 3600);
+    const m = Math.floor((safeSec % 3600) / 60);
+    return `${h} ч ${m} мин`;
   };
 
-  // Cleanup on unmount
+  const roundEtaSeconds = (rawSec: number): number => {
+    const clamped = Math.max(0, rawSec);
+    if (clamped < 60) {
+      return Math.round(clamped);
+    }
+    return Math.round(clamped / 10) * 10;
+  };
+
+  const getEtaOrStepDisplay = (
+    progress: CalculationProgressInfo | null
+  ): { label: string; value: string } => {
+    if (!progress) {
+      return { label: 'Осталось (перебор)', value: 'Оценка...' };
+    }
+    const isMeasurable = Boolean(
+      progress.hasMeasurableProgress &&
+        progress.totalPasses &&
+        progress.totalPasses > 0 &&
+        progress.viewedPasses !== undefined
+    );
+    if (!isMeasurable) {
+      const tracker = etaTrackerRef.current;
+      const stepElapsedSec =
+        tracker.phaseStartTsMs > 0
+          ? Math.max(0, (performance.now() - tracker.phaseStartTsMs) / 1000)
+          : 0;
+      return {
+        label: 'Текущий шаг',
+        value: `${progress.stageName} · прошло ${formatDuration(stepElapsedSec)}`,
+      };
+    }
+    if (progress.viewedPasses! >= progress.totalPasses!) {
+      return { label: 'Осталось (перебор)', value: 'Завершение...' };
+    }
+    const etaSec = etaTrackerRef.current.lastDisplayedEtaSec;
+    if (etaSec === null) {
+      return { label: 'Осталось (перебор)', value: 'Оценка...' };
+    }
+    if (etaSec <= 0) {
+      return { label: 'Осталось (перебор)', value: 'Завершение...' };
+    }
+    return {
+      label: 'Осталось (перебор)',
+      value: `~${formatDuration(etaSec)}`,
+    };
+  };
+
+  // Cleanup persistent workers strictly on unmount or page unload
   useEffect(() => {
-    return () => {
+    const terminatePersistentWorkers = () => {
       if (workerRef.current) {
         workerRef.current.terminate();
         workerRef.current = null;
       }
+      if (passWorkerPoolRef.current.length > 0) {
+        for (const hw of passWorkerPoolRef.current) {
+          hw.terminate();
+        }
+        passWorkerPoolRef.current = [];
+      }
+    };
+
+    window.addEventListener('beforeunload', terminatePersistentWorkers);
+    return () => {
+      window.removeEventListener('beforeunload', terminatePersistentWorkers);
+      terminatePersistentWorkers();
       if (stopwatchIntervalRef.current) {
         clearInterval(stopwatchIntervalRef.current);
         stopwatchIntervalRef.current = null;
@@ -437,23 +702,26 @@ export const CalculationProgressModal: React.FC<CalculationProgressModalProps> =
     onFinished?: (sol: FullOptimizationSolution) => void
   ) => {
     setPhase('calculating');
-    setProgressPercent(10);
+    setProgressPercent(0);
     setStatusText('Инициализация параметров и подготовка заготовок...');
     setElapsedTimeMs(0);
     setProgressInfo(null);
+    progressInfoRef.current = null;
     setMaxObservedCards(0);
     latestSolutionRef.current = null;
 
-    if (workerRef.current) {
-      workerRef.current.terminate();
-      workerRef.current = null;
-    }
     if (stopwatchIntervalRef.current) {
       clearInterval(stopwatchIntervalRef.current);
       stopwatchIntervalRef.current = null;
     }
 
     const startPerfTime = performance.now();
+    etaTrackerRef.current = {
+      phaseKey: 'init',
+      phaseStartTsMs: startPerfTime,
+      samples: [],
+      lastDisplayedEtaSec: null,
+    };
     stopwatchIntervalRef.current = setInterval(() => {
       setElapsedTimeMs(performance.now() - startPerfTime);
     }, 40);
@@ -467,10 +735,10 @@ export const CalculationProgressModal: React.FC<CalculationProgressModalProps> =
         length: s.length,
         quantity: s.quantity,
         isActive: s.isActive !== false,
-        isStandard: s.isStandard || s.length === 6000 || s.length === 12000,
+        isStandard: s.isStandard || s.length === 6000 || s.length === 12000 || s.length === 11700,
         isStandardUnlimited:
           s.isStandardUnlimited ||
-          ((s.length === 6000 || s.length === 12000) && s.quantity <= 0),
+          ((s.length === 6000 || s.length === 12000 || s.length === 11700) && s.quantity <= 0),
         mark: s.mark,
         notes: s.notes,
       }));
@@ -491,28 +759,35 @@ export const CalculationProgressModal: React.FC<CalculationProgressModalProps> =
     isStoppingRef.current = false;
 
     // Point 5: Generate Baselines (Эталон-12 и Эталон-6) as references
-    let baseRuns = ensureBaselines(existingRunsList, stocks, demands, settingsToRun, inputSignature);
+    const baseRuns = ensureBaselines(existingRunsList, stocks, demands, settingsToRun, inputSignature);
     setRuns(baseRuns);
     runsRef.current = baseRuns;
+
+    const formatAbortedStatus = (abortedInfo?: { viewedPasses: number; totalPasses: number }): string => {
+      if (abortedInfo) {
+        return `Расчёт прерван: просмотрено ${abortedInfo.viewedPasses} из ${abortedInfo.totalPasses} проходов`;
+      }
+      const pInfo = progressInfoRef.current;
+      if (pInfo?.viewedPasses !== undefined && pInfo?.totalPasses !== undefined) {
+        return `Расчёт прерван: просмотрено ${pInfo.viewedPasses} из ${pInfo.totalPasses} проходов`;
+      }
+      return 'Расчёт прерван: сохранен лучший найденный вариант';
+    };
 
     const finishRun = (sol: FullOptimizationSolution) => {
       if (stopwatchIntervalRef.current) {
         clearInterval(stopwatchIntervalRef.current);
         stopwatchIntervalRef.current = null;
       }
-      if (workerRef.current) {
-        workerRef.current.terminate();
-        workerRef.current = null;
-      }
 
-      const isStopped = isStoppingRef.current;
+      const isStopped = isStoppingRef.current || Boolean(sol.abortedInfo);
       const currentBase = runsRef.current && runsRef.current.length > 0 ? runsRef.current : baseRuns;
       const nextIndex = currentBase.filter((r) => r.index > 0).length + 1;
       const newRun: CalculationRun = {
         id: `run_${Date.now()}_${nextIndex}`,
         index: nextIndex,
-        title: isStopped ? `Расчет #${nextIndex} (Остановлен)` : `Расчет #${nextIndex}`,
-        badge: isStopped ? 'Остановлен' : undefined,
+        title: isStopped ? `Расчет #${nextIndex} (Прерван)` : `Расчет #${nextIndex}`,
+        badge: isStopped ? 'Прерван' : undefined,
         timestamp: Date.now(),
         settings: { ...settingsToRun },
         solution: sol,
@@ -526,9 +801,8 @@ export const CalculationProgressModal: React.FC<CalculationProgressModalProps> =
       if (onSaveRuns) onSaveRuns(updated);
       if (onApplySolutionAndSettings) onApplySolutionAndSettings(sol, settingsToRun);
       setProgressPercent(100);
-      setStatusText(isStopped ? 'Расчет остановлен и сохранен текущий результат' : 'Расчет успешно выполнен!');
+      setStatusText(isStopped ? formatAbortedStatus(sol.abortedInfo) : 'Расчет успешно выполнен!');
       setPhase('done');
-      setIsRecalculating(false);
       setIsStopping(false);
       isStoppingRef.current = false;
       if (onFinished) onFinished(sol);
@@ -542,10 +816,11 @@ export const CalculationProgressModal: React.FC<CalculationProgressModalProps> =
         clearInterval(stopwatchIntervalRef.current);
         stopwatchIntervalRef.current = null;
       }
-      if (workerRef.current) {
-        workerRef.current.terminate();
-        workerRef.current = null;
-      }
+
+      const abortedInfo =
+        suite.find((item) => item.solution.abortedInfo)?.solution.abortedInfo ||
+        bestSol.abortedInfo;
+      const isStopped = isStoppingRef.current || Boolean(abortedInfo);
 
       const currentBase = runsRef.current && runsRef.current.length > 0 ? runsRef.current : baseRuns;
       let curIdx = currentBase.filter((r) => r.index > 0).length;
@@ -582,41 +857,143 @@ export const CalculationProgressModal: React.FC<CalculationProgressModalProps> =
       if (onSaveRuns) onSaveRuns(updated);
 
       setProgressPercent(100);
-      setStatusText('Комплексный расчет выполнен! Добавлено 4 стратегии для сравнения.');
+      setStatusText(
+        isStopped
+          ? formatAbortedStatus(abortedInfo)
+          : settingsToRun.optimizationGoal === 'balance'
+            ? `Расчет «Баланс» выполнен! Вариантов в сравнении: ${suite.length}.`
+            : `Комплексный расчет выполнен! Вариантов для сравнения: ${suite.length}.`
+      );
       setPhase('done');
-      setIsRecalculating(false);
       setIsStopping(false);
       isStoppingRef.current = false;
       if (onFinished && bestRun) onFinished(bestRun.solution);
     };
 
     try {
-      const worker = new Worker(new URL('../workers/cuttingWorker.ts', import.meta.url), {
-        type: 'module',
-      });
+      const worker =
+        workerRef.current ||
+        new Worker(new URL('../workers/cuttingWorker.ts', import.meta.url), {
+          type: 'module',
+        });
       workerRef.current = worker;
 
-      worker.onmessage = (e: MessageEvent<any>) => {
-        const { type, payload } = e.data;
-        if (type === 'PROGRESS') {
+      worker.onmessage = (e: MessageEvent<WorkerOutMessage>) => {
+        const msg = e.data;
+        if (msg.type === 'PROGRESS') {
+          const payload = msg.payload;
+          const nowMs = performance.now();
+          const isMeasurable = Boolean(
+            payload.hasMeasurableProgress &&
+              payload.totalPasses &&
+              payload.totalPasses > 0 &&
+              payload.viewedPasses !== undefined
+          );
+          const normalizedStepName = (payload.stageStepName ?? '')
+            .replace(/\s*\([^)]*\d+\s*\/\s*\d+[^)]*\)/g, '')
+            .replace(/\s*·\s*карт:\s*\d+/gi, '')
+            .trim();
+          const nextPhaseKey = isMeasurable
+            ? `M:${payload.stage}:${payload.totalPasses}`
+            : `U:${payload.stage}:${normalizedStepName}`;
+
+          const tracker = etaTrackerRef.current;
+          const lastSample = tracker.samples[tracker.samples.length - 1];
+          const passesRestarted =
+            isMeasurable &&
+            lastSample !== undefined &&
+            payload.viewedPasses !== undefined &&
+            payload.viewedPasses < lastSample.passes;
+
+          if (tracker.phaseKey !== nextPhaseKey || passesRestarted) {
+            tracker.phaseKey = nextPhaseKey;
+            tracker.phaseStartTsMs = nowMs;
+            tracker.samples = isMeasurable
+              ? [{ tsMs: nowMs, passes: payload.viewedPasses ?? 0 }]
+              : [];
+            tracker.lastDisplayedEtaSec = null;
+          } else if (isMeasurable && payload.viewedPasses !== undefined) {
+            const viewed = payload.viewedPasses;
+            const total = payload.totalPasses || 0;
+            if (!lastSample || viewed > lastSample.passes) {
+              tracker.samples.push({ tsMs: nowMs, passes: viewed });
+              if (tracker.samples.length > 10) {
+                tracker.samples.shift();
+              }
+            }
+            if (tracker.samples.length >= 4 && total > 0 && viewed / total >= 0.05) {
+              const first = tracker.samples[0];
+              const latest = tracker.samples[tracker.samples.length - 1];
+              const deltaPasses = latest.passes - first.passes;
+              const deltaSec = (latest.tsMs - first.tsMs) / 1000;
+              const stageElapsedSec = (nowMs - tracker.phaseStartTsMs) / 1000;
+              const rate =
+                deltaPasses > 0 && deltaSec >= 0.05
+                  ? deltaPasses / deltaSec
+                  : latest.passes > 0 && stageElapsedSec >= 0.05
+                    ? latest.passes / stageElapsedSec
+                    : 0;
+
+              if (rate > 0 && viewed > 0) {
+                const remainingPasses = Math.max(0, total - viewed);
+                const rawEtaSec = remainingPasses / rate;
+                const roundedEta = roundEtaSeconds(rawEtaSec);
+                const prevEta = tracker.lastDisplayedEtaSec;
+                let nextEta = roundedEta;
+                if (prevEta !== null && roundedEta > prevEta && roundedEta <= prevEta * 1.2) {
+                  nextEta = prevEta;
+                }
+                tracker.lastDisplayedEtaSec = nextEta;
+              }
+            }
+          }
+
+          progressInfoRef.current = payload;
           setProgressInfo(payload);
           setProgressPercent(payload.percent);
           setStatusText(payload.stageName);
           if (payload.uniqueCardsCount && payload.uniqueCardsCount > 0) {
-            setMaxObservedCards((prev) => Math.max(prev, payload.uniqueCardsCount));
+            setMaxObservedCards((prev) => Math.max(prev, payload.uniqueCardsCount || 0));
           }
-        } else if (type === 'COMPREHENSIVE_DONE') {
-          latestSolutionRef.current = payload.bestSolution;
-          finishComprehensiveSuite(payload.suite, payload.bestSolution);
-        } else if (type === 'DONE') {
-          latestSolutionRef.current = payload;
-          finishRun(payload);
-        } else if (type === 'ERROR') {
-          console.error('Worker returned error:', payload);
-          // Fallback to sync
+        } else if (msg.type === 'RUN_POOL_IN_MAIN') {
+          const { reqId, request } = msg.payload;
+          void executeWorkerPool({
+            poolCache: passWorkerPoolRef.current,
+            createWorker: () =>
+              new Worker(new URL('../workers/passWorker.ts', import.meta.url), {
+                type: 'module',
+              }),
+            request,
+            maxHelpers: getAvailableHelperThreadLimit(),
+            shouldAbort: () => isStoppingRef.current,
+            onProgress: (progress) => {
+              const progressMsg: WorkerInMessage = {
+                type: 'POOL_PROGRESS',
+                payload: { reqId, progress },
+              };
+              worker.postMessage(progressMsg);
+            },
+          }).then((result) => {
+            const resultMsg: WorkerInMessage = {
+              type: 'POOL_RESULT',
+              payload: { reqId, result },
+            };
+            worker.postMessage(resultMsg);
+          });
+        } else if (msg.type === 'COMPREHENSIVE_DONE') {
+          latestSolutionRef.current = msg.payload.bestSolution;
+          finishComprehensiveSuite(msg.payload.suite, msg.payload.bestSolution);
+        } else if (msg.type === 'DONE') {
+          latestSolutionRef.current = msg.payload;
+          finishRun(msg.payload);
+        } else if (msg.type === 'ERROR') {
+          console.error('Worker returned error:', msg.payload);
           if (settingsToRun.optimizationGoal === 'comprehensive') {
             const comp = runComprehensiveSuite(stocks, demands, settingsToRun);
             finishComprehensiveSuite(comp.suite, comp.bestSolution);
+          } else if (settingsToRun.optimizationGoal === 'balance') {
+            const bal = runBalanceSuite(stocks, demands, settingsToRun);
+            finishComprehensiveSuite(bal.suite, bal.bestSolution);
           } else {
             const sol = onExecuteCalculation(settingsToRun);
             finishRun(sol);
@@ -626,16 +1003,20 @@ export const CalculationProgressModal: React.FC<CalculationProgressModalProps> =
 
       worker.onerror = (err) => {
         console.warn('Worker runtime error, falling back to sync:', err);
+        workerRef.current = null;
         if (settingsToRun.optimizationGoal === 'comprehensive') {
           const comp = runComprehensiveSuite(stocks, demands, settingsToRun);
           finishComprehensiveSuite(comp.suite, comp.bestSolution);
+        } else if (settingsToRun.optimizationGoal === 'balance') {
+          const bal = runBalanceSuite(stocks, demands, settingsToRun);
+          finishComprehensiveSuite(bal.suite, bal.bestSolution);
         } else {
           const sol = onExecuteCalculation(settingsToRun);
           finishRun(sol);
         }
       };
 
-      worker.postMessage({
+      const startMsg: WorkerInMessage = {
         type: 'START',
         payload: {
           stockInput: stocks,
@@ -643,7 +1024,8 @@ export const CalculationProgressModal: React.FC<CalculationProgressModalProps> =
           settings: settingsToRun,
           isComprehensive: settingsToRun.optimizationGoal === 'comprehensive',
         },
-      });
+      };
+      worker.postMessage(startMsg);
     } catch (err) {
       console.warn('Worker spawn error, using synchronous execution:', err);
       setTimeout(() => {
@@ -651,6 +1033,9 @@ export const CalculationProgressModal: React.FC<CalculationProgressModalProps> =
           if (settingsToRun.optimizationGoal === 'comprehensive') {
             const comp = runComprehensiveSuite(stocks, demands, settingsToRun);
             finishComprehensiveSuite(comp.suite, comp.bestSolution);
+          } else if (settingsToRun.optimizationGoal === 'balance') {
+            const bal = runBalanceSuite(stocks, demands, settingsToRun);
+            finishComprehensiveSuite(bal.suite, bal.bestSolution);
           } else {
             const sol = onExecuteCalculation(settingsToRun);
             finishRun(sol);
@@ -658,90 +1043,24 @@ export const CalculationProgressModal: React.FC<CalculationProgressModalProps> =
         } catch (e) {
           console.error('Calculation execution error:', e);
           setPhase('done');
-          setIsRecalculating(false);
         }
       }, 50);
     }
   };
 
   /**
-   * Stop & apply best result found so far
+   * Soft stop: stop issuing new chunks, await in-flight helpers, merge finished results, complete Stage 3
    */
   const handleStopAndApply = () => {
     if (isStopping) return;
     setIsStopping(true);
     isStoppingRef.current = true;
-    setStatusText('Остановка расчета: завершаем текущий шаг и сохраняем лучший вариант...');
+    setStatusText('Остановка расчета: дожидаемся запущенных проходов и завершаем Этап 3...');
 
     if (workerRef.current) {
-      workerRef.current.postMessage({ type: 'ABORT' });
+      const abortMsg: WorkerInMessage = { type: 'ABORT' };
+      workerRef.current.postMessage(abortMsg);
     }
-
-    setTimeout(() => {
-      if (phase === 'calculating') {
-        if (workerRef.current) {
-          workerRef.current.terminate();
-          workerRef.current = null;
-        }
-        if (stopwatchIntervalRef.current) {
-          clearInterval(stopwatchIntervalRef.current);
-          stopwatchIntervalRef.current = null;
-        }
-
-        let solToApply: FullOptimizationSolution | null = latestSolutionRef.current;
-        if (!solToApply || !solToApply.rows || solToApply.rows.length === 0) {
-          if (solution && solution.rows && solution.rows.length > 0) {
-            solToApply = solution;
-          }
-        }
-        if (!solToApply || !solToApply.rows || solToApply.rows.length === 0) {
-          try {
-            solToApply = onExecuteCalculation({ ...modalSettings, searchSpeed: 'fast' });
-          } catch (e) {
-            console.warn('Fallback onExecuteCalculation failed:', e);
-          }
-        }
-        if (!solToApply || !solToApply.rows || solToApply.rows.length === 0) {
-          const baseRun = (runsRef.current || []).find((r) => r.solution && r.solution.rows.length > 0);
-          if (baseRun) {
-            solToApply = baseRun.solution;
-          } else {
-            solToApply = solveNaiveSequentialCutting(
-              currentStocksRef.current.length > 0 ? currentStocksRef.current : (stockItems as any) || [],
-              currentDemandsRef.current.length > 0 ? currentDemandsRef.current : (demandItems as any) || [],
-              modalSettings,
-              12000
-            );
-          }
-        }
-
-        const currentBase = runsRef.current && runsRef.current.length > 0 ? runsRef.current : [];
-        const nextIdx = currentBase.filter((r) => r.index > 0).length + 1;
-        const newRun: CalculationRun = {
-          id: `run_${Date.now()}_${nextIdx}`,
-          index: nextIdx,
-          title: `Расчет #${nextIdx} (Остановлен)`,
-          badge: 'Остановлен',
-          timestamp: Date.now(),
-          settings: { ...modalSettings },
-          solution: solToApply,
-          inputSignature,
-        };
-        const updated = [...currentBase, newRun];
-        setRuns(updated);
-        runsRef.current = updated;
-        setActiveRunId(newRun.id);
-        if (onSaveRuns) onSaveRuns(updated);
-        if (onApplySolutionAndSettings) onApplySolutionAndSettings(solToApply, modalSettings);
-
-        setProgressPercent(100);
-        setStatusText('Расчет остановлен пользователем и применен текущий результат');
-        setPhase('done');
-        setIsRecalculating(false);
-        setIsStopping(false);
-        isStoppingRef.current = false;
-      }
-    }, 250);
   };
 
   // Reset or run initial calculation on open, preserving prior results when settings and input conditions match
@@ -752,10 +1071,6 @@ export const CalculationProgressModal: React.FC<CalculationProgressModalProps> =
       setHighlightedRunId(null);
       setDuplicateWarning(null);
       setIsStopping(false);
-      if (workerRef.current) {
-        workerRef.current.terminate();
-        workerRef.current = null;
-      }
       if (stopwatchIntervalRef.current) {
         clearInterval(stopwatchIntervalRef.current);
         stopwatchIntervalRef.current = null;
@@ -793,10 +1108,10 @@ export const CalculationProgressModal: React.FC<CalculationProgressModalProps> =
         length: s.length,
         quantity: s.quantity,
         isActive: s.isActive !== false,
-        isStandard: s.isStandard || s.length === 6000 || s.length === 12000,
+        isStandard: s.isStandard || s.length === 6000 || s.length === 12000 || s.length === 11700,
         isStandardUnlimited:
           s.isStandardUnlimited ||
-          ((s.length === 6000 || s.length === 12000) && s.quantity <= 0),
+          ((s.length === 6000 || s.length === 12000 || s.length === 11700) && s.quantity <= 0),
         mark: s.mark,
         notes: s.notes,
       }));
@@ -837,7 +1152,6 @@ export const CalculationProgressModal: React.FC<CalculationProgressModalProps> =
       setProgressPercent(100);
       setStatusText('Просмотр сохраненных расчетов');
       setPhase('done');
-      setIsRecalculating(false);
       return;
     }
 
@@ -905,6 +1219,8 @@ export const CalculationProgressModal: React.FC<CalculationProgressModalProps> =
     const actBars = actSol.rows.reduce((sum, r) => sum + r.barsCount, 0);
     const savedBars = baseBars - actBars;
 
+    const baseWb = getSolutionWasteBreakdown(baseSol);
+    const actWb = getSolutionWasteBreakdown(actSol);
     const baseWasteM = (baseSol.totalWasteLength || 0) / 1000;
     const actWasteM = (actSol.totalWasteLength || 0) / 1000;
     const reducedWasteM = baseWasteM - actWasteM;
@@ -926,6 +1242,10 @@ export const CalculationProgressModal: React.FC<CalculationProgressModalProps> =
       actSpentM,
       baseWasteM,
       actWasteM,
+      baseOffcutsM: baseWb.offcutsMm / 1000,
+      actOffcutsM: actWb.offcutsMm / 1000,
+      baseKerfM: baseWb.kerfMm / 1000,
+      actKerfM: actWb.kerfMm / 1000,
       reusableDiffM,
     };
   }, [matchingBaseline, activeRun]);
@@ -966,12 +1286,7 @@ export const CalculationProgressModal: React.FC<CalculationProgressModalProps> =
 
     // Execute recalculation (new run added to comparison list)
     setDuplicateWarning(null);
-    setIsRecalculating(true);
     startOptimizationRun(settingsToUse, runs);
-  };
-
-  const handleRecalculate = () => {
-    executeRecalculateWithSettings(settings);
   };
 
   // Listen to calcTriggerNonce from App when user clicks "Рассчитать раскрой" in sidebar
@@ -1063,65 +1378,41 @@ export const CalculationProgressModal: React.FC<CalculationProgressModalProps> =
     0
   );
 
-  const getStrategyLabel = (goal?: string) => {
-    switch (goal) {
-      case 'variants':
-        return 'Минимум наладок';
-      case 'min_waste':
-        return 'Минимум отходов';
-      case 'min_bars':
-        return 'Минимум хлыстов';
-      case 'max_reusable':
-        return 'Максимум делового';
-      case 'prioritize_remnants':
-        return 'Приоритет остатков';
-      case 'comprehensive':
-        return 'Комплексный (4)';
-      case 'custom':
-        return 'Пользовательская';
+  const getStrategyLabel = (goal?: string) => getOptimizationLabel(goal, true);
+
+  const getStrategyBadge = (goal?: string, _runSettings?: AppSettings) => getOptimizationBadge(goal);
+
+  const getSpeedLabel = (spd?: string) => getSearchSpeedLabel(spd, true);
+
+  const getReusableModeLabel = (mode?: AppSettings['reusableRemnantMode']) => {
+    switch (mode) {
+      case 'weighted':
+        return 'Средневзв.';
+      case 'min_part':
+        return 'Мин. деталь';
       default:
-        return goal || '—';
+        return 'Ручной';
     }
   };
 
-  const getStrategyBadge = (goal?: string, runSettings?: AppSettings) => {
-    switch (goal) {
-      case 'variants':
-        return { label: 'Меньше наладок', icon: '⚡', color: 'bg-indigo-50 text-indigo-700 border-indigo-200' };
-      case 'min_waste':
-        return { label: 'Мин. отход', icon: '🏆', color: 'bg-emerald-50 text-emerald-700 border-emerald-200' };
-      case 'min_bars':
-        return { label: 'Мин. хлыстов', icon: '📦', color: 'bg-sky-50 text-sky-700 border-sky-200' };
-      case 'max_reusable':
-        return {
-          label: runSettings?.targetRemnantMinLength
-            ? `Остаток ≥${runSettings.targetRemnantMinLength} мм`
-            : 'Деловой остаток',
-          icon: '♻️',
-          color: 'bg-amber-50 text-amber-700 border-amber-200',
-        };
-      case 'prioritize_remnants':
-        return { label: 'Склад', icon: '🔄', color: 'bg-teal-50 text-teal-700 border-teal-200' };
-      case 'comprehensive':
-        return { label: '4 стратегии', icon: '✨', color: 'bg-purple-50 text-purple-700 border-purple-200' };
-      case 'custom':
-        return { label: 'Настраиваемая', icon: '⚙️', color: 'bg-blue-50 text-blue-700 border-blue-200' };
-      default:
-        return null;
-    }
+  const getCustomParamsSummary = (s: AppSettings): string => {
+    if (s.optimizationGoal !== 'custom') return '';
+    const c = { ...getDefaultCustomConfig(), ...(s.customStrategyConfig || {}) };
+    const twoOptText = c.enable2Opt ? `2Opt:${c.twoOptRounds}` : '2Opt:выкл';
+    const tailText = c.enableTailConsolidation
+      ? `Хв:${c.tailConsolidationMaxBars}(${c.cardMergeScrapToleranceMm}мм)`
+      : 'Хв:выкл';
+    const cardsText = c.preferFewerCards ? 'Мин.карт' : 'Мин.отход';
+    return `${c.maxPassesMultiplier.toFixed(2)}x · ${twoOptText} · ${tailText} · ${cardsText}`;
   };
 
-  const getSpeedLabel = (spd?: string) => {
-    switch (spd) {
-      case 'fast':
-        return 'Быстро';
-      case 'standard':
-        return 'Стандарт';
-      case 'deep':
-        return 'Глубокий';
-      default:
-        return spd || '—';
-    }
+  const getRunCommentSearchText = (r: CalculationRun): string => {
+    const parts: string[] = [];
+    if (r.badge) parts.push(r.badge);
+    const sBadge = getStrategyBadge(r.settings.optimizationGoal, r.settings);
+    if (sBadge) parts.push(sBadge.label);
+    if (r.settings.orderComment) parts.push(r.settings.orderComment);
+    return parts.join(' ');
   };
 
   // Point 3: Цвета КИМ (98%+ зеленый, 92%-97.99% желтый, <92% красный)
@@ -1191,85 +1482,6 @@ export const CalculationProgressModal: React.FC<CalculationProgressModalProps> =
     };
   };
 
-  // Runs WITHOUT material deficit (unplaced parts) - only these participate in comparative color scaling
-  const validRuns = useMemo(() => {
-    return runs.filter(
-      (r) =>
-        !r.solution.unplacedDemand ||
-        r.solution.unplacedDemand.length === 0 ||
-        r.solution.unplacedDemand.every((u) => (u.quantity || 0) === 0)
-    );
-  }, [runs]);
-
-  // Color theme for Cards count column (runs with deficit do not participate in sample)
-  const cardsList = useMemo(() => validRuns.map((r) => r.solution.rows.length), [validRuns]);
-  const minCards = useMemo(() => (cardsList.length > 0 ? Math.min(...cardsList) : null), [cardsList]);
-  const maxCards = useMemo(() => (cardsList.length > 0 ? Math.max(...cardsList) : null), [cardsList]);
-
-  const getCardsTheme = (cardsCount: number, isDeficit: boolean) => {
-    if (isDeficit) {
-      return 'text-slate-400 font-mono font-normal';
-    }
-    if (validRuns.length <= 1 || minCards === null || maxCards === null || minCards === maxCards) {
-      return 'text-slate-800 font-mono font-medium';
-    }
-    if (cardsCount === minCards) {
-      return 'text-emerald-700 font-bold font-mono'; // зеленый - наименьшее количество вариантов (карт)
-    }
-    if (cardsCount === maxCards) {
-      return 'text-rose-600 font-bold font-mono'; // красный - наибольшее
-    }
-    return 'text-amber-700 font-bold font-mono'; // промежуточные значения - желтым
-  };
-
-  // Color theme for Spent (Расход) column (runs with deficit do not participate in sample)
-  const spentList = useMemo(
-    () => validRuns.map((r) => Number(((r.solution.totalStockLength || 0) / 1000).toFixed(2))),
-    [validRuns]
-  );
-  const minSpent = useMemo(() => (spentList.length > 0 ? Math.min(...spentList) : null), [spentList]);
-  const maxSpent = useMemo(() => (spentList.length > 0 ? Math.max(...spentList) : null), [spentList]);
-
-  const getSpentTheme = (spentMeters: number, isDeficit: boolean) => {
-    if (isDeficit) {
-      return 'text-slate-400 font-mono font-normal';
-    }
-    if (validRuns.length <= 1 || minSpent === null || maxSpent === null || minSpent === maxSpent) {
-      return 'text-slate-800 font-mono font-medium';
-    }
-    if (spentMeters === minSpent) {
-      return 'text-emerald-700 font-bold font-mono'; // минимальный расход - зеленым
-    }
-    if (spentMeters === maxSpent) {
-      return 'text-rose-600 font-bold font-mono'; // максимальный расход - красным
-    }
-    return 'text-amber-700 font-bold font-mono'; // промежуточные значения - желтым
-  };
-
-  // Color theme for Waste (Отход) column (runs with deficit do not participate in sample)
-  const wasteList = useMemo(
-    () => validRuns.map((r) => Number(((r.solution.totalWasteLength || 0) / 1000).toFixed(2))),
-    [validRuns]
-  );
-  const minWaste = useMemo(() => (wasteList.length > 0 ? Math.min(...wasteList) : null), [wasteList]);
-  const maxWaste = useMemo(() => (wasteList.length > 0 ? Math.max(...wasteList) : null), [wasteList]);
-
-  const getWasteTheme = (wasteMeters: number, isDeficit: boolean) => {
-    if (isDeficit) {
-      return 'text-slate-400 font-mono font-normal';
-    }
-    if (validRuns.length <= 1 || minWaste === null || maxWaste === null || minWaste === maxWaste) {
-      return 'text-slate-500 font-mono font-medium';
-    }
-    if (wasteMeters === minWaste) {
-      return 'text-emerald-700 font-bold font-mono'; // минимальный отход - зеленым
-    }
-    if (wasteMeters === maxWaste) {
-      return 'text-rose-600 font-bold font-mono'; // максимальный отход - красным
-    }
-    return 'text-amber-700 font-bold font-mono'; // промежуточные значения - желтым
-  };
-
   const filteredAndSortedRuns = useMemo(() => {
     let list = [...runs];
 
@@ -1323,7 +1535,8 @@ export const CalculationProgressModal: React.FC<CalculationProgressModalProps> =
         )
           .toLowerCase()
           .includes(q);
-        return titleMatch || stratMatch || speedMatch;
+        const commentMatch = getRunCommentSearchText(r).toLowerCase().includes(q);
+        return titleMatch || stratMatch || speedMatch || commentMatch;
       });
     }
 
@@ -1343,24 +1556,115 @@ export const CalculationProgressModal: React.FC<CalculationProgressModalProps> =
           diff = stdA - stdB;
           break;
         }
+        case 'strategy':
+          diff = a.settings.optimizationGoal.localeCompare(b.settings.optimizationGoal);
+          break;
+        case 'comments':
+          diff = getRunCommentSearchText(a).localeCompare(getRunCommentSearchText(b));
+          break;
         case 'speed':
           diff = a.settings.searchSpeed.localeCompare(b.settings.searchSpeed);
           break;
-        case 'strategy':
-          diff = a.settings.optimizationGoal.localeCompare(b.settings.optimizationGoal);
+        case 'multiThread':
+          diff =
+            Number(Boolean(a.settings.multiThreadEnabled)) -
+            Number(Boolean(b.settings.multiThreadEnabled));
+          break;
+        case 'exactSolver': {
+          const exA = Number(
+            a.settings.searchSpeed === 'exact' || Boolean(a.settings.exactSolverEnabled)
+          );
+          const exB = Number(
+            b.settings.searchSpeed === 'exact' || Boolean(b.settings.exactSolverEnabled)
+          );
+          diff = exA - exB;
+          break;
+        }
+        case 'prioritizeRemnants':
+          diff =
+            Number(Boolean(a.settings.prioritizeRemnants)) -
+            Number(Boolean(b.settings.prioritizeRemnants));
+          break;
+        case 'remnantMinFill': {
+          const rfA = a.settings.prioritizeRemnants
+            ? (a.settings.remnantMinFillPct ?? a.settings.targetRemnantKIM ?? 75)
+            : -1;
+          const rfB = b.settings.prioritizeRemnants
+            ? (b.settings.remnantMinFillPct ?? b.settings.targetRemnantKIM ?? 75)
+            : -1;
+          diff = rfA - rfB;
+          break;
+        }
+        case 'shapeRemnants': {
+          const srA = a.settings.shapeRemnantsInSearch
+            ? (a.settings.shapeRemnantsThresholdPct ?? 50) + 1
+            : 0;
+          const srB = b.settings.shapeRemnantsInSearch
+            ? (b.settings.shapeRemnantsThresholdPct ?? 50) + 1
+            : 0;
+          diff = srA - srB;
+          break;
+        }
+        case 'bladeWidth':
+          diff = (a.settings.bladeWidth || 0) - (b.settings.bladeWidth || 0);
+          break;
+        case 'edgeTrim':
+          diff = (a.settings.edgeTrim || 0) - (b.settings.edgeTrim || 0);
+          break;
+        case 'reusableMin':
+          diff = a.settings.reusableRemnantMin - b.settings.reusableRemnantMin;
+          break;
+        case 'reusableMode':
+          diff = (a.settings.reusableRemnantMode ?? 'manual').localeCompare(
+            b.settings.reusableRemnantMode ?? 'manual'
+          );
           break;
         case 'dualProfile':
           diff = Number(a.settings.dualProfileCut) - Number(b.settings.dualProfileCut);
           break;
+        case 'batchSize': {
+          const bsA = a.settings.dualProfileCut
+            ? (a.solution.batchInfo?.batchSize ?? a.settings.batchSizeN ?? 2)
+            : 0;
+          const bsB = b.settings.dualProfileCut
+            ? (b.solution.batchInfo?.batchSize ?? b.settings.batchSizeN ?? 2)
+            : 0;
+          diff = bsA - bsB;
+          break;
+        }
         case 'fillControl': {
           const fcA = a.settings.dualProfileCut && a.settings.fillControlEnabled ? (a.settings.fillControlThreshold ?? 50) : 0;
           const fcB = b.settings.dualProfileCut && b.settings.fillControlEnabled ? (b.settings.fillControlThreshold ?? 50) : 0;
           diff = fcA - fcB;
           break;
         }
-        case 'reusableMin':
-          diff = a.settings.reusableRemnantMin - b.settings.reusableRemnantMin;
+        case 'groupSolutions':
+          diff = Number(a.settings.groupSolutions !== false) - Number(b.settings.groupSolutions !== false);
           break;
+        case 'customParams':
+          diff = getCustomParamsSummary(a.settings).localeCompare(
+            getCustomParamsSummary(b.settings)
+          );
+          break;
+        case 'cuttingIndex': {
+          const idxA = computeCuttingIndexFromSolution(
+            a.solution,
+            mappedStockItems,
+            liveTargetRemnantMinLength
+          ).cuttingIndex;
+          const idxB = computeCuttingIndexFromSolution(
+            b.solution,
+            mappedStockItems,
+            liveTargetRemnantMinLength
+          ).cuttingIndex;
+          diff = idxA - idxB;
+          if (diff === 0) {
+            diff =
+              getSolutionWasteBreakdown(b.solution).offcutsMm -
+              getSolutionWasteBreakdown(a.solution).offcutsMm;
+          }
+          break;
+        }
         case 'kim':
           diff = a.solution.overallKIM - b.solution.overallKIM;
           break;
@@ -1387,6 +1691,21 @@ export const CalculationProgressModal: React.FC<CalculationProgressModalProps> =
         case 'reusable':
           diff = (a.solution.totalReusableLength || 0) - (b.solution.totalReusableLength || 0);
           break;
+        case 'maxReusable':
+          diff =
+            computeMaxReusableRemnantFromSolution(a.solution) -
+            computeMaxReusableRemnantFromSolution(b.solution);
+          break;
+        case 'offcuts':
+          diff =
+            getSolutionWasteBreakdown(a.solution).offcutsMm -
+            getSolutionWasteBreakdown(b.solution).offcutsMm;
+          break;
+        case 'kerf':
+          diff =
+            getSolutionWasteBreakdown(a.solution).kerfMm -
+            getSolutionWasteBreakdown(b.solution).kerfMm;
+          break;
         case 'waste':
           diff = (a.solution.totalWasteLength || 0) - (b.solution.totalWasteLength || 0);
           break;
@@ -1403,14 +1722,183 @@ export const CalculationProgressModal: React.FC<CalculationProgressModalProps> =
     });
 
     return [...baselineRuns, ...regularRuns];
-  }, [runs, filterStatus, filterStrategy, filterStandardSize, searchQuery, sortField, sortDirection]);
+  }, [runs, filterStatus, filterStrategy, filterStandardSize, searchQuery, sortField, sortDirection, mappedStockItems, liveTargetRemnantMinLength]);
+
+  // Sample for comparative min/max color highlighting strictly from the FILTERED range (excluding deficit runs)
+  const filteredValidRuns = useMemo(() => {
+    return filteredAndSortedRuns.filter(
+      (r) =>
+        !r.solution.unplacedDemand ||
+        r.solution.unplacedDemand.length === 0 ||
+        r.solution.unplacedDemand.every((u) => (u.quantity || 0) === 0)
+    );
+  }, [filteredAndSortedRuns]);
+
+  const bestIndexRunId = useMemo(() => {
+    let bestId: string | null = null;
+    let bestIdx = -1;
+    let bestOffcuts = Infinity;
+    for (const r of filteredValidRuns) {
+      if (r.isBaseline || r.index <= 0) continue;
+      const idx = computeCuttingIndexFromSolution(
+        r.solution,
+        mappedStockItems,
+        liveTargetRemnantMinLength
+      ).cuttingIndex;
+      const offcuts = getSolutionWasteBreakdown(r.solution).offcutsMm;
+      if (idx > bestIdx + 1e-12 || (Math.abs(idx - bestIdx) <= 1e-12 && offcuts < bestOffcuts)) {
+        bestIdx = idx;
+        bestOffcuts = offcuts;
+        bestId = r.id;
+      }
+    }
+    return bestId;
+  }, [filteredValidRuns, mappedStockItems, liveTargetRemnantMinLength]);
+
+  // Color theme for Cards count column
+  const cardsList = useMemo(
+    () => filteredValidRuns.map((r) => r.solution.rows.length),
+    [filteredValidRuns]
+  );
+  const minCards = useMemo(() => (cardsList.length > 0 ? Math.min(...cardsList) : null), [cardsList]);
+  const maxCards = useMemo(() => (cardsList.length > 0 ? Math.max(...cardsList) : null), [cardsList]);
+
+  const getCardsTheme = (cardsCount: number, isDeficit: boolean) => {
+    if (isDeficit) {
+      return 'text-slate-400 font-mono font-normal';
+    }
+    if (filteredValidRuns.length <= 1 || minCards === null || maxCards === null || minCards === maxCards) {
+      return 'text-slate-800 font-mono font-medium';
+    }
+    if (cardsCount === minCards) {
+      return 'text-emerald-700 font-bold font-mono';
+    }
+    if (cardsCount === maxCards) {
+      return 'text-rose-600 font-bold font-mono';
+    }
+    return 'text-amber-700 font-bold font-mono';
+  };
+
+  // Color theme for Spent (Расход) column
+  const spentList = useMemo(
+    () => filteredValidRuns.map((r) => Number(((r.solution.totalStockLength || 0) / 1000).toFixed(2))),
+    [filteredValidRuns]
+  );
+  const minSpent = useMemo(() => (spentList.length > 0 ? Math.min(...spentList) : null), [spentList]);
+  const maxSpent = useMemo(() => (spentList.length > 0 ? Math.max(...spentList) : null), [spentList]);
+
+  const getSpentTheme = (spentMeters: number, isDeficit: boolean) => {
+    if (isDeficit) {
+      return 'text-slate-400 font-mono font-normal';
+    }
+    if (filteredValidRuns.length <= 1 || minSpent === null || maxSpent === null || minSpent === maxSpent) {
+      return 'text-slate-800 font-mono font-medium';
+    }
+    if (spentMeters === minSpent) {
+      return 'text-emerald-700 font-bold font-mono';
+    }
+    if (spentMeters === maxSpent) {
+      return 'text-rose-600 font-bold font-mono';
+    }
+    return 'text-amber-700 font-bold font-mono';
+  };
+
+  // Color theme for Offcuts (Обрезки) column
+  const offcutsList = useMemo(
+    () =>
+      filteredValidRuns.map((r) =>
+        Number((getSolutionWasteBreakdown(r.solution).offcutsMm / 1000).toFixed(2))
+      ),
+    [filteredValidRuns]
+  );
+  const minOffcuts = useMemo(
+    () => (offcutsList.length > 0 ? Math.min(...offcutsList) : null),
+    [offcutsList]
+  );
+  const maxOffcuts = useMemo(
+    () => (offcutsList.length > 0 ? Math.max(...offcutsList) : null),
+    [offcutsList]
+  );
+
+  const getOffcutsTheme = (offcutsMeters: number, isDeficit: boolean) => {
+    if (isDeficit) {
+      return 'text-slate-400 font-mono font-normal';
+    }
+    if (filteredValidRuns.length <= 1 || minOffcuts === null || maxOffcuts === null || minOffcuts === maxOffcuts) {
+      return 'text-slate-600 font-mono font-medium';
+    }
+    if (offcutsMeters === minOffcuts) {
+      return 'text-emerald-700 font-bold font-mono';
+    }
+    if (offcutsMeters === maxOffcuts) {
+      return 'text-rose-600 font-bold font-mono';
+    }
+    return 'text-amber-700 font-bold font-mono';
+  };
+
+  // Color theme for Kerf (Стружка) column
+  const kerfList = useMemo(
+    () =>
+      filteredValidRuns.map((r) =>
+        Number((getSolutionWasteBreakdown(r.solution).kerfMm / 1000).toFixed(2))
+      ),
+    [filteredValidRuns]
+  );
+  const minKerf = useMemo(() => (kerfList.length > 0 ? Math.min(...kerfList) : null), [kerfList]);
+  const maxKerf = useMemo(() => (kerfList.length > 0 ? Math.max(...kerfList) : null), [kerfList]);
+
+  const getKerfTheme = (kerfMeters: number, isDeficit: boolean) => {
+    if (isDeficit) {
+      return 'text-slate-400 font-mono font-normal';
+    }
+    if (filteredValidRuns.length <= 1 || minKerf === null || maxKerf === null || minKerf === maxKerf) {
+      return 'text-slate-500 font-mono font-medium';
+    }
+    if (kerfMeters === minKerf) {
+      return 'text-emerald-700 font-bold font-mono';
+    }
+    if (kerfMeters === maxKerf) {
+      return 'text-rose-600 font-bold font-mono';
+    }
+    return 'text-amber-700 font-bold font-mono';
+  };
+
+  // Color theme for Total Waste (Отход) column
+  const wasteList = useMemo(
+    () => filteredValidRuns.map((r) => Number(((r.solution.totalWasteLength || 0) / 1000).toFixed(2))),
+    [filteredValidRuns]
+  );
+  const minWaste = useMemo(() => (wasteList.length > 0 ? Math.min(...wasteList) : null), [wasteList]);
+  const maxWaste = useMemo(() => (wasteList.length > 0 ? Math.max(...wasteList) : null), [wasteList]);
+
+  const getWasteTheme = (wasteMeters: number, isDeficit: boolean) => {
+    if (isDeficit) {
+      return 'text-slate-400 font-mono font-normal';
+    }
+    if (filteredValidRuns.length <= 1 || minWaste === null || maxWaste === null || minWaste === maxWaste) {
+      return 'text-slate-500 font-mono font-medium';
+    }
+    if (wasteMeters === minWaste) {
+      return 'text-emerald-700 font-bold font-mono';
+    }
+    if (wasteMeters === maxWaste) {
+      return 'text-rose-600 font-bold font-mono';
+    }
+    return 'text-amber-700 font-bold font-mono';
+  };
 
   const handleSortToggle = (field: typeof sortField) => {
     if (sortField === field) {
       setSortDirection((prev) => (prev === 'asc' ? 'desc' : 'asc'));
     } else {
       setSortField(field);
-      setSortDirection('asc');
+      const defaultDesc =
+        field === 'cuttingIndex' ||
+        field === 'kim' ||
+        field === 'netKim' ||
+        field === 'maxReusable' ||
+        field === 'reusable';
+      setSortDirection(defaultDesc ? 'desc' : 'asc');
     }
   };
 
@@ -1436,12 +1924,12 @@ export const CalculationProgressModal: React.FC<CalculationProgressModalProps> =
       {/* Light backdrop over the right workspace only - left settings sidebar is NEVER obscured */}
       <div
         onClick={onClose}
-        className={`fixed top-[57px] sm:top-[61px] bottom-0 right-0 z-30 bg-slate-900/20 backdrop-blur-2xs transition-all duration-300 ${leftOffsetClass}`}
+        className={`fixed top-[57px] sm:top-[61px] bottom-0 right-0 z-20 bg-slate-900/20 backdrop-blur-2xs transition-all duration-300 ${leftOffsetClass}`}
       />
 
       {/* Docked Calculation Panel positioned immediately to the right of Settings Sidebar */}
       <div
-        className={`fixed top-[57px] sm:top-[61px] bottom-0 right-0 z-40 bg-white border-l border-slate-200 shadow-2xl flex flex-col overflow-hidden animate-in slide-in-from-left-4 duration-250 transition-all ${leftOffsetClass}`}
+        className={`fixed top-[57px] sm:top-[61px] bottom-0 right-0 z-30 bg-white border-l border-slate-200 shadow-2xl flex flex-col overflow-hidden animate-in slide-in-from-left-4 duration-250 transition-all ${leftOffsetClass}`}
       >
         {/* Floating toast notification for duplicate or status warning (zero layout shift) */}
         {duplicateWarning && (
@@ -1474,14 +1962,6 @@ export const CalculationProgressModal: React.FC<CalculationProgressModalProps> =
               </p>
             </div>
           </div>
-
-          <div className="flex items-center gap-2">
-            {phase === 'done' && activeSolution && (
-              <span className="text-[11px] font-mono text-emerald-700 font-bold bg-emerald-50 px-2 py-0.5 rounded border border-emerald-200">
-                {activeSolution.calculationTimeMs || 15} мс
-              </span>
-            )}
-
             <button
               type="button"
               onClick={onClose}
@@ -1491,7 +1971,6 @@ export const CalculationProgressModal: React.FC<CalculationProgressModalProps> =
               <ChevronLeft className="w-3.5 h-3.5 text-blue-600" />
               <span>Свернуть</span>
             </button>
-          </div>
         </div>
 
         {/* Body */}
@@ -1532,15 +2011,20 @@ export const CalculationProgressModal: React.FC<CalculationProgressModalProps> =
                   </div>
                 </div>
 
-                <div className="sm:text-right flex sm:flex-col items-center sm:items-end justify-between w-full sm:w-auto border-t sm:border-t-0 border-slate-800 pt-3 sm:pt-0">
-                  <div className="text-[10px] text-slate-400 uppercase tracking-wider font-semibold">
-                    Ориентировочное время (ETA)
-                  </div>
-                  <div className="text-sm sm:text-base font-bold font-mono text-emerald-400 flex items-center gap-1.5 mt-0.5">
-                    <Clock className="w-4 h-4 text-emerald-400" />
-                    <span>{formatETA(progressInfo, elapsedTimeMs)}</span>
-                  </div>
-                </div>
+                {(() => {
+                  const etaDisplay = getEtaOrStepDisplay(progressInfo);
+                  return (
+                    <div className="sm:text-right flex sm:flex-col items-center sm:items-end justify-between gap-2 w-full sm:w-auto border-t sm:border-t-0 border-slate-800 pt-3 sm:pt-0">
+                      <div className="text-[10px] text-slate-400 uppercase tracking-wider font-semibold">
+                        {etaDisplay.label}
+                      </div>
+                      <div className="text-sm sm:text-base font-bold font-mono text-emerald-400 flex items-center gap-1.5 mt-0.5 text-right">
+                        <Clock className="w-4 h-4 text-emerald-400 shrink-0" />
+                        <span>{etaDisplay.value}</span>
+                      </div>
+                    </div>
+                  );
+                })()}
               </div>
 
               {/* 3-Stage Progress Tracker */}
@@ -1566,6 +2050,22 @@ export const CalculationProgressModal: React.FC<CalculationProgressModalProps> =
                     className="bg-blue-600 h-full transition-all duration-150 rounded-full shadow-inner"
                   />
                 </div>
+
+                {((progressInfo?.workerThreadCount && progressInfo.workerThreadCount > 1) ||
+                  (progressInfo?.totalChunks && progressInfo.totalChunks > 0)) && (
+                  <div className="flex items-center justify-between text-[11px] font-mono text-slate-600 bg-slate-50 border border-slate-200 px-2.5 py-1 rounded-lg">
+                    <span>
+                      Потоков: {progressInfo?.workerThreadCount ?? 1} · кусков:{' '}
+                      {progressInfo?.chunksCompleted ?? 0} из {progressInfo?.totalChunks ?? 0}
+                    </span>
+                    {progressInfo?.viewedPasses !== undefined &&
+                      progressInfo?.totalPasses !== undefined && (
+                        <span>
+                          Проходов: {progressInfo.viewedPasses} из {progressInfo.totalPasses}
+                        </span>
+                      )}
+                  </div>
+                )}
 
                 {/* Visual Stages */}
                 <div className="grid grid-cols-3 gap-2 pt-2 border-t border-slate-100">
@@ -1635,7 +2135,11 @@ export const CalculationProgressModal: React.FC<CalculationProgressModalProps> =
                       <span>Этап 3</span>
                     </div>
                     <div className="text-[11px] font-semibold mt-0.5 truncate">
-                      {(progressInfo?.stage || 1) === 3 ? '2-Opt и сжатие карт' : 'Минимизация отходов'}
+                      {(progressInfo?.stage || 1) === 3
+                        ? progressInfo?.stageName === 'Формирование деловых остатков'
+                          ? 'Деловые остатки'
+                          : '2-Opt и сжатие карт'
+                        : 'Минимизация отходов'}
                     </div>
                   </div>
                 </div>
@@ -1663,7 +2167,7 @@ export const CalculationProgressModal: React.FC<CalculationProgressModalProps> =
 
                 <div className="bg-slate-50 border border-slate-200 rounded-xl p-3">
                   <span className="text-[10px] uppercase text-slate-500 font-bold block">
-                    Использовано хлыстов
+                    Использовано профилей
                   </span>
                   <div className="text-base sm:text-lg font-mono font-extrabold text-slate-900 mt-0.5">
                     {progressInfo?.usedBars ?? 0}
@@ -1750,20 +2254,12 @@ export const CalculationProgressModal: React.FC<CalculationProgressModalProps> =
             </div>
           ) : (
             <>
-              {/* Left sidebar controller banner */}
-              <div className="bg-slate-50 border border-slate-200 rounded-xl px-3.5 py-2.5 text-xs flex items-center gap-2.5 text-slate-700 shadow-2xs">
-                <Sliders className="w-4 h-4 text-blue-600 shrink-0" />
-                <span>
-                  Параметры расчета настраиваются в <strong>боковой панели слева</strong>. Для расчета нового варианта нажмите кнопку «Рассчитать раскрой» в боковой панели или шапке.
-                </span>
-              </div>
-
               {/* Sub-tab navigation */}
-              <div className="flex items-center border-b border-slate-200 gap-4 text-xs font-bold">
+              <div className="flex flex-wrap items-center border-b border-slate-200 gap-4 text-xs font-bold">
                 <button
                   type="button"
                   onClick={() => setActiveSubTab('summary')}
-                  className={`pb-2 transition-colors flex items-center gap-1.5 cursor-pointer ${
+                  className={`pb-2 transition-colors flex items-center gap-1.5 cursor-pointer whitespace-nowrap ${
                     activeSubTab === 'summary'
                       ? 'text-blue-700 border-b-2 border-blue-600'
                       : 'text-slate-500 hover:text-slate-800'
@@ -1780,8 +2276,27 @@ export const CalculationProgressModal: React.FC<CalculationProgressModalProps> =
 
                 <button
                   type="button"
+                  onClick={() => setActiveSubTab('details')}
+                  disabled={!activeSolution}
+                  className={`pb-2 transition-colors flex items-center gap-1.5 cursor-pointer whitespace-nowrap disabled:opacity-40 disabled:cursor-not-allowed ${
+                    activeSubTab === 'details'
+                      ? 'text-indigo-700 border-b-2 border-indigo-600'
+                      : 'text-slate-500 hover:text-slate-800'
+                  }`}
+                >
+                  <Table2 className="w-3.5 h-3.5" />
+                  <span>Подробная статистика расчета</span>
+                  {activeSolution && (
+                    <span className="bg-indigo-100 text-indigo-800 px-1.5 py-0.2 rounded-full text-[10px]">
+                      {activeSolution.rows.length} карт
+                    </span>
+                  )}
+                </button>
+
+                <button
+                  type="button"
                   onClick={() => setActiveSubTab('remnants')}
-                  className={`pb-2 transition-colors flex items-center gap-1.5 cursor-pointer ${
+                  className={`pb-2 transition-colors flex items-center gap-1.5 cursor-pointer whitespace-nowrap ${
                     activeSubTab === 'remnants'
                       ? 'text-amber-700 border-b-2 border-amber-600'
                       : 'text-slate-500 hover:text-slate-800'
@@ -1804,6 +2319,7 @@ export const CalculationProgressModal: React.FC<CalculationProgressModalProps> =
                   {activeSolution && (() => {
                     const kimTheme = getKimTheme(activeSolution.overallKIM);
                     const remnantTheme = getRemnantTheme(activeSolution.totalReusableLength);
+                    const activeWasteBreakdown = getSolutionWasteBreakdown(activeSolution);
 
                     return (
                       <div className="grid grid-cols-2 sm:grid-cols-4 gap-2.5 text-xs">
@@ -1812,7 +2328,7 @@ export const CalculationProgressModal: React.FC<CalculationProgressModalProps> =
                           <span className={`text-[10px] uppercase block font-bold ${kimTheme.labelColor}`}>
                             Общий КИМ
                           </span>
-                          <strong className={`text-xl font-mono font-extrabold ${kimTheme.valueColor}`}>
+                          <strong className={`text-xl font-mono font-extrabold tabular-nums ${kimTheme.valueColor}`}>
                             {activeSolution.overallKIM.toFixed(2)}%
                           </strong>
                           <span className={`text-[10px] block mt-0.5 ${kimTheme.subColor}`}>
@@ -1825,12 +2341,12 @@ export const CalculationProgressModal: React.FC<CalculationProgressModalProps> =
                           <span className="text-[10px] text-slate-500 uppercase block font-bold">
                             Расход заготовок
                           </span>
-                          <strong className="text-xl font-mono text-slate-900 font-extrabold">
+                          <strong className="text-xl font-mono text-slate-900 font-extrabold tabular-nums">
                             {((activeSolution.totalStockLength || 0) / 1000).toFixed(1)}{' '}
                             <span className="text-xs font-normal text-slate-500">м</span>
                           </strong>
                           <span className="text-[10px] text-slate-500 block mt-0.5">
-                            Использовано {activeSolution.totalBarsUsed} хлыстов
+                            Использовано {activeSolution.totalBarsUsed} профилей
                           </span>
                         </div>
 
@@ -1839,33 +2355,46 @@ export const CalculationProgressModal: React.FC<CalculationProgressModalProps> =
                           <span className={`text-[10px] uppercase block font-bold ${remnantTheme.labelColor}`}>
                             Деловой остаток
                           </span>
-                          <strong className={`text-xl font-mono font-extrabold ${remnantTheme.valueColor}`}>
+                          <strong className={`text-xl font-mono font-extrabold tabular-nums ${remnantTheme.valueColor}`}>
                             {(activeSolution.totalReusableLength / 1000).toFixed(2)}{' '}
                             <span className="text-xs font-normal">м</span>
                           </strong>
                           <span className={`text-[10px] block mt-0.5 ${remnantTheme.subColor}`}>
                             {totalCutRemnantsCount > 0
                               ? `${totalCutRemnantsCount} обрезков на склад`
-                              : 'Остатков нет (все в лом)'}
+                              : 'Остатков нет'}
                           </span>
                         </div>
 
-                        {/* Отход и рез */}
+                        {/* Отходы: Обрезки + Стружка */}
                         <div className="p-3 bg-slate-50 border border-slate-200 rounded-xl">
                           <span className="text-[10px] text-slate-500 uppercase block font-bold">
-                            Отход и рез
+                            Отходы (обрезки + стружка)
                           </span>
-                          <strong className="text-xl font-mono text-slate-700 font-extrabold">
-                            {(activeSolution.totalWasteLength / 1000).toFixed(2)}{' '}
+                          <strong className="text-xl font-mono text-slate-800 font-extrabold tabular-nums">
+                            {(activeWasteBreakdown.totalWasteMm / 1000).toFixed(2)}{' '}
                             <span className="text-xs font-normal text-slate-500">м</span>
                           </strong>
-                          <span className="text-[10px] text-slate-500 block mt-0.5">
-                            {(100 - activeSolution.overallKIM).toFixed(2)}% от объема
-                          </span>
+                          <div className="text-[10px] font-mono text-slate-600 mt-0.5 tabular-nums">
+                            Обр: <strong>{(activeWasteBreakdown.offcutsMm / 1000).toFixed(2)} м</strong> · Стр:{' '}
+                            <strong>{(activeWasteBreakdown.kerfMm / 1000).toFixed(2)} м</strong>
+                          </div>
                         </div>
                       </div>
                     );
                   })()}
+
+                  {/* Notice if calculation was interrupted early */}
+                  {activeSolution?.abortedInfo && (
+                    <div className="flex items-center gap-2 p-3 bg-amber-50 border border-amber-200 rounded-xl text-amber-900 text-xs font-medium">
+                      <AlertTriangle className="w-4 h-4 text-amber-600 shrink-0" />
+                      <span>
+                        Расчёт прерван: просмотрено{' '}
+                        <strong>{activeSolution.abortedInfo.viewedPasses}</strong> из{' '}
+                        <strong>{activeSolution.abortedInfo.totalPasses}</strong> проходов
+                      </span>
+                    </div>
+                  )}
 
                   {/* Warning if unplaced items */}
                   {activeSolution && activeSolution.unplacedDemand.length > 0 && (
@@ -1893,33 +2422,8 @@ export const CalculationProgressModal: React.FC<CalculationProgressModalProps> =
                           </span>
                         </div>
 
-                        <div className="flex items-center gap-2 self-end sm:self-auto">
-                          <button
-                            type="button"
-                            onClick={() => {
-                              executeRecalculateWithSettings({
-                                ...modalSettings,
-                                optimizationGoal: 'comprehensive',
-                              });
-                            }}
-                            title="Рассчитать сразу 4 варианта (по схемам, мин. отход, мин. хлыстов, макс. делового) для сравнительного выбора"
-                            className="flex items-center gap-1.5 text-[11px] font-bold text-indigo-700 bg-indigo-50 hover:bg-indigo-100 border border-indigo-200 px-2.5 py-1 rounded-lg transition-all cursor-pointer shadow-2xs hover:shadow-xs"
-                          >
-                            <Zap className="w-3.5 h-3.5 text-indigo-600 fill-indigo-600" />
-                            <span>Комплексный расчет (4 стратегии)</span>
-                          </button>
-
-                          <button
-                            type="button"
-                            onClick={() => setIsAuditModalOpen(true)}
-                            title="Открыть журнал аудита и телеметрии ресурсов (процессор, память, сложность)"
-                            className="flex items-center gap-1.5 text-[11px] font-semibold text-slate-700 bg-white hover:bg-slate-50 border border-slate-200 px-2.5 py-1 rounded-lg transition-all cursor-pointer shadow-2xs hover:shadow-xs"
-                          >
-                            <Activity className="w-3.5 h-3.5 text-blue-600" />
-                            <span>Аудит ресурсов</span>
-                          </button>
-
-                          {runs.length > 1 && (
+                        {runs.length > 1 && (
+                          <div className="flex items-center gap-2 self-end sm:self-auto">
                             <button
                               type="button"
                               onClick={handleClearRuns}
@@ -1929,8 +2433,8 @@ export const CalculationProgressModal: React.FC<CalculationProgressModalProps> =
                               <Trash2 className="w-3 h-3" />
                               <span>Очистить историю</span>
                             </button>
-                          )}
-                        </div>
+                          </div>
+                        )}
                       </div>
 
                       {/* Economic Benefit Benchmark Banner against matching baseline (Point 7) */}
@@ -1964,7 +2468,7 @@ export const CalculationProgressModal: React.FC<CalculationProgressModalProps> =
                               </div>
                               <div className="text-[10px] text-slate-500">
                                 {economicBenefit.savedBars > 0
-                                  ? `на ${economicBenefit.savedBars} хлыст${economicBenefit.savedBars === 1 ? '' : economicBenefit.savedBars < 5 ? 'а' : 'ов'} меньше`
+                                  ? `на ${economicBenefit.savedBars} профил${economicBenefit.savedBars === 1 ? 'ь' : economicBenefit.savedBars < 5 ? 'я' : 'ей'} меньше`
                                   : `${economicBenefit.actSpentM.toFixed(1)} м против ${economicBenefit.baseSpentM.toFixed(1)} м`}
                               </div>
                             </div>
@@ -2003,6 +2507,9 @@ export const CalculationProgressModal: React.FC<CalculationProgressModalProps> =
                                   </div>
                                   <div className="text-[10px] text-slate-500">
                                     с {economicBenefit.baseWasteM.toFixed(1)} м до {economicBenefit.actWasteM.toFixed(1)} м
+                                  </div>
+                                  <div className="text-[10px] font-mono text-slate-500 mt-0.5">
+                                    Обр: {economicBenefit.actOffcutsM.toFixed(2)} м · Стр: {economicBenefit.actKerfM.toFixed(2)} м
                                   </div>
                                 </div>
                               );
@@ -2140,17 +2647,88 @@ export const CalculationProgressModal: React.FC<CalculationProgressModalProps> =
                           >
                             <option value="all">Все стратегии</option>
                             <option value="baseline">Эталоны (без оптимизации)</option>
-                            <option value="variants">Схемы (Кол-во вариантов)</option>
-                            <option value="min_waste">Мин. отход</option>
-                            <option value="min_bars">Мин. хлыстов</option>
-                            <option value="max_reusable">Деловой остаток</option>
-                            <option value="prioritize_remnants">Склад</option>
-                            <option value="comprehensive">Комплексный</option>
-                            <option value="custom">Пользовательская</option>
+                            {OPTIMIZATION_OPTIONS.map((option) => (
+                              <option key={option.value} value={option.value}>
+                                {option.shortLabel ?? option.label}
+                              </option>
+                            ))}
                           </select>
                         </div>
 
                         <div className="flex items-center gap-2">
+                          <div className="relative" ref={columnsMenuRef}>
+                            <button
+                              type="button"
+                              onClick={() => setIsColumnsMenuOpen((prev) => !prev)}
+                              title="Настроить отображаемые колонки сравнительной таблицы"
+                              className={`flex items-center gap-1.5 px-2.5 py-1 text-xs font-semibold rounded-lg border transition-colors cursor-pointer ${
+                                isColumnsMenuOpen
+                                  ? 'bg-blue-50 text-blue-700 border-blue-300'
+                                  : 'bg-white text-slate-700 hover:bg-slate-100 border-slate-200'
+                              }`}
+                            >
+                              <Columns3 className="w-3.5 h-3.5 text-blue-600" />
+                              <span>Колонки</span>
+                              <span className="text-[10px] font-mono bg-slate-100 text-slate-600 px-1 rounded">
+                                {visibleColumns.length}/{COMPARISON_COLUMNS.length}
+                              </span>
+                            </button>
+
+                            {isColumnsMenuOpen && (
+                              <div className="absolute right-0 mt-1.5 w-64 bg-white border border-slate-200 rounded-xl shadow-xl z-40 p-2.5 space-y-2">
+                                <div className="flex items-center justify-between pb-1.5 border-b border-slate-100">
+                                  <span className="text-[11px] font-bold text-slate-800 uppercase tracking-wider">
+                                    Состав колонок
+                                  </span>
+                                  <div className="flex items-center gap-2 text-[10.5px]">
+                                    <button
+                                      type="button"
+                                      onClick={() => setVisibleColumns(DEFAULT_VISIBLE_COLUMNS)}
+                                      className="text-blue-600 hover:text-blue-800 font-semibold cursor-pointer"
+                                    >
+                                      По умолч.
+                                    </button>
+                                    <button
+                                      type="button"
+                                      onClick={() => setVisibleColumns(COMPARISON_COLUMNS.map((c) => c.key))}
+                                      className="text-slate-600 hover:text-slate-900 font-semibold cursor-pointer"
+                                    >
+                                      Все
+                                    </button>
+                                  </div>
+                                </div>
+
+                                <div className="max-h-64 overflow-y-auto space-y-0.5 pr-1">
+                                  {COMPARISON_COLUMNS.map((col) => {
+                                    const checked = visibleColSet.has(col.key);
+                                    const isLastChecked = checked && visibleColumns.length <= 1;
+                                    return (
+                                      <label
+                                        key={col.key}
+                                        className={`flex items-center gap-2 px-2 py-1 rounded-md text-xs transition-colors ${
+                                          isLastChecked
+                                            ? 'opacity-50 cursor-not-allowed'
+                                            : 'hover:bg-slate-50 cursor-pointer'
+                                        }`}
+                                      >
+                                        <input
+                                          type="checkbox"
+                                          checked={checked}
+                                          disabled={isLastChecked}
+                                          onChange={() => toggleVisibleColumn(col.key)}
+                                          className="w-3.5 h-3.5 text-blue-600 rounded cursor-pointer disabled:cursor-not-allowed"
+                                        />
+                                        <span className={checked ? 'font-semibold text-slate-800' : 'text-slate-600'}>
+                                          {col.label}
+                                        </span>
+                                      </label>
+                                    );
+                                  })}
+                                </div>
+                              </div>
+                            )}
+                          </div>
+
                           <div className="relative">
                             <Search className="w-3.5 h-3.5 absolute left-2.5 top-1/2 -translate-y-1/2 text-slate-400 pointer-events-none" />
                             <input
@@ -2170,11 +2748,12 @@ export const CalculationProgressModal: React.FC<CalculationProgressModalProps> =
                             )}
                           </div>
 
-                          {(filterStatus !== 'all' || filterStrategy !== 'all' || searchQuery) && (
+                          {(filterStatus !== 'all' || filterStrategy !== 'all' || filterStandardSize !== 'all' || searchQuery) && (
                             <button
                               onClick={() => {
                                 setFilterStatus('all');
                                 setFilterStrategy('all');
+                                setFilterStandardSize('all');
                                 setSearchQuery('');
                               }}
                               title="Сбросить фильтры"
@@ -2191,133 +2770,366 @@ export const CalculationProgressModal: React.FC<CalculationProgressModalProps> =
                         <table className="w-full border-collapse whitespace-nowrap">
                           <thead>
                             <tr className="bg-slate-100 text-slate-700 border-b border-slate-200 text-left text-[11px] whitespace-nowrap select-none">
-                              <th
-                                onClick={() => handleSortToggle('index')}
-                                className="py-2 px-2.5 cursor-pointer hover:bg-slate-200 transition-colors group whitespace-nowrap w-28"
-                              >
-                                <div className="flex items-center gap-1">
-                                  <span>Вариант</span>
-                                  {renderSortIndicator('index')}
-                                </div>
-                              </th>
+                              {visibleColSet.has('index') && (
+                                <th
+                                  onClick={() => handleSortToggle('index')}
+                                  className="py-2 px-2.5 cursor-pointer hover:bg-slate-200 transition-colors group whitespace-nowrap w-28"
+                                >
+                                  <div className="flex items-center gap-1">
+                                    <span>Вариант</span>
+                                    {renderSortIndicator('index')}
+                                  </div>
+                                </th>
+                              )}
 
-                              {/* Point 6: Колонка с размером основной стандартной заготовки в сравнительной таблице */}
-                              <th
-                                onClick={() => handleSortToggle('standardSize')}
-                                className="py-2 px-2.5 cursor-pointer hover:bg-slate-200 transition-colors group whitespace-nowrap w-22"
-                              >
-                                <div className="flex items-center gap-1">
-                                  <span>Стандарт</span>
-                                  {renderSortIndicator('standardSize')}
-                                </div>
-                              </th>
+                              {visibleColSet.has('standardSize') && (
+                                <th
+                                  onClick={() => handleSortToggle('standardSize')}
+                                  className="py-2 px-2.5 cursor-pointer hover:bg-slate-200 transition-colors group whitespace-nowrap w-22"
+                                >
+                                  <div className="flex items-center gap-1">
+                                    <span>Стандарт</span>
+                                    {renderSortIndicator('standardSize')}
+                                  </div>
+                                </th>
+                              )}
 
-                              <th
-                                onClick={() => handleSortToggle('strategy')}
-                                className="py-2 px-2.5 cursor-pointer hover:bg-slate-200 transition-colors group whitespace-nowrap"
-                              >
-                                <div className="flex items-center gap-1">
-                                  <span>Стратегия</span>
-                                  {renderSortIndicator('strategy')}
-                                </div>
-                              </th>
+                              {visibleColSet.has('strategy') && (
+                                <th
+                                  onClick={() => handleSortToggle('strategy')}
+                                  className="py-2 px-2.5 cursor-pointer hover:bg-slate-200 transition-colors group whitespace-nowrap"
+                                >
+                                  <div className="flex items-center gap-1">
+                                    <span>Стратегия</span>
+                                    {renderSortIndicator('strategy')}
+                                  </div>
+                                </th>
+                              )}
 
-                              <th
-                                onClick={() => handleSortToggle('speed')}
-                                className="py-2 px-2.5 cursor-pointer hover:bg-slate-200 transition-colors group whitespace-nowrap"
-                              >
-                                <div className="flex items-center gap-1">
-                                  <span>Производительность</span>
-                                  {renderSortIndicator('speed')}
-                                </div>
-                              </th>
+                              {visibleColSet.has('comments') && (
+                                <th
+                                  onClick={() => handleSortToggle('comments')}
+                                  className="py-2 px-2.5 cursor-pointer hover:bg-slate-200 transition-colors group whitespace-nowrap"
+                                >
+                                  <div className="flex items-center gap-1">
+                                    <span>Комментарии</span>
+                                    {renderSortIndicator('comments')}
+                                  </div>
+                                </th>
+                              )}
 
-                              <th
-                                onClick={() => handleSortToggle('dualProfile')}
-                                className="py-2 px-2.5 cursor-pointer hover:bg-slate-200 transition-colors group whitespace-nowrap"
-                              >
-                                <div className="flex items-center gap-1">
-                                  <span>2 проф.</span>
-                                  {renderSortIndicator('dualProfile')}
-                                </div>
-                              </th>
+                              {visibleColSet.has('speed') && (
+                                <th
+                                  onClick={() => handleSortToggle('speed')}
+                                  className="py-2 px-2.5 cursor-pointer hover:bg-slate-200 transition-colors group whitespace-nowrap"
+                                >
+                                  <div className="flex items-center gap-1">
+                                    <span>Глубина поиска</span>
+                                    {renderSortIndicator('speed')}
+                                  </div>
+                                </th>
+                              )}
 
-                              <th
-                                onClick={() => handleSortToggle('fillControl')}
-                                className="py-2 px-2.5 cursor-pointer hover:bg-slate-200 transition-colors group whitespace-nowrap"
-                              >
-                                <div className="flex items-center gap-1">
-                                  <span>Контроль</span>
-                                  {renderSortIndicator('fillControl')}
-                                </div>
-                              </th>
+                              {visibleColSet.has('multiThread') && (
+                                <th
+                                  onClick={() => handleSortToggle('multiThread')}
+                                  className="py-2 px-2.5 cursor-pointer hover:bg-slate-200 transition-colors group whitespace-nowrap"
+                                >
+                                  <div className="flex items-center gap-1">
+                                    <span>Многопоточность</span>
+                                    {renderSortIndicator('multiThread')}
+                                  </div>
+                                </th>
+                              )}
 
+                              {visibleColSet.has('exactSolver') && (
+                                <th
+                                  onClick={() => handleSortToggle('exactSolver')}
+                                  className="py-2 px-2.5 cursor-pointer hover:bg-slate-200 transition-colors group whitespace-nowrap"
+                                >
+                                  <div className="flex items-center gap-1">
+                                    <span>Точный (LP)</span>
+                                    {renderSortIndicator('exactSolver')}
+                                  </div>
+                                </th>
+                              )}
 
-                              <th
-                                onClick={() => handleSortToggle('kim')}
-                                title="Валовый КИМ: учитывает суммарный выход деталей и делового остатка"
-                                className="py-2 px-2 text-right cursor-pointer hover:bg-slate-200 transition-colors group whitespace-nowrap w-20"
-                              >
-                                <div className="flex items-center justify-end gap-1">
-                                  <span>КИМ (вал.)</span>
-                                  {renderSortIndicator('kim')}
-                                </div>
-                              </th>
+                              {visibleColSet.has('prioritizeRemnants') && (
+                                <th
+                                  onClick={() => handleSortToggle('prioritizeRemnants')}
+                                  className="py-2 px-2.5 cursor-pointer hover:bg-slate-200 transition-colors group whitespace-nowrap"
+                                >
+                                  <div className="flex items-center gap-1">
+                                    <span>Приоритет остатков</span>
+                                    {renderSortIndicator('prioritizeRemnants')}
+                                  </div>
+                                </th>
+                              )}
 
-                              <th
-                                onClick={() => handleSortToggle('netKim')}
-                                title="Мгновенный (чистый) КИМ: отношение длины готовых деталей к расходу материала без учета деловых отходов"
-                                className="py-2 px-2 text-right cursor-pointer hover:bg-slate-200 transition-colors group whitespace-nowrap w-20"
-                              >
-                                <div className="flex items-center justify-end gap-1">
-                                  <span className="text-blue-900 font-bold">Мгн. КИМ</span>
-                                  {renderSortIndicator('netKim')}
-                                </div>
-                              </th>
+                              {visibleColSet.has('remnantMinFill') && (
+                                <th
+                                  onClick={() => handleSortToggle('remnantMinFill')}
+                                  className="py-2 px-2.5 cursor-pointer hover:bg-slate-200 transition-colors group whitespace-nowrap"
+                                >
+                                  <div className="flex items-center gap-1">
+                                    <span>Мин. зап. ост.</span>
+                                    {renderSortIndicator('remnantMinFill')}
+                                  </div>
+                                </th>
+                              )}
 
-                              <th
-                                onClick={() => handleSortToggle('cards')}
-                                className="py-2 px-2.5 text-right cursor-pointer hover:bg-slate-200 transition-colors group whitespace-nowrap w-16"
-                              >
-                                <div className="flex items-center justify-end gap-1">
-                                  <span>Карт</span>
-                                  {renderSortIndicator('cards')}
-                                </div>
-                              </th>
+                              {visibleColSet.has('shapeRemnants') && (
+                                <th
+                                  onClick={() => handleSortToggle('shapeRemnants')}
+                                  className="py-2 px-2.5 cursor-pointer hover:bg-slate-200 transition-colors group whitespace-nowrap"
+                                >
+                                  <div className="flex items-center gap-1">
+                                    <span>Форм. деловые</span>
+                                    {renderSortIndicator('shapeRemnants')}
+                                  </div>
+                                </th>
+                              )}
 
-                              <th
-                                onClick={() => handleSortToggle('spent')}
-                                className="py-2 px-2.5 text-right cursor-pointer hover:bg-slate-200 transition-colors group whitespace-nowrap w-24"
-                              >
-                                <div className="flex items-center justify-end gap-1">
-                                  <span>Расход (м)</span>
-                                  {renderSortIndicator('spent')}
-                                </div>
-                              </th>
+                              {visibleColSet.has('bladeWidth') && (
+                                <th
+                                  onClick={() => handleSortToggle('bladeWidth')}
+                                  className="py-2 px-2.5 text-right cursor-pointer hover:bg-slate-200 transition-colors group whitespace-nowrap"
+                                >
+                                  <div className="flex items-center justify-end gap-1">
+                                    <span>Пропил (мм)</span>
+                                    {renderSortIndicator('bladeWidth')}
+                                  </div>
+                                </th>
+                              )}
 
-                              <th
-                                onClick={() => handleSortToggle('reusable')}
-                                className="py-2 px-2.5 text-right cursor-pointer hover:bg-slate-200 transition-colors group whitespace-nowrap w-24"
-                              >
-                                <div className="flex items-center justify-end gap-1">
-                                  <span>Деловой (м)</span>
-                                  {renderSortIndicator('reusable')}
-                                </div>
-                              </th>
+                              {visibleColSet.has('edgeTrim') && (
+                                <th
+                                  onClick={() => handleSortToggle('edgeTrim')}
+                                  className="py-2 px-2.5 text-right cursor-pointer hover:bg-slate-200 transition-colors group whitespace-nowrap"
+                                >
+                                  <div className="flex items-center justify-end gap-1">
+                                    <span>Кромка (мм)</span>
+                                    {renderSortIndicator('edgeTrim')}
+                                  </div>
+                                </th>
+                              )}
 
-                              <th
-                                onClick={() => handleSortToggle('waste')}
-                                className="py-2 px-2.5 text-right cursor-pointer hover:bg-slate-200 transition-colors group whitespace-nowrap w-22"
-                              >
-                                <div className="flex items-center justify-end gap-1">
-                                  <span>Отход (м)</span>
-                                  {renderSortIndicator('waste')}
-                                </div>
-                              </th>
+                              {visibleColSet.has('reusableMin') && (
+                                <th
+                                  onClick={() => handleSortToggle('reusableMin')}
+                                  className="py-2 px-2.5 text-right cursor-pointer hover:bg-slate-200 transition-colors group whitespace-nowrap"
+                                >
+                                  <div className="flex items-center justify-end gap-1">
+                                    <span>Порог ДО (мм)</span>
+                                    {renderSortIndicator('reusableMin')}
+                                  </div>
+                                </th>
+                              )}
 
-                              <th className="py-2 px-3 text-center w-24 whitespace-nowrap">
-                                Выбор
-                              </th>
+                              {visibleColSet.has('reusableMode') && (
+                                <th
+                                  onClick={() => handleSortToggle('reusableMode')}
+                                  className="py-2 px-2.5 cursor-pointer hover:bg-slate-200 transition-colors group whitespace-nowrap"
+                                >
+                                  <div className="flex items-center gap-1">
+                                    <span>Режим порога ДО</span>
+                                    {renderSortIndicator('reusableMode')}
+                                  </div>
+                                </th>
+                              )}
+
+                              {visibleColSet.has('dualProfile') && (
+                                <th
+                                  onClick={() => handleSortToggle('dualProfile')}
+                                  className="py-2 px-2.5 cursor-pointer hover:bg-slate-200 transition-colors group whitespace-nowrap"
+                                >
+                                  <div className="flex items-center gap-1">
+                                    <span>2 проф.</span>
+                                    {renderSortIndicator('dualProfile')}
+                                  </div>
+                                </th>
+                              )}
+
+                              {visibleColSet.has('batchSize') && (
+                                <th
+                                  onClick={() => handleSortToggle('batchSize')}
+                                  className="py-2 px-2.5 cursor-pointer hover:bg-slate-200 transition-colors group whitespace-nowrap"
+                                >
+                                  <div className="flex items-center gap-1">
+                                    <span>Размер пакета</span>
+                                    {renderSortIndicator('batchSize')}
+                                  </div>
+                                </th>
+                              )}
+
+                              {visibleColSet.has('fillControl') && (
+                                <th
+                                  onClick={() => handleSortToggle('fillControl')}
+                                  className="py-2 px-2.5 cursor-pointer hover:bg-slate-200 transition-colors group whitespace-nowrap"
+                                >
+                                  <div className="flex items-center gap-1">
+                                    <span>Контроль</span>
+                                    {renderSortIndicator('fillControl')}
+                                  </div>
+                                </th>
+                              )}
+
+                              {visibleColSet.has('groupSolutions') && (
+                                <th
+                                  onClick={() => handleSortToggle('groupSolutions')}
+                                  className="py-2 px-2.5 cursor-pointer hover:bg-slate-200 transition-colors group whitespace-nowrap"
+                                >
+                                  <div className="flex items-center gap-1">
+                                    <span>Группировка</span>
+                                    {renderSortIndicator('groupSolutions')}
+                                  </div>
+                                </th>
+                              )}
+
+                              {visibleColSet.has('customParams') && (
+                                <th
+                                  onClick={() => handleSortToggle('customParams')}
+                                  className="py-2 px-2.5 cursor-pointer hover:bg-slate-200 transition-colors group whitespace-nowrap"
+                                >
+                                  <div className="flex items-center gap-1">
+                                    <span>Настройки польз.</span>
+                                    {renderSortIndicator('customParams')}
+                                  </div>
+                                </th>
+                              )}
+
+                              {visibleColSet.has('cuttingIndex') && (
+                                <th
+                                  onClick={() => handleSortToggle('cuttingIndex')}
+                                  title={getComparisonMetricHelp('cuttingIndex')}
+                                  className="py-2 px-2 text-right cursor-pointer hover:bg-slate-200 transition-colors group whitespace-nowrap w-20"
+                                >
+                                  <div className="flex items-center justify-end gap-1">
+                                    <span className="text-emerald-900 font-bold">Индекс</span>
+                                    {renderSortIndicator('cuttingIndex')}
+                                  </div>
+                                </th>
+                              )}
+
+                              {visibleColSet.has('kim') && (
+                                <th
+                                  onClick={() => handleSortToggle('kim')}
+                                  title={getComparisonMetricHelp('kim')}
+                                  className="py-2 px-2 text-right cursor-pointer hover:bg-slate-200 transition-colors group whitespace-nowrap w-20"
+                                >
+                                  <div className="flex items-center justify-end gap-1">
+                                    <span>КИМ (вал.)</span>
+                                    {renderSortIndicator('kim')}
+                                  </div>
+                                </th>
+                              )}
+
+                              {visibleColSet.has('netKim') && (
+                                <th
+                                  onClick={() => handleSortToggle('netKim')}
+                                  title={getComparisonMetricHelp('netKim')}
+                                  className="py-2 px-2 text-right cursor-pointer hover:bg-slate-200 transition-colors group whitespace-nowrap w-20"
+                                >
+                                  <div className="flex items-center justify-end gap-1">
+                                    <span className="text-blue-900 font-bold">Мгн. КИМ</span>
+                                    {renderSortIndicator('netKim')}
+                                  </div>
+                                </th>
+                              )}
+
+                              {visibleColSet.has('cards') && (
+                                <th
+                                  onClick={() => handleSortToggle('cards')}
+                                  className="py-2 px-2.5 text-right cursor-pointer hover:bg-slate-200 transition-colors group whitespace-nowrap w-16"
+                                >
+                                  <div className="flex items-center justify-end gap-1">
+                                    <span>Карт</span>
+                                    {renderSortIndicator('cards')}
+                                  </div>
+                                </th>
+                              )}
+
+                              {visibleColSet.has('spent') && (
+                                <th
+                                  onClick={() => handleSortToggle('spent')}
+                                  className="py-2 px-2.5 text-right cursor-pointer hover:bg-slate-200 transition-colors group whitespace-nowrap w-24"
+                                >
+                                  <div className="flex items-center justify-end gap-1">
+                                    <span>Расход (м)</span>
+                                    {renderSortIndicator('spent')}
+                                  </div>
+                                </th>
+                              )}
+
+                              {visibleColSet.has('reusable') && (
+                                <th
+                                  onClick={() => handleSortToggle('reusable')}
+                                  className="py-2 px-2.5 text-right cursor-pointer hover:bg-slate-200 transition-colors group whitespace-nowrap w-24"
+                                >
+                                  <div className="flex items-center justify-end gap-1">
+                                    <span>Деловой (м)</span>
+                                    {renderSortIndicator('reusable')}
+                                  </div>
+                                </th>
+                              )}
+
+                              {visibleColSet.has('maxReusable') && (
+                                <th
+                                  onClick={() => handleSortToggle('maxReusable')}
+                                  title={getComparisonMetricHelp('maxReusable')}
+                                  className="py-2 px-2.5 text-right cursor-pointer hover:bg-slate-200 transition-colors group whitespace-nowrap w-24"
+                                >
+                                  <div className="flex items-center justify-end gap-1">
+                                    <span>Макс. остаток (м)</span>
+                                    {renderSortIndicator('maxReusable')}
+                                  </div>
+                                </th>
+                              )}
+
+                              {visibleColSet.has('offcuts') && (
+                                <th
+                                  onClick={() => handleSortToggle('offcuts')}
+                                  title={getComparisonMetricHelp('offcuts')}
+                                  className="py-2 px-2.5 text-right cursor-pointer hover:bg-slate-200 transition-colors group whitespace-nowrap w-22"
+                                >
+                                  <div className="flex items-center justify-end gap-1">
+                                    <span>Обрезки (м)</span>
+                                    {renderSortIndicator('offcuts')}
+                                  </div>
+                                </th>
+                              )}
+
+                              {visibleColSet.has('kerf') && (
+                                <th
+                                  onClick={() => handleSortToggle('kerf')}
+                                  title={getComparisonMetricHelp('kerf')}
+                                  className="py-2 px-2.5 text-right cursor-pointer hover:bg-slate-200 transition-colors group whitespace-nowrap w-22"
+                                >
+                                  <div className="flex items-center justify-end gap-1">
+                                    <span>Стружка (м)</span>
+                                    {renderSortIndicator('kerf')}
+                                  </div>
+                                </th>
+                              )}
+
+                              {visibleColSet.has('waste') && (
+                                <th
+                                  onClick={() => handleSortToggle('waste')}
+                                  title={getComparisonMetricHelp('waste')}
+                                  className="py-2 px-2.5 text-right cursor-pointer hover:bg-slate-200 transition-colors group whitespace-nowrap w-22"
+                                >
+                                  <div className="flex items-center justify-end gap-1">
+                                    <span>Отходы (м)</span>
+                                    {renderSortIndicator('waste')}
+                                  </div>
+                                </th>
+                              )}
+
+                              {visibleColSet.has('select') && (
+                                <th className="py-2 px-3 text-center w-24 whitespace-nowrap">
+                                  Выбор
+                                </th>
+                              )}
                             </tr>
                           </thead>
                           <tbody>
@@ -2343,8 +3155,19 @@ export const CalculationProgressModal: React.FC<CalculationProgressModalProps> =
                                 const netKimTheme = getKimTheme(netKim, hasUnplaced);
                                 const remnantTheme = getRemnantTheme(r.solution.totalReusableLength, hasUnplaced);
                                 const spentMeters = Number(((r.solution.totalStockLength || 0) / 1000).toFixed(2));
+                                const runWb = getSolutionWasteBreakdown(r.solution);
+                                const offcutsMeters = Number((runWb.offcutsMm / 1000).toFixed(2));
+                                const kerfMeters = Number((runWb.kerfMm / 1000).toFixed(2));
                                 const wasteMeters = Number(((r.solution.totalWasteLength || 0) / 1000).toFixed(2));
                                 const stdInfo = getPrimaryStandardSize(r.solution);
+                                const cuttingIndexInfo = computeCuttingIndexFromSolution(
+                                  r.solution,
+                                  mappedStockItems,
+                                  liveTargetRemnantMinLength
+                                );
+                                const cuttingIndexScale = computeCuttingIndexScale(cuttingIndexInfo.cuttingIndex);
+                                const maxRemnantMm = computeMaxReusableRemnantFromSolution(r.solution);
+                                const isBestIndex = r.id === bestIndexRunId;
 
                                 return (
                                   <tr
@@ -2355,89 +3178,81 @@ export const CalculationProgressModal: React.FC<CalculationProgressModalProps> =
                                         ? 'bg-amber-100 ring-2 ring-amber-400 font-bold'
                                         : isActive
                                         ? 'bg-blue-50/80 font-bold text-blue-950'
+                                        : isBestIndex
+                                        ? 'bg-emerald-50/70 hover:bg-emerald-100/70 text-slate-900'
                                         : isBaseline
                                         ? 'bg-slate-50/70 hover:bg-slate-100/80 border-slate-200 text-slate-800'
                                         : 'hover:bg-slate-50 text-slate-800'
                                     }`}
                                   >
-                                    {/* Вариант с кругом либо красным треугольником при дефиците деталей */}
-                                    <td className="py-2 px-2.5 whitespace-nowrap">
-                                      <div className="flex items-center gap-2 whitespace-nowrap">
-                                        {hasUnplaced ? (
-                                          <div
-                                            className="flex items-center text-rose-600 shrink-0 cursor-help"
-                                            title={`Не все детали вошли в раскрой! Не разложено: ${unplacedCount} шт.`}
-                                          >
-                                            <AlertTriangle className="w-4 h-4 fill-rose-100 text-rose-600 shrink-0" />
-                                          </div>
-                                        ) : (
-                                          <span
-                                            className={`w-2.5 h-2.5 rounded-full shrink-0 ${
-                                              isActive
-                                                ? 'bg-blue-600 ring-2 ring-blue-300'
-                                                : isBaseline
-                                                ? 'bg-slate-400 ring-1 ring-slate-300'
-                                                : 'bg-slate-300'
-                                            }`}
-                                          />
-                                        )}
-                                        <span className={`font-semibold ${isActive ? 'text-blue-950' : isBaseline ? 'text-slate-800' : 'text-slate-900'}`}>
-                                          {r.title}
-                                        </span>
-                                        {isBaseline && (
-                                          <span className="text-[9px] font-bold text-slate-600 bg-slate-200/90 px-1.5 py-0.2 rounded border border-slate-300">
-                                            Эталон
+                                    {visibleColSet.has('index') && (
+                                      <td className="py-2 px-2.5 whitespace-nowrap">
+                                        <div className="flex items-center gap-2 whitespace-nowrap">
+                                          {hasUnplaced ? (
+                                            <div
+                                              className="flex items-center text-rose-600 shrink-0 cursor-help"
+                                              title={formatUnplacedDeficitTooltip(unplacedCount)}
+                                            >
+                                              <AlertTriangle className="w-4 h-4 fill-rose-100 text-rose-600 shrink-0" />
+                                            </div>
+                                          ) : (
+                                            <span
+                                              className={`w-2.5 h-2.5 rounded-full shrink-0 ${
+                                                isActive
+                                                  ? 'bg-blue-600 ring-2 ring-blue-300'
+                                                  : isBaseline
+                                                  ? 'bg-slate-400 ring-1 ring-slate-300'
+                                                  : 'bg-slate-300'
+                                              }`}
+                                            />
+                                          )}
+                                          <span className={`font-semibold ${isActive ? 'text-blue-950' : isBaseline ? 'text-slate-800' : 'text-slate-900'}`}>
+                                            {r.title}
                                           </span>
-                                        )}
-                                        {hasUnplaced && (
-                                          <button
-                                            type="button"
-                                            onClick={(e) => {
-                                              e.stopPropagation();
-                                              setDeficitModalRun(r);
-                                            }}
-                                            title="Раскроить дефицит в отдельном окне с новым списком «ЕСТЬ»"
-                                            className="text-[10px] text-rose-700 font-bold bg-rose-50 hover:bg-rose-100 px-1.5 py-0.2 rounded border border-rose-300 transition-colors cursor-pointer flex items-center gap-0.5"
-                                          >
-                                            <Zap className="w-2.5 h-2.5 text-rose-600" />
-                                            <span>-{unplacedCount} (Дефицит)</span>
-                                          </button>
-                                        )}
-                                      </div>
-                                    </td>
+                                        </div>
+                                      </td>
+                                    )}
 
-                                    {/* Point 6: Размер стандартной заготовки в таблице */}
-                                    <td className="py-2 px-2.5 text-[11px] whitespace-nowrap">
-                                      <span
-                                        className={`px-1.5 py-0.5 rounded text-[10.5px] font-bold border ${
-                                          stdInfo.primarySize === 12000
-                                            ? 'bg-blue-50 text-blue-700 border-blue-200'
-                                            : 'bg-emerald-50 text-emerald-700 border-emerald-200'
-                                        }`}
-                                      >
-                                        {stdInfo.label}
-                                      </span>
-                                    </td>
+                                    {visibleColSet.has('standardSize') && (
+                                      <td className="py-2 px-2.5 text-[11px] whitespace-nowrap">
+                                        <span
+                                          className={`px-1.5 py-0.5 rounded text-[10.5px] font-bold border ${
+                                            stdInfo.primarySize === 12000
+                                              ? 'bg-blue-50 text-blue-700 border-blue-200'
+                                              : 'bg-emerald-50 text-emerald-700 border-emerald-200'
+                                          }`}
+                                        >
+                                          {stdInfo.label}
+                                        </span>
+                                      </td>
+                                    )}
 
-                                    {/* Стратегия */}
-                                    <td className="py-2 px-2.5 text-[11px] whitespace-nowrap">
-                                      <div className="flex items-center gap-1.5">
+                                    {visibleColSet.has('strategy') && (
+                                      <td className="py-2 px-2.5 text-[11px] whitespace-nowrap">
                                         <span className="font-medium text-slate-800">
                                           {isBaseline ? 'Порезка подряд' : getStrategyLabel(r.settings.optimizationGoal)}
                                         </span>
-                                        {(() => {
-                                          if (isBaseline) {
-                                            return (
+                                      </td>
+                                    )}
+
+                                    {visibleColSet.has('comments') && (
+                                      <td className="py-2 px-2.5 text-[11px] whitespace-nowrap">
+                                        <div className="flex items-center gap-1.5 flex-wrap">
+                                          {isBaseline && (
+                                            <>
+                                              <span className="text-[9.5px] font-bold text-slate-600 bg-slate-200/90 px-1.5 py-0.2 rounded border border-slate-300">
+                                                Эталон
+                                              </span>
                                               <span
                                                 className="text-[9.5px] font-semibold px-1.5 py-0.2 rounded border bg-slate-100 text-slate-600 border-slate-300"
                                                 title="Базовый раскрой от крупных деталей к мелким без оптимизации"
                                               >
                                                 📊 Без оптимизации
                                               </span>
-                                            );
-                                          }
-                                          if (r.badge) {
-                                            const isStopped = r.badge.includes('Остановлен');
+                                            </>
+                                          )}
+                                          {!isBaseline && r.badge && (() => {
+                                            const isStopped = r.badge.includes('Остановлен') || r.badge.includes('Прерван');
                                             return (
                                               <span
                                                 className={`text-[9.5px] font-semibold px-1.5 py-0.2 rounded border ${
@@ -2447,110 +3262,324 @@ export const CalculationProgressModal: React.FC<CalculationProgressModalProps> =
                                                 }`}
                                                 title={r.badge}
                                               >
-                                                {isStopped ? '⏹️ Остановлен' : r.badge}
+                                                {r.badge.includes('Остановлен') ? '⏹️ Остановлен' : r.badge}
                                               </span>
                                             );
-                                          }
-                                          const badge = getStrategyBadge(r.settings.optimizationGoal, r.settings);
-                                          if (!badge) return null;
-                                          return (
-                                            <span
-                                              className={`text-[9.5px] font-semibold px-1.5 py-0.2 rounded border ${badge.color}`}
+                                          })()}
+                                          {!isBaseline && !r.badge && (() => {
+                                            const badge = getStrategyBadge(r.settings.optimizationGoal, r.settings);
+                                            if (!badge) return null;
+                                            return (
+                                              <span
+                                                className={`text-[9.5px] font-semibold px-1.5 py-0.2 rounded border ${badge.color}`}
+                                              >
+                                                {badge.icon} {badge.label}
+                                              </span>
+                                            );
+                                          })()}
+                                          {hasUnplaced && (
+                                            <button
+                                              type="button"
+                                              onClick={(e) => {
+                                                e.stopPropagation();
+                                                setDeficitModalRun(r);
+                                              }}
+                                              title="Раскроить дефицит в отдельном окне с новым списком «ЕСТЬ»"
+                                              className="text-[10px] text-rose-700 font-bold bg-rose-50 hover:bg-rose-100 px-1.5 py-0.2 rounded border border-rose-300 transition-colors cursor-pointer flex items-center gap-0.5"
                                             >
-                                              {badge.icon} {badge.label}
+                                              <Zap className="w-2.5 h-2.5 text-rose-600" />
+                                              <span>-{unplacedCount} (Дефицит)</span>
+                                            </button>
+                                          )}
+                                          {r.settings.orderComment && (
+                                            <span className="text-[11px] text-slate-600 font-normal">
+                                              {r.settings.orderComment}
                                             </span>
-                                          );
-                                        })()}
-                                      </div>
-                                    </td>
+                                          )}
+                                          {!isBaseline &&
+                                            !r.badge &&
+                                            !getStrategyBadge(r.settings.optimizationGoal, r.settings) &&
+                                            !hasUnplaced &&
+                                            !r.settings.orderComment && (
+                                              <span className="text-slate-400 font-normal">—</span>
+                                            )}
+                                        </div>
+                                      </td>
+                                    )}
 
-                                    {/* Производительность */}
-                                    <td className="py-2 px-2.5 text-[11px] whitespace-nowrap text-slate-600">
-                                      {isBaseline ? (
-                                        <span className="text-slate-400 font-medium">—</span>
-                                      ) : (
-                                        getSpeedLabel(r.settings.searchSpeed)
-                                      )}
-                                    </td>
+                                    {visibleColSet.has('speed') && (
+                                      <td className="py-2 px-2.5 text-[11px] whitespace-nowrap text-slate-600">
+                                        {isBaseline ? (
+                                          <span className="text-slate-400 font-medium">—</span>
+                                        ) : (
+                                          getSpeedLabel(r.settings.searchSpeed)
+                                        )}
+                                      </td>
+                                    )}
 
-                                    {/* 2 профиля */}
-                                    <td className="py-2 px-2.5 text-[11px] whitespace-nowrap">
-                                      {r.settings.dualProfileCut ? (
-                                        <span className="text-blue-700 font-semibold bg-blue-50 px-1.5 py-0.5 rounded border border-blue-200">
-                                          Да
-                                        </span>
-                                      ) : (
-                                        <span className="text-slate-400 font-normal">Нет</span>
-                                      )}
-                                    </td>
+                                    {visibleColSet.has('multiThread') && (
+                                      <td className="py-2 px-2.5 text-[11px] whitespace-nowrap">
+                                        {isBaseline ? (
+                                          <span className="text-slate-400 font-normal">—</span>
+                                        ) : r.settings.multiThreadEnabled ? (
+                                          <span className="text-blue-700 font-semibold">
+                                            Да
+                                            {(r.solution.telemetry?.workerThreadCount ?? 1) > 1
+                                              ? ` (${r.solution.telemetry?.workerThreadCount} пот.)`
+                                              : ''}
+                                          </span>
+                                        ) : (
+                                          <span className="text-slate-400 font-normal">Нет</span>
+                                        )}
+                                      </td>
+                                    )}
 
-                                    {/* Контроль заполнения */}
-                                    <td className="py-2 px-2.5 text-[11px] whitespace-nowrap font-mono">
-                                      {r.settings.dualProfileCut && r.settings.fillControlEnabled ? (
-                                        <span className="text-blue-800 font-medium">
-                                          {r.settings.fillControlThreshold ?? 50}%
-                                        </span>
-                                      ) : (
-                                        <span className="text-slate-400 font-normal">—</span>
-                                      )}
-                                    </td>
+                                    {visibleColSet.has('exactSolver') && (
+                                      <td className="py-2 px-2.5 text-[11px] whitespace-nowrap">
+                                        {isBaseline ? (
+                                          <span className="text-slate-400 font-normal">—</span>
+                                        ) : r.settings.searchSpeed === 'exact' ||
+                                          r.settings.exactSolverEnabled ? (
+                                          <span className="text-blue-700 font-semibold">Да</span>
+                                        ) : (
+                                          <span className="text-slate-400 font-normal">Нет</span>
+                                        )}
+                                      </td>
+                                    )}
 
+                                    {visibleColSet.has('prioritizeRemnants') && (
+                                      <td className="py-2 px-2.5 text-[11px] whitespace-nowrap">
+                                        {isBaseline ? (
+                                          <span className="text-slate-400 font-normal">—</span>
+                                        ) : r.settings.prioritizeRemnants ? (
+                                          <span className="text-blue-700 font-semibold">Да</span>
+                                        ) : (
+                                          <span className="text-slate-400 font-normal">Нет</span>
+                                        )}
+                                      </td>
+                                    )}
 
-                                    {/* КИМ (валовый) */}
-                                    <td
-                                      title="Валовый КИМ: выход готовых деталей + деловой остаток"
-                                      className={`py-2 px-2 text-right font-mono whitespace-nowrap ${kimTheme.tableText}`}
-                                    >
-                                      {r.solution.overallKIM.toFixed(2)}%
-                                    </td>
+                                    {visibleColSet.has('remnantMinFill') && (
+                                      <td className="py-2 px-2.5 text-[11px] whitespace-nowrap font-mono">
+                                        {isBaseline ? (
+                                          <span className="text-slate-400 font-normal">—</span>
+                                        ) : r.settings.prioritizeRemnants ? (
+                                          <span className="text-blue-800 font-medium">
+                                            {r.settings.remnantMinFillPct ??
+                                              r.settings.targetRemnantKIM ??
+                                              75}
+                                            %
+                                          </span>
+                                        ) : (
+                                          <span className="text-slate-400 font-normal font-sans">—</span>
+                                        )}
+                                      </td>
+                                    )}
 
-                                    {/* Мгновенный КИМ (чистый) */}
-                                    <td
-                                      title="Мгновенный (чистый) КИМ: выход готовых деталей без делового остатка"
-                                      className={`py-2 px-2 text-right font-mono whitespace-nowrap ${netKimTheme.tableText}`}
-                                    >
-                                      {netKim.toFixed(2)}%
-                                    </td>
+                                    {visibleColSet.has('shapeRemnants') && (
+                                      <td className="py-2 px-2.5 text-[11px] whitespace-nowrap font-mono">
+                                        {isBaseline ? (
+                                          <span className="text-slate-400 font-normal">—</span>
+                                        ) : r.settings.shapeRemnantsInSearch ? (
+                                          <span className="text-blue-800 font-medium">
+                                            {r.settings.shapeRemnantsThresholdPct ?? 50}%
+                                          </span>
+                                        ) : (
+                                          <span className="text-slate-400 font-normal font-sans">Нет</span>
+                                        )}
+                                      </td>
+                                    )}
 
-                                    {/* Карт раскроя */}
-                                    <td className={`py-2 px-2.5 text-right whitespace-nowrap ${getCardsTheme(r.solution.rows.length, hasUnplaced)}`}>
-                                      {r.solution.rows.length}
-                                    </td>
+                                    {visibleColSet.has('bladeWidth') && (
+                                      <td className="py-2 px-2.5 text-[11px] text-right whitespace-nowrap font-mono text-slate-700 tabular-nums">
+                                        {r.settings.bladeWidth} мм
+                                      </td>
+                                    )}
 
-                                    {/* Расход хлыстов (м) */}
-                                    <td className={`py-2 px-2.5 text-right whitespace-nowrap ${getSpentTheme(spentMeters, hasUnplaced)}`}>
-                                      {((r.solution.totalStockLength || 0) / 1000).toFixed(1)} м
-                                    </td>
+                                    {visibleColSet.has('edgeTrim') && (
+                                      <td className="py-2 px-2.5 text-[11px] text-right whitespace-nowrap font-mono text-slate-700 tabular-nums">
+                                        {r.settings.edgeTrim || 0} мм
+                                      </td>
+                                    )}
 
-                                    {/* Деловой остаток (м) */}
-                                    <td className={`py-2 px-2.5 text-right font-mono whitespace-nowrap ${remnantTheme.tableText}`}>
-                                      {(r.solution.totalReusableLength / 1000).toFixed(2)}
-                                    </td>
+                                    {visibleColSet.has('reusableMin') && (
+                                      <td className="py-2 px-2.5 text-[11px] text-right whitespace-nowrap font-mono text-slate-700 tabular-nums">
+                                        {r.settings.reusableRemnantMin} мм
+                                      </td>
+                                    )}
 
-                                    {/* Отход и резы (м) */}
-                                    <td className={`py-2 px-2.5 text-right whitespace-nowrap ${getWasteTheme(wasteMeters, hasUnplaced)}`}>
-                                      {(r.solution.totalWasteLength / 1000).toFixed(2)}
-                                    </td>
+                                    {visibleColSet.has('reusableMode') && (
+                                      <td className="py-2 px-2.5 text-[11px] whitespace-nowrap text-slate-600">
+                                        {isBaseline ? (
+                                          <span className="text-slate-400 font-normal">—</span>
+                                        ) : (
+                                          getReusableModeLabel(r.settings.reusableRemnantMode)
+                                        )}
+                                      </td>
+                                    )}
 
-                                    {/* Выбор */}
-                                    <td className="py-2 px-2.5 text-center whitespace-nowrap">
-                                      {isActive ? (
-                                        <span className="inline-flex items-center gap-1 px-2.5 py-0.5 bg-blue-600 text-white text-[10px] font-bold rounded-md whitespace-nowrap shadow-xs">
-                                          <Check className="w-3 h-3" />
-                                          Активен
-                                        </span>
-                                      ) : (
-                                        <span className="text-[11px] text-slate-500 hover:text-blue-600 font-medium whitespace-nowrap">
-                                          Выбрать
-                                        </span>
-                                      )}
-                                    </td>
+                                    {visibleColSet.has('dualProfile') && (
+                                      <td className="py-2 px-2.5 text-[11px] whitespace-nowrap">
+                                        {r.settings.dualProfileCut ? (
+                                          <span className="text-blue-700 font-semibold bg-blue-50 px-1.5 py-0.5 rounded border border-blue-200">
+                                            Да
+                                          </span>
+                                        ) : (
+                                          <span className="text-slate-400 font-normal">Нет</span>
+                                        )}
+                                      </td>
+                                    )}
+
+                                    {visibleColSet.has('batchSize') && (
+                                      <td className="py-2 px-2.5 text-[11px] whitespace-nowrap font-mono">
+                                        {r.settings.dualProfileCut ? (
+                                          <span className="text-slate-700 font-medium">
+                                            {r.solution.batchInfo?.batchSize ?? r.settings.batchSizeN ?? 2} шт. (
+                                            {(r.settings.batchSizeMode ?? 'auto') === 'auto' ? 'авто' : 'ручн.'})
+                                          </span>
+                                        ) : (
+                                          <span className="text-slate-400 font-normal font-sans">—</span>
+                                        )}
+                                      </td>
+                                    )}
+
+                                    {visibleColSet.has('fillControl') && (
+                                      <td className="py-2 px-2.5 text-[11px] whitespace-nowrap font-mono">
+                                        {r.settings.dualProfileCut && r.settings.fillControlEnabled ? (
+                                          <span className="text-blue-800 font-medium">
+                                            {r.settings.fillControlThreshold ?? 50}%
+                                          </span>
+                                        ) : (
+                                          <span className="text-slate-400 font-normal">—</span>
+                                        )}
+                                      </td>
+                                    )}
+
+                                    {visibleColSet.has('groupSolutions') && (
+                                      <td className="py-2 px-2.5 text-[11px] whitespace-nowrap">
+                                        {r.settings.groupSolutions !== false ? (
+                                          <span className="text-slate-700 font-medium">Да</span>
+                                        ) : (
+                                          <span className="text-slate-400 font-normal">Нет</span>
+                                        )}
+                                      </td>
+                                    )}
+
+                                    {visibleColSet.has('customParams') && (
+                                      <td className="py-2 px-2.5 text-[11px] whitespace-nowrap font-mono text-slate-600">
+                                        {!isBaseline && r.settings.optimizationGoal === 'custom' ? (
+                                          getCustomParamsSummary(r.settings)
+                                        ) : (
+                                          <span className="text-slate-400 font-normal font-sans">—</span>
+                                        )}
+                                      </td>
+                                    )}
+
+                                    {visibleColSet.has('cuttingIndex') && (
+                                      <td
+                                        title={formatCuttingIndexRowTooltip(
+                                          cuttingIndexInfo.cuttingIndex,
+                                          cuttingIndexInfo.cuttingIndexMaterial,
+                                          cuttingIndexInfo.cuttingIndexSetup
+                                        )}
+                                        className={`py-2 px-2 text-right font-mono tabular-nums whitespace-nowrap ${
+                                          hasUnplaced
+                                            ? 'text-slate-400 font-normal'
+                                            : isBestIndex
+                                            ? 'text-emerald-700 font-extrabold'
+                                            : 'text-slate-800 font-semibold'
+                                        }`}
+                                      >
+                                        {isBestIndex && !hasUnplaced ? `★ ${cuttingIndexScale}` : cuttingIndexScale}
+                                      </td>
+                                    )}
+
+                                    {visibleColSet.has('kim') && (
+                                      <td
+                                        title={getComparisonMetricHelp('kim')}
+                                        className={`py-2 px-2 text-right font-mono whitespace-nowrap ${kimTheme.tableText}`}
+                                      >
+                                        {r.solution.overallKIM.toFixed(2)}%
+                                      </td>
+                                    )}
+
+                                    {visibleColSet.has('netKim') && (
+                                      <td
+                                        title={getComparisonMetricHelp('netKim')}
+                                        className={`py-2 px-2 text-right font-mono whitespace-nowrap ${netKimTheme.tableText}`}
+                                      >
+                                        {netKim.toFixed(2)}%
+                                      </td>
+                                    )}
+
+                                    {visibleColSet.has('cards') && (
+                                      <td className={`py-2 px-2.5 text-right whitespace-nowrap ${getCardsTheme(r.solution.rows.length, hasUnplaced)}`}>
+                                        {r.solution.rows.length}
+                                      </td>
+                                    )}
+
+                                    {visibleColSet.has('spent') && (
+                                      <td className={`py-2 px-2.5 text-right whitespace-nowrap ${getSpentTheme(spentMeters, hasUnplaced)}`}>
+                                        {((r.solution.totalStockLength || 0) / 1000).toFixed(1)} м
+                                      </td>
+                                    )}
+
+                                    {visibleColSet.has('reusable') && (
+                                      <td className={`py-2 px-2.5 text-right font-mono whitespace-nowrap ${remnantTheme.tableText}`}>
+                                        {(r.solution.totalReusableLength / 1000).toFixed(2)}
+                                      </td>
+                                    )}
+
+                                    {visibleColSet.has('maxReusable') && (
+                                      <td
+                                        className={`py-2 px-2.5 text-right font-mono tabular-nums whitespace-nowrap ${
+                                          hasUnplaced || maxRemnantMm === 0
+                                            ? 'text-slate-400 font-normal'
+                                            : 'text-amber-700 font-semibold'
+                                        }`}
+                                      >
+                                        {maxRemnantMm > 0 ? (maxRemnantMm / 1000).toFixed(2) : '—'}
+                                      </td>
+                                    )}
+
+                                    {visibleColSet.has('offcuts') && (
+                                      <td className={`py-2 px-2.5 text-right whitespace-nowrap tabular-nums ${getOffcutsTheme(offcutsMeters, hasUnplaced)}`}>
+                                        {offcutsMeters.toFixed(2)}
+                                      </td>
+                                    )}
+
+                                    {visibleColSet.has('kerf') && (
+                                      <td className={`py-2 px-2.5 text-right whitespace-nowrap tabular-nums ${getKerfTheme(kerfMeters, hasUnplaced)}`}>
+                                        {kerfMeters.toFixed(2)}
+                                      </td>
+                                    )}
+
+                                    {visibleColSet.has('waste') && (
+                                      <td className={`py-2 px-2.5 text-right whitespace-nowrap tabular-nums ${getWasteTheme(wasteMeters, hasUnplaced)}`}>
+                                        {(r.solution.totalWasteLength / 1000).toFixed(2)}
+                                      </td>
+                                    )}
+
+                                    {visibleColSet.has('select') && (
+                                      <td className="py-2 px-2.5 text-center whitespace-nowrap">
+                                        {isActive ? (
+                                          <span className="inline-flex items-center gap-1 px-2.5 py-0.5 bg-blue-600 text-white text-[10px] font-bold rounded-md whitespace-nowrap shadow-xs">
+                                            <Check className="w-3 h-3" />
+                                            Активен
+                                          </span>
+                                        ) : (
+                                          <span className="text-[11px] text-slate-500 hover:text-blue-600 font-medium whitespace-nowrap">
+                                            Выбрать
+                                          </span>
+                                        )}
+                                      </td>
+                                    )}
                                   </tr>
                                 );
                               })
                             ) : (
                               <tr>
-                                <td colSpan={14} className="py-6 text-center text-slate-400 text-xs">
+                                <td colSpan={Math.max(1, visibleColumns.length)} className="py-6 text-center text-slate-400 text-xs">
                                   Нет вариантов, соответствующих выбранным фильтрам
                                 </td>
                               </tr>
@@ -2580,7 +3609,32 @@ export const CalculationProgressModal: React.FC<CalculationProgressModalProps> =
                 </div>
               )}
 
-              {/* Sub-tab 2: Reusable Remnants List */}
+              {/* Sub-tab 2: Detailed Statistics Table for Selected Calculation (no graphics) */}
+              {activeSubTab === 'details' && activeSolution && (
+                <div className="space-y-3">
+                  <div className="p-3 bg-slate-50 border border-slate-200 rounded-xl text-xs text-slate-700 flex flex-wrap items-center justify-between gap-2">
+                    <div>
+                      <span className="font-bold text-slate-900">
+                        Выбранный вариант: {activeRun?.title || 'Текущий расчет'}
+                      </span>
+                      <span className="text-slate-500 ml-2">
+                        ({activeSolution.rows.length} карт · {activeSolution.totalBarsUsed} профилей · КИМ {activeSolution.overallKIM.toFixed(2)}%)
+                      </span>
+                    </div>
+                    <span className="text-[11px] text-slate-500">
+                      Табличный просмотр без графики · сортировка и фильтрация по картам
+                    </span>
+                  </div>
+
+                  <CuttingStatsTable
+                    solution={activeSolution}
+                    groupSolutions={modalSettings.groupSolutions !== false}
+                    title={`Детализация карт: ${activeRun?.title || 'Выбранный расчет'}`}
+                  />
+                </div>
+              )}
+
+              {/* Sub-tab 3: Reusable Remnants List */}
               {activeSubTab === 'remnants' && (
                 <div className="space-y-4">
                   {/* Explanation banner */}
@@ -2588,12 +3642,6 @@ export const CalculationProgressModal: React.FC<CalculationProgressModalProps> =
                     <div>
                       <span className="font-bold">Порог делового остатка:</span> обрезки длиной от{' '}
                       <strong>{modalSettings.reusableRemnantMin} мм</strong> и более считаются пригодными для повторного использования и возвращаются на склад.
-                      {activeRun?.settings.optimizationGoal === 'max_reusable' && (
-                        <div className="mt-1 text-[11px] text-amber-800">
-                          🎯 <strong>Стратегия «Максимум делового»:</strong> расчет ориентирован на формирование остатков длиной от{' '}
-                          <strong className="underline decoration-amber-500">{activeRun.settings.targetRemnantMinLength ?? 1500} мм</strong>.
-                        </div>
-                      )}
                     </div>
                     <div className="shrink-0 font-mono font-bold text-amber-800 text-sm">
                       {totalCutRemnantsMeters.toFixed(2)} м / {totalCutRemnantsCount} шт.
@@ -2614,7 +3662,7 @@ export const CalculationProgressModal: React.FC<CalculationProgressModalProps> =
                               <th className="py-2 px-3">Размер (мм)</th>
                               <th className="py-2 px-3 text-right">Кол-во (шт.)</th>
                               <th className="py-2 px-3 text-right">Суммарная длина (м)</th>
-                              <th className="py-2 px-3">Получен из хлыстов</th>
+                              <th className="py-2 px-3">Получен из профилей</th>
                             </tr>
                           </thead>
                           <tbody>
@@ -2721,7 +3769,7 @@ export const CalculationProgressModal: React.FC<CalculationProgressModalProps> =
               onClick={handleConfirmAndGo}
               className="flex items-center gap-2 px-5 py-2.5 text-xs font-bold text-white bg-blue-600 hover:bg-blue-500 rounded-xl shadow-md hover:shadow-lg transition-all cursor-pointer"
             >
-              <span>Применить и перейти к раскрою</span>
+              <span>Показать активный расчет</span>
               <ArrowRight className="w-4 h-4" />
             </button>
           )}
@@ -2813,7 +3861,7 @@ export const CalculationProgressModal: React.FC<CalculationProgressModalProps> =
                       Вариант А: Быстрый раскрой
                     </span>
                     <p className="text-[11px] text-slate-500 mt-1 leading-relaxed">
-                      Подобрать раскрой только для дефицита со стандартных хлыстов прямо сейчас.
+                      Подобрать раскрой только для дефицита со стандартных профилей прямо сейчас.
                     </p>
 
                     <div className="mt-2.5 space-y-2">
@@ -2864,10 +3912,11 @@ export const CalculationProgressModal: React.FC<CalculationProgressModalProps> =
                         onChange={(e) => setDeficitStrategy(e.target.value)}
                         className="w-full bg-white border border-slate-300 rounded-lg text-xs py-1 px-2 font-medium"
                       >
-                        <option value="variants">Минимум наладок</option>
-                        <option value="min_waste">Минимум отходов</option>
-                        <option value="min_bars">Минимум хлыстов</option>
-                        <option value="max_reusable">Максимум делового</option>
+                        {DEFICIT_OPTIMIZATION_OPTIONS.map((option) => (
+                          <option key={option.value} value={option.value}>
+                            {option.shortLabel ?? option.label}
+                          </option>
+                        ))}
                       </select>
                     </div>
                   </div>
@@ -2920,21 +3969,6 @@ export const CalculationProgressModal: React.FC<CalculationProgressModalProps> =
         </div>
       )}
 
-      {/* System Audit & Resource Telemetry Modal */}
-      <AuditTelemetryModal
-        isOpen={isAuditModalOpen}
-        onClose={() => setIsAuditModalOpen(false)}
-        runs={runs}
-        activeRunId={activeRunId}
-        onSelectRun={(id) => {
-          setActiveRunId(id);
-          const r = runs.find((item) => item.id === id);
-          if (r && onApplySolutionAndSettings) {
-            onApplySolutionAndSettings(r.solution, r.settings);
-          }
-        }}
-        onClearHistory={handleClearRuns}
-      />
     </>
   );
 };

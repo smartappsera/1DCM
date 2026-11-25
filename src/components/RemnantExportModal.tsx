@@ -6,7 +6,6 @@ import {
   FileSpreadsheet,
   FileCode,
   RefreshCw,
-  CheckCircle,
   AlertCircle,
 } from 'lucide-react';
 import {

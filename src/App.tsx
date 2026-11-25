@@ -3,7 +3,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-import React, { useState, useMemo, useRef, useEffect } from 'react';
+import { useState, useMemo, useRef, useEffect } from 'react';
 import { Header } from './components/Header';
 import { SettingsSidebar } from './components/SettingsSidebar';
 import { CalculationSpoiler } from './components/CalculationSpoiler';
@@ -14,15 +14,21 @@ import { ExcelPasteModal } from './components/ExcelPasteModal';
 import { CalculationProgressModal, CalculationRun } from './components/CalculationProgressModal';
 import { FeedbackDonationModal } from './components/FeedbackDonationModal';
 import { AuditTelemetryModal } from './components/AuditTelemetryModal';
-import { solveLinearCutting, recalculateSolutionWithSettings, getDefaultDemandColor } from './utils/cuttingEngine';
+import {
+  solveLinearCutting,
+  recalculateSolutionWithSettings,
+  getDefaultDemandColor,
+  computeReusableRemnantMin,
+} from './utils/cuttingEngine';
 import { exportSolutionToExcel } from './utils/dataIO';
+import { getRowWasteBreakdown, getSolutionWasteBreakdown } from './utils/wasteBreakdown';
 import {
   AppSettings,
   FullOptimizationSolution,
   StockItem,
   DemandItem,
 } from './types/cutting';
-import { Play, Lock, Unlock } from 'lucide-react';
+import { Lock, Unlock } from 'lucide-react';
 
 export default function App() {
   const [activeTab, setActiveTab] = useState<'workspace' | 'visualizer' | 'reports'>('workspace');
@@ -36,6 +42,12 @@ export default function App() {
   };
 
   const handleTabChange = (newTab: 'workspace' | 'visualizer' | 'reports') => {
+    setIsProgressModalOpen(false);
+    if (newTab === 'workspace') {
+      setIsSettingsOpen(true);
+    } else if (newTab === 'reports') {
+      setIsSettingsOpen(false);
+    }
     if (newTab === activeTab) return;
     const currentIdx = TAB_ORDER[activeTab];
     const nextIdx = TAB_ORDER[newTab];
@@ -58,17 +70,24 @@ export default function App() {
     orderNumber: 'ПР-01',
     bladeWidth: 3,
     edgeTrim: 0,
-    reusableRemnantMin: 250, // Yields 98.60% KIM matching Screenshot 5 & 6
+    reusableRemnantMin: 250,
+    reusableRemnantMode: 'manual',
     cutAngle45: false,
     dualProfileCut: true,
+    batchSizeMode: 'auto',
+    batchSizeN: 2,
     prioritizeRemnants: false,
+    remnantMinFillPct: 75,
     fillControlEnabled: false,
     fillControlThreshold: 50,
     groupSolutions: true,
     showGraphics: true,
     searchSpeed: 'fast',
+    multiThreadEnabled: false,
+    exactSolverEnabled: false,
     optimizationGoal: 'variants',
-    targetRemnantMinLength: 1500,
+    shapeRemnantsInSearch: false,
+    shapeRemnantsThresholdPct: 50,
   });
 
   // Stocks («Есть») initialized with pinned standard bars + benchmark remnants
@@ -110,7 +129,7 @@ export default function App() {
         (s) =>
           `${s.length}:${s.quantity}:${
             s.isStandardUnlimited ||
-            ((s.length === 6000 || s.length === 12000) && s.quantity <= 0)
+            ((s.length === 6000 || s.length === 12000 || s.length === 11700) && s.quantity <= 0)
               ? 'U'
               : 'Q'
           }`
@@ -146,6 +165,52 @@ export default function App() {
       }
     }
   }, [demandSignature, savedRuns.length, solution]);
+
+  // Keep reusableRemnantMin in sync when reusableRemnantMode is 'weighted' or 'min_part'
+  const remnantMode = settings.reusableRemnantMode ?? 'manual';
+  const computedAutoRemnantMin = useMemo(
+    () =>
+      remnantMode === 'manual'
+        ? settings.reusableRemnantMin
+        : computeReusableRemnantMin(demandItems, remnantMode, settings.reusableRemnantMin),
+    [demandItems, remnantMode, settings.reusableRemnantMin]
+  );
+
+  useEffect(() => {
+    if (remnantMode === 'manual') return;
+    if (settings.reusableRemnantMin !== computedAutoRemnantMin) {
+      setSettings((prev) =>
+        (prev.reusableRemnantMode ?? 'manual') !== 'manual' &&
+        prev.reusableRemnantMin !== computedAutoRemnantMin
+          ? { ...prev, reusableRemnantMin: computedAutoRemnantMin }
+          : prev
+      );
+    }
+  }, [remnantMode, settings.reusableRemnantMin, computedAutoRemnantMin]);
+
+  // Recalculate solution Index immediately when reusableRemnantMin changes (without re-running solver)
+  useEffect(() => {
+    if (!solution || solution.rows.length === 0) return;
+    const mappedStocks: StockItem[] = stockItems.map((s) => ({
+      id: s.id,
+      orderIndex: s.orderIndex,
+      length: s.length,
+      quantity: s.quantity,
+      isActive: s.isActive !== false,
+      isStandardUnlimited:
+        s.isStandardUnlimited ||
+        ((s.length === 6000 || s.length === 12000 || s.length === 11700) && s.quantity <= 0),
+      mark: s.mark,
+      notes: s.notes,
+    }));
+    const updated = recalculateSolutionWithSettings(solution, settings, mappedStocks);
+    if (
+      updated.cuttingIndex !== solution.cuttingIndex ||
+      updated.cuttingIndexMaterial !== solution.cuttingIndexMaterial
+    ) {
+      setSolution(updated);
+    }
+  }, [settings.reusableRemnantMin]);
 
   // Synchronize solution piece colors dynamically when demandItem colors are customized
   useEffect(() => {
@@ -260,7 +325,10 @@ export default function App() {
       .filter((s) => {
         if (s.length <= 0) return false;
         // Standard length bars (6000, 12000) or explicit isStandardUnlimited can have quantity === 0 (auto-calculate)
-        if (s.isStandardUnlimited || ((s.length === 6000 || s.length === 12000) && s.quantity <= 0)) {
+        if (
+          s.isStandardUnlimited ||
+          ((s.length === 6000 || s.length === 12000 || s.length === 11700) && s.quantity <= 0)
+        ) {
           return true;
         }
         return s.quantity > 0;
@@ -271,10 +339,11 @@ export default function App() {
         length: s.length,
         quantity: s.quantity,
         isActive: s.isActive !== false,
-        isStandard: s.isStandard || s.length === 6000 || s.length === 12000,
+        isStandard:
+          s.isStandard || s.length === 6000 || s.length === 12000 || s.length === 11700,
         isStandardUnlimited:
           s.isStandardUnlimited ||
-          ((s.length === 6000 || s.length === 12000) && s.quantity <= 0),
+          ((s.length === 6000 || s.length === 12000 || s.length === 11700) && s.quantity <= 0),
         mark: s.mark,
         notes: s.notes,
       }));
@@ -313,11 +382,20 @@ export default function App() {
       newSettings.bladeWidth !== settings.bladeWidth ||
       newSettings.edgeTrim !== settings.edgeTrim ||
       newSettings.optimizationGoal !== settings.optimizationGoal ||
-      newSettings.targetRemnantKIM !== settings.targetRemnantKIM ||
-      newSettings.targetRemnantMinLength !== settings.targetRemnantMinLength ||
+      newSettings.searchSpeed !== settings.searchSpeed ||
+      Boolean(newSettings.exactSolverEnabled) !== Boolean(settings.exactSolverEnabled) ||
+      Boolean(newSettings.multiThreadEnabled) !== Boolean(settings.multiThreadEnabled) ||
+      Boolean(newSettings.prioritizeRemnants) !== Boolean(settings.prioritizeRemnants) ||
+      (newSettings.remnantMinFillPct ?? newSettings.targetRemnantKIM ?? 75) !==
+        (settings.remnantMinFillPct ?? settings.targetRemnantKIM ?? 75) ||
       newSettings.dualProfileCut !== settings.dualProfileCut ||
+      (newSettings.batchSizeMode ?? 'auto') !== (settings.batchSizeMode ?? 'auto') ||
+      (newSettings.batchSizeN ?? 2) !== (settings.batchSizeN ?? 2) ||
       newSettings.cutAngle45 !== settings.cutAngle45 ||
-      newSettings.groupSolutions !== settings.groupSolutions;
+      newSettings.groupSolutions !== settings.groupSolutions ||
+      (newSettings.shapeRemnantsInSearch ?? false) !== (settings.shapeRemnantsInSearch ?? false) ||
+      (newSettings.shapeRemnantsThresholdPct ?? 50) !==
+        (settings.shapeRemnantsThresholdPct ?? 50);
 
     if (isCoreDimensionChanged) {
       performSolve(newSettings);
@@ -333,7 +411,7 @@ export default function App() {
           isActive: s.isActive !== false,
           isStandardUnlimited:
             s.isStandardUnlimited ||
-            ((s.length === 6000 || s.length === 12000) && s.quantity <= 0),
+            ((s.length === 6000 || s.length === 12000 || s.length === 11700) && s.quantity <= 0),
           mark: s.mark,
           notes: s.notes,
         }))
@@ -356,7 +434,8 @@ export default function App() {
     if (!solution) return 0;
     const isAuto =
       item.isStandardUnlimited ||
-      ((item.length === 6000 || item.length === 12000) && item.quantity <= 0);
+      ((item.length === 6000 || item.length === 12000 || item.length === 11700) &&
+        item.quantity <= 0);
     if (isAuto) return 0;
     const usedCount = solution.rows
       .filter((r) => r.barSize === item.length)
@@ -477,7 +556,8 @@ export default function App() {
         mark: item.mark || '',
         notes: item.notes || '',
         isStandardUnlimited:
-          (item.length === 6000 || item.length === 12000) && item.quantity === 0,
+          (item.length === 6000 || item.length === 12000 || item.length === 11700) &&
+          item.quantity === 0,
       }));
       setStockItems((prev) => [...prev, ...newItems]);
     } else {
@@ -500,11 +580,8 @@ export default function App() {
       <Header
         activeTab={activeTab}
         setActiveTab={handleTabChange}
-        onCalculate={handleStartCalculation}
         onOpenFeedback={() => setIsFeedbackModalOpen(true)}
         onOpenAudit={() => setIsAuditModalOpen(true)}
-        onPrint={() => handleTabChange('reports')}
-        onExportExcel={handleExportExcel}
         hasResults={Boolean(solution && solution.rows.length > 0)}
         onLoadBenchmarkExample={handleLoadBenchmarkExample}
       />
@@ -518,8 +595,8 @@ export default function App() {
           isOpen={isSettingsOpen}
           setIsOpen={setIsSettingsOpen}
           onCalculate={handleStartCalculation}
-          onLoadBenchmarkExample={handleLoadBenchmarkExample}
           hasResults={Boolean(solution && solution.rows.length > 0)}
+          demandItems={demandItems}
         />
 
         {/* Calculation Comparison Vertical Spoiler (visible when calculations exist and panel is collapsed) */}
@@ -734,51 +811,55 @@ export default function App() {
         )}
 
         {/* Reports Tab: Production Work Order & Component Labels */}
-        {activeTab === 'reports' && solution && (
+        {activeTab === 'reports' && solution && (() => {
+          const solWb = getSolutionWasteBreakdown(solution);
+          return (
           <PrintReports
             result={{
-              patterns: solution.rows.map((r) => ({
-                id: r.id,
-                patternIndex: r.barIndex,
-                stockBarId: 's1',
-                stockName: `Хлыст ${r.barSize} мм`,
-                stockLength: r.barSize,
-                trimStart: settings.edgeTrim,
-                trimEnd: 0,
-                bladeWidth: settings.bladeWidth,
-                cuts: r.pieces.flatMap((p) =>
-                  Array.from({ length: p.count }).map((_, cIdx) => ({
-                    id: `${r.id}_${p.length}_${cIdx}`,
-                    partId: `part_${p.length}`,
-                    mark: `Д-${p.length}`,
-                    length: p.length,
-                    startOffset: 0,
-                    endOffset: 0,
-                    color: p.color,
-                  }))
-                ),
-                totalPartsLength: r.spent,
-                totalKerfLength: r.pieces.reduce(
-                  (sum, p) => sum + p.count * settings.bladeWidth,
-                  0
-                ),
-                wasteLength: r.isReusable ? (r.reusableRemnant || 0) : (r.scrapRemnant || r.waste),
-                isReusableWaste: r.isReusable,
-                reusableLength: r.isReusable ? (r.reusableRemnant || 0) : 0,
-                scrapLength: r.isReusable ? r.waste : (r.scrapRemnant || r.waste),
-                efficiencyPercent: r.efficiency,
-                count: r.barsCount,
-              })),
+              patterns: solution.rows.map((r) => {
+                const rowWb = getRowWasteBreakdown(r);
+                return {
+                  id: r.id,
+                  patternIndex: r.barIndex,
+                  stockBarId: 's1',
+                  stockName: `Профиль ${r.barSize} мм`,
+                  stockLength: r.barSize,
+                  trimStart: rowWb.trimMm,
+                  trimEnd: 0,
+                  bladeWidth: settings.bladeWidth,
+                  cuts: r.pieces.flatMap((p) =>
+                    Array.from({ length: p.count }).map((_, cIdx) => ({
+                      id: `${r.id}_${p.length}_${cIdx}`,
+                      partId: `part_${p.length}`,
+                      mark: `Д-${p.length}`,
+                      length: p.length,
+                      startOffset: 0,
+                      endOffset: 0,
+                      color: p.color,
+                    }))
+                  ),
+                  totalPartsLength: r.spent,
+                  totalKerfLength: rowWb.kerfMm,
+                  wasteLength: r.isReusable ? (r.reusableRemnant || 0) : rowWb.scrapMm,
+                  isReusableWaste: r.isReusable,
+                  reusableLength: r.isReusable ? (r.reusableRemnant || 0) : 0,
+                  scrapLength: rowWb.scrapMm,
+                  efficiencyPercent: r.efficiency,
+                  count: r.barsCount,
+                  ...(r.isTailSingle ? { isTailSingle: true } : {}),
+                };
+              }),
               totalStockBarsUsed: solution.totalBarsUsed,
               totalStockLengthUsed: solution.totalStockLength,
               totalPartsLength: solution.totalSpentLength,
-              totalWasteLength: solution.totalWasteLength,
+              totalWasteLength: solWb.totalWasteMm,
               totalReusableLength: solution.totalReusableLength,
-              totalScrapLength: solution.totalWasteLength,
-              totalKerfLoss:
-                solution.totalStockLength -
-                solution.totalSpentLength -
-                solution.totalWasteLength,
+              maxReusableRemnantLength: solution.maxReusableRemnantLength,
+              cuttingIndex: solution.cuttingIndex,
+              cuttingIndexMaterial: solution.cuttingIndexMaterial,
+              cuttingIndexSetup: solution.cuttingIndexSetup,
+              totalScrapLength: solWb.offcutsMm,
+              totalKerfLoss: solWb.kerfMm,
               overallEfficiencyPercent: solution.overallKIM,
               unfulfilledDemand: solution.unplacedDemand.map((u) => ({
                 partId: `u_${u.length}`,
@@ -789,6 +870,8 @@ export default function App() {
                 missing: u.quantity,
               })),
               calculationTimeMs: solution.calculationTimeMs,
+              telemetry: solution.telemetry,
+              batchInfo: solution.batchInfo,
               algorithmName: 'Excel VBA Exact Port (MyRaskroy.bas)',
             }}
             params={{
@@ -803,6 +886,7 @@ export default function App() {
               reusableRemnantMin: settings.reusableRemnantMin,
               cutAngle45: settings.cutAngle45,
               dualProfileCut: settings.dualProfileCut,
+              groupSolutions: settings.groupSolutions,
               searchSpeed: settings.searchSpeed,
               orderComment: settings.orderComment,
             }}
@@ -815,13 +899,19 @@ export default function App() {
             }))}
             stocks={stockItems.map((s) => ({
               id: s.id,
-              name: `Хлыст ${s.length} мм`,
+              name: `Профиль ${s.length} мм`,
               length: s.length,
               availableQuantity: s.quantity,
-              isRemnant: s.length < 6000,
+              isRemnant:
+                !s.isStandard &&
+                !s.isStandardUnlimited &&
+                s.length !== 6000 &&
+                s.length !== 12000 &&
+                s.length !== 11700,
             }))}
           />
-        )}
+          );
+        })()}
           </div>
         </main>
       </div>
@@ -842,12 +932,14 @@ export default function App() {
           setSettings(newSettings);
           setLastSolvedSettings(newSettings);
         }}
-        onGoToResults={() => handleTabChange('visualizer')}
+        onGoToResults={() => {
+          setIsSettingsOpen(false);
+          handleTabChange('visualizer');
+        }}
         isSettingsOpen={isSettingsOpen}
         calcTriggerNonce={calcTriggerNonce}
         stockItems={stockItems}
         demandItems={demandItems}
-        onSetDemandItems={setDemandItems}
       />
 
       {/* Paste from Excel Clipboard Modal */}

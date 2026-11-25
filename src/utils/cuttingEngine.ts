@@ -9,7 +9,6 @@ import {
   RemnantItem,
   UnplacedItem,
   BarCuttingPattern,
-  CutPiece,
   CuttingOptimizationResult,
   PartDemand,
   StockBar,
@@ -18,16 +17,224 @@ import {
   ComplexityEstimate,
   CustomStrategyConfig,
   CalculationTelemetry,
+  ReusableRemnantMode,
 } from '../types/cutting';
+import { getSearchSpeedLabel } from '../constants/cuttingHelp';
+import {
+  CutCard,
+  CutContext,
+  CutState,
+  CuttingStrategy,
+  ForcedRemnantShapingStrategy,
+  MergedPassResults,
+  MinimizeBalanceStrategy,
+  MinimizeMaterialStrategy,
+  MinimizeSetupsStrategy,
+  PASS_CHUNK_SIZE,
+  ParetoFrontPoint,
+  PassRangeExecutionResult,
+  PassSearchProfile,
+  RemnantFillStrategy,
+  StrategyType,
+  buildBaseStateFromMergedPassResults,
+  calculateMetrics,
+  computeCuttingIndexFromSolution,
+  computeLpCandidate,
+  computeMaxReusableRemnantFromSolution,
+  createCutCard,
+  executePassRange,
+  getColorForLength,
+  getDefaultDemandColor,
+  getBatchRowSplit,
+  getMemoryUsageMb,
+  getStrategy,
+  groupIdenticalCards,
+  loadHighsSolver,
+  mergePassResults,
+  myGcd,
+  refineBaseStateWithPipeline,
+  runCuttingPipeline,
+  runMultiCapBalancePipelines,
+  runPostGenerationSteps,
+} from './cutting';
+import type {
+  PassWorkerInMessage,
+  PassWorkerOutMessage,
+  SerializableCutContext,
+} from '../workers/passWorker';
+
+// Re-export modular Pipeline + Strategy primitives for direct consumers & tests
+export type {
+  StrategyType,
+  CutCard,
+  CutMetrics,
+  CutContext,
+  CutTelemetryCounters,
+  CutState,
+  SearchPackingConfig,
+  PipelineStep,
+  CuttingStrategy,
+  PassSearchProfile,
+  PassProfileCandidate,
+  ParetoFrontPoint,
+  PassRangeExecutionResult,
+  MergedPassResults,
+  HighsSolveOptions,
+  HighsSolverRowLike,
+  HighsSolverColumnLike,
+  HighsSolverSolutionLike,
+  HighsSolverLike,
+  ExactLpCandidateResult,
+} from './cutting';
+
+export {
+  INDEX_FLOOR,
+  SETUP_WEIGHT,
+  PASS_CHUNK_SIZE,
+  executePassRange,
+  mergePassResults,
+  buildBaseStateFromMergedPassResults,
+  computeCuttingIndexScale,
+  computeCuttingIndexFromTotals,
+  computeCuttingIndexFromSolution,
+  computeMaxReusableRemnantFromSolution,
+  computeSearchWasteMm,
+  buildCardSignature,
+  createCutCard,
+  sortCardsDeterministically,
+  groupIdenticalCards,
+  calculateMetrics,
+  StepGroupIdenticalCards,
+  StepGenerateBasePatterns,
+  StepGenerateBasePatternsForStrategies,
+  Step2OptPostProcess,
+  StepOptimizeWaste,
+  StepConsolidateSetups,
+  MinimizeSetupsStrategy,
+  MinimizeMaterialStrategy,
+  ForcedRemnantShapingStrategy,
+  RemnantFillStrategy,
+  MinimizeBalanceStrategy,
+  CustomStrategy,
+  STRATEGY_REGISTRY,
+  registerStrategy,
+  resolveStrategyType,
+  getStrategy,
+  runPostGenerationSteps,
+  refineBaseStateWithPipeline,
+  runCuttingPipeline,
+  runMultiCapBalancePipelines,
+  RICH_DYNAMIC_COLORS,
+  getDefaultDemandColor,
+  getColorForLength,
+  getMemoryUsageMb,
+  myGcd,
+  sortLongArray,
+  longSumEl,
+  greedyAlgo,
+  computeLpCandidate,
+  loadHighsSolver,
+} from './cutting';
 
 /**
- * Returns current JS Heap memory usage in megabytes (Chromium / Node)
+ * Computes effective reusable remnant threshold (Порог делового остатка) in mm:
+ * - 'manual': uses currentManualValue directly
+ * - 'weighted': quantity-weighted median of active demand piece lengths rounded to nearest 100 mm
+ * - 'min_part': (smallest active demand piece length + 1 mm) rounded UP to nearest 10 mm
  */
-export function getMemoryUsageMb(): number | undefined {
-  if (typeof performance !== 'undefined' && (performance as any).memory?.usedJSHeapSize) {
-    return Number(((performance as any).memory.usedJSHeapSize / (1024 * 1024)).toFixed(2));
+export function computeReusableRemnantMin(
+  demandItems: readonly { length: number; quantity: number }[],
+  mode: ReusableRemnantMode = 'manual',
+  currentManualValue = 250
+): number {
+  if (mode === 'manual') {
+    return Math.max(0, Math.round(currentManualValue || 0));
   }
-  return undefined;
+
+  const active = demandItems
+    .filter((d) => d.length > 0 && d.quantity > 0)
+    .slice()
+    .sort((a, b) => a.length - b.length);
+
+  if (mode === 'min_part') {
+    if (active.length === 0) {
+      return Math.max(10, Math.round(currentManualValue || 250));
+    }
+    const minLen = active[0].length;
+    return Math.ceil((minLen + 1) / 10) * 10;
+  }
+
+  // mode === 'weighted': quantity-weighted median rounded to nearest 100 mm
+  if (active.length === 0) {
+    return 1500;
+  }
+  let totalQty = 0;
+  for (let i = 0; i < active.length; i++) {
+    totalQty += active[i].quantity;
+  }
+  const half = Math.ceil(totalQty / 2);
+  let acc = 0;
+  let medianLen = active[0].length;
+  for (let i = 0; i < active.length; i++) {
+    acc += active[i].quantity;
+    if (acc >= half) {
+      medianLen = active[i].length;
+      break;
+    }
+  }
+  return Math.max(10, Math.round(medianLen / 100) * 100);
+}
+
+/**
+ * Resolves remnant target length used by Cutting Index:
+ * uses unified `reusableRemnantMin` (> 0) unless deprecated `targetRemnantMinLength` is explicitly set.
+ */
+export function resolveIndexTargetRemnantLength(
+  settings: Pick<AppSettings, 'reusableRemnantMin' | 'targetRemnantMinLength'>
+): number {
+  if (settings.targetRemnantMinLength && settings.targetRemnantMinLength > 0) {
+    return settings.targetRemnantMinLength;
+  }
+  return settings.reusableRemnantMin > 0 ? settings.reusableRemnantMin : 1500;
+}
+
+/**
+ * Computes auto target remnant length as the quantity-weighted median of active demand piece lengths,
+ * rounded to nearest 100 mm and clamped >= reusableRemnantMin (default fallback 1500 mm).
+ */
+export function computeAutoTargetRemnantLength(
+  demandItems: readonly { length: number; quantity: number }[],
+  reusableRemnantMin = 0
+): number {
+  const weighted = computeReusableRemnantMin(demandItems, 'weighted', 1500);
+  const floorVal = Math.max(0, reusableRemnantMin || 0);
+  return Math.max(floorVal, weighted);
+}
+
+/**
+ * Resolves effective batch size N >= 2 when batch cutting (`dualProfileCut`) is enabled:
+ * - 'manual': max(2, floor(batchSizeN ?? 2))
+ * - 'auto' (default): smallest integer divisor > 1 of GCD(active demand quantities); 2 if GCD <= 1
+ */
+export function resolveBatchSize(
+  demandInput: readonly { length: number; quantity: number }[],
+  settings: Pick<AppSettings, 'batchSizeMode' | 'batchSizeN'>
+): number {
+  if (settings.batchSizeMode === 'manual') {
+    return Math.max(2, Math.floor(settings.batchSizeN ?? 2));
+  }
+  let g = 0;
+  for (let i = 0; i < demandInput.length; i++) {
+    const d = demandInput[i];
+    if (d.length > 0 && d.quantity > 0) {
+      g = g === 0 ? Math.round(d.quantity) : myGcd(g, d.quantity);
+    }
+  }
+  if (g <= 1) return 2;
+  for (let div = 2; div * div <= g; div++) {
+    if (g % div === 0) return div;
+  }
+  return g;
 }
 
 /**
@@ -47,236 +254,12 @@ export function getDefaultCustomConfig(): CustomStrategyConfig {
 }
 
 /**
- * Palette matching the user's Excel VBA screenshot colors
- */
-const PALETTE: Record<number, string> = {
-  5230: '#F87171', // Coral Red
-  810: '#38BDF8',  // Light Blue / Cyan
-  800: '#E879F9',  // Purple / Pink
-  320: '#6366F1',  // Indigo
-  280: '#FACC15',  // Yellow
-  150: '#4ADE80',  // Light Green
-};
-
-export const RICH_DYNAMIC_COLORS = [
-  '#38BDF8', // Light Blue / Sky
-  '#E879F9', // Purple Pink
-  '#FACC15', // Sunflower Yellow
-  '#4ADE80', // Mint Green
-  '#F87171', // Coral Red
-  '#6366F1', // Indigo
-  '#FB923C', // Orange
-  '#2DD4BF', // Teal
-  '#A78BFA', // Violet
-  '#F472B6', // Rose Pink
-  '#34D399', // Emerald
-  '#60A5FA', // Azure Blue
-  '#FBBF24', // Amber
-  '#C084FC', // Light Purple
-  '#F43F5E', // Deep Rose
-  '#14B8A6', // Dark Teal
-  '#818CF8', // Soft Indigo
-  '#FB7185', // Strawberry
-  '#A3E635', // Lime
-  '#06B6D4', // Deep Cyan
-  '#E11D48', // Crimson
-  '#0EA5E9', // Ocean Blue
-  '#D946EF', // Fuchsia
-  '#84CC16', // Bright Lime
-  '#F97316', // Vivid Orange
-  '#8B5CF6', // Purple
-  '#10B981', // True Emerald
-  '#D97706', // Ochre Amber
-  '#64748B', // Steel Slate
-  '#EC4899', // Bright Pink
-  '#059669', // Forest Green
-  '#7C3AED', // Deep Violet
-  '#B45309', // Rust Orange
-  '#2563EB', // Royal Blue
-  '#0284C7', // Cerulean
-  '#475569', // Graphite
-];
-
-export function getDefaultDemandColor(index: number, len?: number): string {
-  if (len && PALETTE[len]) return PALETTE[len];
-  return RICH_DYNAMIC_COLORS[index % RICH_DYNAMIC_COLORS.length];
-}
-
-export function getColorForLength(len: number, index = 0): string {
-  if (PALETTE[len]) return PALETTE[len];
-  // Deterministic hash solely by length so a piece of given length has one fixed color everywhere
-  const hash = Math.abs(Math.round(len * 9973));
-  return RICH_DYNAMIC_COLORS[hash % RICH_DYNAMIC_COLORS.length];
-}
-
-/**
- * Greatest Common Divisor (myGcd from MyRaskroy.bas)
- */
-export function myGcd(a: number, b: number): number {
-  a = Math.abs(Math.round(a));
-  b = Math.abs(Math.round(b));
-  if (a < b) {
-    const t = a;
-    a = b;
-    b = t;
-  }
-  while (b > 0) {
-    const t = b;
-    b = a % b;
-    a = t;
-  }
-  return a || 1;
-}
-
-/**
- * Array Sorting Heuristics matching SortLongArray from MyRaskroy.bas
- */
-export function sortLongArray(arr: number[], sortMode = 1): number[] {
-  const result = [...arr];
-  const k = result.length;
-  if (k <= 1) return result;
-
-  if (sortMode === 1) {
-    // Descending (First-Fit Decreasing)
-    result.sort((a, b) => b - a);
-  } else if (sortMode === 2) {
-    // Ascending (First-Fit Increasing)
-    result.sort((a, b) => a - b);
-  } else if (sortMode === 3) {
-    // Alternating
-    result.sort((a, b) => b - a);
-    for (let i = 1; i < Math.floor(k / 2); i += 2) {
-      const j = k - 1 - i;
-      const t = result[i];
-      result[i] = result[j];
-      result[j] = t;
-    }
-  } else if (sortMode === 4) {
-    // Fold from extremes to center
-    result.sort((a, b) => b - a);
-    const bArr = [...result];
-    for (let i = 0; i < k; i++) {
-      if (i % 2 === 0) {
-        result[i] = bArr[Math.floor(i / 2)];
-      } else {
-        result[i] = bArr[k - 1 - Math.floor(i / 2)];
-      }
-    }
-  } else if (sortMode === 5) {
-    // Modular remainder sort: elements that leave smaller remainder when dividing standard 6000
-    result.sort((a, b) => (6000 % a) - (6000 % b) || b - a);
-  } else if (sortMode === 6) {
-    // Alternating 2 large, 1 small
-    result.sort((a, b) => b - a);
-    const temp = [...result];
-    let left = 0;
-    let right = k - 1;
-    let idx = 0;
-    while (left <= right) {
-      if (left <= right) result[idx++] = temp[left++];
-      if (left <= right) result[idx++] = temp[left++];
-      if (left <= right) result[idx++] = temp[right--];
-    }
-  } else if (sortMode === 7) {
-    // Center to extremes
-    result.sort((a, b) => b - a);
-    const temp = [...result];
-    const mid = Math.floor(k / 2);
-    let l = mid;
-    let r = mid + 1;
-    let idx = 0;
-    while (l >= 0 || r < k) {
-      if (l >= 0) result[idx++] = temp[l--];
-      if (r < k) result[idx++] = temp[r++];
-    }
-  } else if (sortMode >= 8) {
-    // Deterministic pseudo-random shuffle for deep exploration
-    let seed = sortMode * 16807;
-    for (let i = k - 1; i > 0; i--) {
-      seed = (seed * 16807) % 2147483647;
-      const j = Math.floor((seed / 2147483647) * (i + 1));
-      const t = result[i];
-      result[i] = result[j];
-      result[j] = t;
-    }
-  } else {
-    result.sort((a, b) => b - a);
-  }
-
-  return result;
-}
-
-/**
- * LongSumEl from MyRaskroy.bas:
- * Dynamic Programming Subset-Sum / Knapsack Solver with early termination
- * Given candidate items arr and target sum sm, finds subset that sums up to sm (or within ds tolerance)
- */
-export function longSumEl(arr: number[], sm: number, ds = 0): number[] | null {
-  const n = sm;
-  const sm1 = sm - ds;
-  if (n <= 0 || n > 80000000) return null;
-
-  const a = new Int32Array(n + 1);
-  a.fill(-1);
-  a[0] = 0;
-
-  outerLoop: for (let i = 0; i < arr.length; i++) {
-    const itemVal = arr[i];
-    if (itemVal <= 0 || itemVal > n) continue;
-
-    for (let j = n - itemVal; j >= 0; j--) {
-      if (a[j] >= 0) {
-        const k = j + itemVal;
-        if (a[k] === -1) {
-          a[k] = j;
-          if (k >= sm1) {
-            break outerLoop;
-          }
-        }
-      }
-    }
-  }
-
-  // Backtrack from largest achieved sum <= sm
-  for (let i = sm; i >= 1; i--) {
-    if (a[i] >= 0) {
-      const out: number[] = [];
-      let k = i;
-      while (k > 0) {
-        const prev = a[k];
-        out.push(k - prev);
-        k = prev;
-      }
-      return out;
-    }
-  }
-
-  return null;
-}
-
-/**
- * GreedyAlgo from MyRaskroy.bas:
- * Greedy first-fit packing
- */
-export function greedyAlgo(arr: number[], sm: number): number[] | null {
-  let s = sm;
-  const out: number[] = [];
-  for (let i = 0; i < arr.length; i++) {
-    if (arr[i] <= s) {
-      out.push(arr[i]);
-      s -= arr[i];
-    }
-  }
-  return s < sm ? out : null;
-}
-
-/**
  * Pre-flight estimation of cutting calculation complexity and expected duration
  */
 export function estimateCalculationComplexity(
-  stockInput: StockItem[],
+  _stockInput: StockItem[],
   demandInput: DemandItem[],
-  settings: AppSettings
+  _settings: AppSettings
 ): ComplexityEstimate {
   let totalDemandLength = 0;
   let totalParts = 0;
@@ -292,22 +275,17 @@ export function estimateCalculationComplexity(
 
   const totalMeters = Number((totalDemandLength / 1000).toFixed(1));
   const uniqueParts = uniquePartsSet.size;
-
-  // Heavy task criteria: > 1,000 meters or > 800 parts or > 15 unique lengths
   const isHeavy = totalMeters > 1000 || totalParts > 800 || uniqueParts > 15;
 
-  // Estimated execution durations in seconds matching user criteria:
-  // Fast: ~10-15s, Standard: ~1-2m, Deep: 2+m
   const estimatedSeconds = {
     fast: isHeavy ? (totalMeters > 10000 ? 15 : 10) : 1.5,
     standard: isHeavy ? (totalMeters > 10000 ? 120 : 60) : 15,
     deep: isHeavy ? (totalMeters > 10000 ? 180 : 120) : 45,
   };
 
-  let recommendation = 'Стандартная спецификация. Расчет выполняется быстро с высокой точностью раскроя.';
-  if (isHeavy) {
-    recommendation = `Большой объем спецификации (${totalMeters.toLocaleString('ru-RU')} м, ${totalParts.toLocaleString('ru-RU')} деталей, ${uniqueParts} типоразмеров). Скоростные режимы: «Быстро» (10–15 сек), «Стандарт» (1–2 мин) и «Глубокий» (от 2 мин) с комбинаторным перебором карт и 2-opt оптимизацией.`;
-  }
+  const recommendation = isHeavy
+    ? `Большой объем спецификации (${totalMeters.toLocaleString('ru-RU')} м, ${totalParts.toLocaleString('ru-RU')} деталей, ${uniqueParts} типоразмеров). Глубина поиска: «${getSearchSpeedLabel('fast', true)}» (10–15 сек), «${getSearchSpeedLabel('standard', true)}» (1–2 мин) и «${getSearchSpeedLabel('deep', true)}» (от 2 мин) с комбинаторным перебором карт и 2-opt оптимизацией.`
+    : 'Стандартная спецификация. Расчет выполняется быстро с высокой точностью раскроя.';
 
   return {
     totalMeters,
@@ -324,11 +302,8 @@ export interface SolveLinearCuttingOptions {
   shouldAbort?: () => boolean;
 }
 
-/**
- * Full Port of Sub Raskroy() from MyRaskroy.bas with Batch Multiplicity Engine
- */
 export interface ComprehensiveSuiteItem {
-  goal: 'min_waste' | 'variants' | 'min_bars' | 'max_reusable';
+  goal: 'variants' | 'min_bars' | 'balance';
   title: string;
   badge: string;
   description: string;
@@ -340,13 +315,22 @@ export interface ComprehensiveResult {
   bestSolution: FullOptimizationSolution;
 }
 
+export interface BalanceRunTiming {
+  label: string;
+  capMm: number;
+  durationMs: number;
+  stockMm: number;
+  bars: number;
+  cards: number;
+}
+
+export interface BalanceResult extends ComprehensiveResult {
+  timings: BalanceRunTiming[];
+  totalDurationMs: number;
+}
+
 /**
- * Runs all 4 core optimization strategies in a single benchmark suite
- * If both 12m and 6m standard bars are active, runs a targeted comparative benchmark:
- * 1) 12m + 6m Combined (Optimal)
- * 2) Pure 12m bars
- * 3) Pure 6m bars
- * 4) Batch variants (minimum setup cards)
+ * Runs core optimization strategies without duplicating identical runs
  */
 export function runComprehensiveSuite(
   stockInput: StockItem[],
@@ -363,7 +347,7 @@ export function runComprehensiveSuite(
   const isMultiStandard = hasActive12m && hasActive6m;
 
   const configs: Array<{
-    goal: 'min_waste' | 'variants' | 'min_bars' | 'max_reusable';
+    goal: 'variants' | 'min_bars';
     title: string;
     badge: string;
     description: string;
@@ -371,26 +355,28 @@ export function runComprehensiveSuite(
   }> = isMultiStandard
     ? [
         {
-          goal: 'min_waste',
+          goal: 'min_bars',
           title: '12м + 6м Оптимальный',
-          badge: '🏆 Лучший КИМ',
-          description: 'Умный подбор между 12м и 6м для максимального КИМ и мин. расхода',
+          badge: 'Мин. материал',
+          description: 'Минимум заготовок; при равенстве меньше карт и отхода',
         },
         {
-          goal: 'min_waste',
-          title: 'Только 12м хлысты',
+          goal: 'min_bars',
+          title: 'Только 12м профили',
           badge: '📏 Стандарт 12м',
           description: 'Раскрой исключительно из 12-метрового проката',
           stockModifier: (stocks) =>
             stocks.map((s) => (s.length === 6000 ? { ...s, isActive: false } : s)),
         },
         {
-          goal: 'min_waste',
-          title: 'Только 6м хлысты',
+          goal: 'min_bars',
+          title: 'Только 6м профили',
           badge: '📐 Стандарт 6м',
           description: 'Раскрой исключительно из 6-метрового проката',
           stockModifier: (stocks) =>
-            stocks.map((s) => (s.length === 12000 || s.length === 11700 ? { ...s, isActive: false } : s)),
+            stocks.map((s) =>
+              s.length === 12000 || s.length === 11700 ? { ...s, isActive: false } : s
+            ),
         },
         {
           goal: 'variants',
@@ -401,28 +387,16 @@ export function runComprehensiveSuite(
       ]
     : [
         {
-          goal: 'min_waste',
-          title: 'Минимум отходов',
-          badge: '🏆 Лучший КИМ',
-          description: 'Максимальный КИМ и наименьшие потери металла в отход',
+          goal: 'min_bars',
+          title: 'Минимум материала',
+          badge: 'Мин. материал',
+          description: 'Минимум заготовок; при равенстве меньше карт и отхода',
         },
         {
           goal: 'variants',
           title: 'Минимум наладок',
           badge: '⚡ Меньше наладок',
           description: 'Минимум уникальных карт для быстрой резки на станке',
-        },
-        {
-          goal: 'min_bars',
-          title: 'Минимум хлыстов',
-          badge: '📦 Меньше заготовок',
-          description: 'Минимальное количество целых хлыстов со склада/закупки',
-        },
-        {
-          goal: 'max_reusable',
-          title: 'Максимум делового',
-          badge: '♻️ Возврат на склад',
-          description: 'Максимальный возврат длинномерных деловых остатков',
         },
       ];
 
@@ -460,7 +434,6 @@ export function runComprehensiveSuite(
     });
   }
 
-  // Best solution is highest KIM or min_waste
   let best = suite[0]?.solution;
   for (const item of suite) {
     if (!best || item.solution.overallKIM > best.overallKIM) {
@@ -471,1735 +444,206 @@ export function runComprehensiveSuite(
   return { suite, bestSolution: best };
 }
 
-export interface BestSolutionState {
-  kout: number;
-  maxOst: number;
-  ostSm: number;
-  othSm: number;
-  kolVarBest: number;
-  remnantsUsed: number;
-  remnantLengthUsed: number;
-  reusableLen: number;
-  targetRemnantsLen: number;
-  outSmIsh: number[];
-  outSm: number[];
-  outTxt: string[];
-  outPieces: number[][];
-  remainingData: number[];
+function isRemnantStock(st: StockItem): boolean {
+  if (st.isStandard || st.isStandardUnlimited) return false;
+  if (st.length === 6000 || st.length === 12000 || st.length === 11700) {
+    return false;
+  }
+  return true;
 }
 
-/**
- * 2-Opt Local Search Piece Exchange Optimizer
- * Compaction (1-0 shift) and Inter-pattern piece exchange (1-1 swap)
- * Repairs greedy knapsack tail artifacts and eliminates unusable scrap
- */
-function run2OptLocalSearch(
-  best: BestSolutionState,
-  nod: number,
-  dRez: number,
-  krm: number,
-  delOst: number,
-  targetRemnantMin: number,
-  goal: AppSettings['optimizationGoal'],
-  speed: AppSettings['searchSpeed'],
-  customConfig?: CustomStrategyConfig,
-  onProgressStep?: (
-    stepName: string,
-    round: number,
-    maxRounds: number,
-    cardsCount: number,
-    curKim: number
-  ) => void
-): BestSolutionState {
-  if (best.kout <= 1) return best;
-  if (customConfig && customConfig.enable2Opt === false) return best;
-
-  const maxRounds =
-    customConfig?.twoOptRounds ??
-    (speed === 'deep' ? 30 : speed === 'standard' ? 15 : 6);
-  const pieces = best.outPieces.map((p) => [...p]);
-  const smIsh = [...best.outSmIsh];
-  const sm = [...best.outSm];
-  let kout = best.kout;
-
-  let improved = false;
-
-  for (let round = 0; round < maxRounds; round++) {
-    let roundImproved = false;
-
-    // Report intermediate 2-Opt progress with live card count and KIM
-    if (onProgressStep) {
-      const curCards = new Set(pieces.map((p) => buildPatternText(p, dRez))).size;
-      const totalSm = sm.reduce((a, b) => a + b, 0);
-      const totalCap = smIsh.reduce((a, b) => a + b, 0);
-      const curKim = totalCap > 0 ? Number(((totalSm / totalCap) * 100).toFixed(1)) : 0;
-      onProgressStep(
-        `Локальная переупаковка 2-Opt (раунд ${round + 1}/${maxRounds}) · Карт: ${curCards}`,
-        round + 1,
-        maxRounds,
-        curCards,
-        curKim
-      );
-    }
-
-    // 1. Bar Elimination / Compaction (Bin Compaction)
-    // Try to completely eliminate a low-fill bar by placing ALL its pieces into available capacities of other bars
-    for (let i = kout - 1; i >= 0; i--) {
-      if (pieces[i].length === 0) continue;
-      const sortedPiecesI = [...pieces[i]].sort((a, b) => b - a);
-      const tempCapacities = smIsh.map((cap, idx) => cap - sm[idx]);
-      const moves: { targetBar: number; pieceMm: number; pieceScaled: number }[] = [];
-      let canEliminate = true;
-
-      for (const pieceMm of sortedPiecesI) {
-        const pieceScaled = Math.floor((pieceMm + dRez) / nod);
-        let placed = false;
-        for (let j = 0; j < kout; j++) {
-          if (i === j) continue;
-          if (tempCapacities[j] >= pieceScaled) {
-            tempCapacities[j] -= pieceScaled;
-            moves.push({ targetBar: j, pieceMm, pieceScaled });
-            placed = true;
-            break;
-          }
-        }
-        if (!placed) {
-          canEliminate = false;
-          break;
-        }
-      }
-
-      if (canEliminate && moves.length === pieces[i].length) {
-        for (const m of moves) {
-          pieces[m.targetBar].push(m.pieceMm);
-          sm[m.targetBar] += m.pieceScaled;
-        }
-        pieces[i].length = 0;
-        sm[i] = 0;
-        roundImproved = true;
-        improved = true;
-        break;
-      }
-    }
-
-    // Purge completely emptied bars
-    const activeIndices: number[] = [];
-    for (let i = 0; i < kout; i++) {
-      if (pieces[i].length > 0) {
-        activeIndices.push(i);
-      }
-    }
-
-    if (activeIndices.length < kout) {
-      const newPieces: number[][] = [];
-      const newSmIsh: number[] = [];
-      const newSm: number[] = [];
-      for (const idx of activeIndices) {
-        newPieces.push(pieces[idx]);
-        newSmIsh.push(smIsh[idx]);
-        newSm.push(sm[idx]);
-      }
-      pieces.length = 0;
-      pieces.push(...newPieces);
-      smIsh.length = 0;
-      smIsh.push(...newSmIsh);
-      sm.length = 0;
-      sm.push(...newSm);
-      kout = pieces.length;
-    }
-
-    // Precompute pattern counts to protect homogeneous batches from fragmentation
-    const sigCounts = new Map<string, number>();
-    const barSigs = new Array<string>(kout);
-    for (let idx = 0; idx < kout; idx++) {
-      const s = `${smIsh[idx]}:${[...pieces[idx]].sort((a, b) => b - a).join(',')}`;
-      barSigs[idx] = s;
-      sigCounts.set(s, (sigCounts.get(s) || 0) + 1);
-    }
-
-    // 2. Piece Swap (1-1 swap between tail bar i and tail bar j)
-    for (let i = 0; i < kout; i++) {
-      if ((sigCounts.get(barSigs[i]) || 0) >= 4) continue;
-      for (let j = i + 1; j < kout; j++) {
-        if ((sigCounts.get(barSigs[j]) || 0) >= 4) continue;
-        const capI = smIsh[i];
-        const capJ = smIsh[j];
-
-        for (let pI = 0; pI < pieces[i].length; pI++) {
-          const pieceI = pieces[i][pI];
-          const scI = Math.floor((pieceI + dRez) / nod);
-
-          for (let pJ = 0; pJ < pieces[j].length; pJ++) {
-            const pieceJ = pieces[j][pJ];
-            const scJ = Math.floor((pieceJ + dRez) / nod);
-
-            if (scI === scJ) continue;
-
-            const newSmI = sm[i] - scI + scJ;
-            const newSmJ = sm[j] - scJ + scI;
-
-            if (newSmI <= capI && newSmJ <= capJ) {
-              const oldScrapI = (capI - sm[i]) * nod;
-              const oldScrapJ = (capJ - sm[j]) * nod;
-              const newScrapI = (capI - newSmI) * nod;
-              const newScrapJ = (capJ - newSmJ) * nod;
-
-              const oldUnusableScrap =
-                (delOst > 0 && oldScrapI >= delOst ? 0 : oldScrapI) +
-                (delOst > 0 && oldScrapJ >= delOst ? 0 : oldScrapJ);
-              const newUnusableScrap =
-                (delOst > 0 && newScrapI >= delOst ? 0 : newScrapI) +
-                (delOst > 0 && newScrapJ >= delOst ? 0 : newScrapJ);
-
-              let shouldSwap = false;
-              if (goal === 'min_waste') {
-                shouldSwap = newUnusableScrap < oldUnusableScrap;
-              } else if (goal === 'max_reusable') {
-                const oldMaxRem = Math.max(oldScrapI, oldScrapJ);
-                const newMaxRem = Math.max(newScrapI, newScrapJ);
-                shouldSwap =
-                  newMaxRem > oldMaxRem &&
-                  (newMaxRem >= targetRemnantMin || newUnusableScrap <= oldUnusableScrap);
-              }
-
-              if (shouldSwap) {
-                pieces[i][pI] = pieceJ;
-                pieces[j][pJ] = pieceI;
-                sm[i] = newSmI;
-                sm[j] = newSmJ;
-                roundImproved = true;
-                improved = true;
-                break;
-              }
-            }
-          }
-          if (roundImproved) break;
-        }
-        if (roundImproved) break;
-      }
-      if (roundImproved) break;
-    }
-
-    // 3. Cluster Swap (2 pieces from tail bar i for 1 piece from tail bar j)
-    if (!roundImproved) {
-      for (let i = 0; i < kout; i++) {
-        if ((sigCounts.get(barSigs[i]) || 0) >= 4) continue;
-        if (pieces[i].length < 2) continue;
-        for (let j = 0; j < kout; j++) {
-          if (i === j) continue;
-          if ((sigCounts.get(barSigs[j]) || 0) >= 4) continue;
-          const capI = smIsh[i];
-          const capJ = smIsh[j];
-
-          for (let pI1 = 0; pI1 < pieces[i].length; pI1++) {
-            for (let pI2 = pI1 + 1; pI2 < pieces[i].length; pI2++) {
-              const pieceI1 = pieces[i][pI1];
-              const pieceI2 = pieces[i][pI2];
-              const scI = Math.floor((pieceI1 + dRez) / nod) + Math.floor((pieceI2 + dRez) / nod);
-
-              for (let pJ = 0; pJ < pieces[j].length; pJ++) {
-                const pieceJ = pieces[j][pJ];
-                const scJ = Math.floor((pieceJ + dRez) / nod);
-
-                if (scI === scJ) continue;
-
-                const newSmI = sm[i] - scI + scJ;
-                const newSmJ = sm[j] - scJ + scI;
-
-                if (newSmI <= capI && newSmJ <= capJ) {
-                  const oldScrapI = (capI - sm[i]) * nod;
-                  const oldScrapJ = (capJ - sm[j]) * nod;
-                  const newScrapI = (capI - newSmI) * nod;
-                  const newScrapJ = (capJ - newSmJ) * nod;
-
-                  const oldUnusableScrap =
-                    (delOst > 0 && oldScrapI >= delOst ? 0 : oldScrapI) +
-                    (delOst > 0 && oldScrapJ >= delOst ? 0 : oldScrapJ);
-                  const newUnusableScrap =
-                    (delOst > 0 && newScrapI >= delOst ? 0 : newScrapI) +
-                    (delOst > 0 && newScrapJ >= delOst ? 0 : newScrapJ);
-
-                  let shouldSwap = false;
-                  if (goal === 'min_waste') {
-                    if (newUnusableScrap < oldUnusableScrap) {
-                      shouldSwap = true;
-                    } else if (newUnusableScrap === oldUnusableScrap && newUnusableScrap === 0) {
-                      const oldMaxRem = Math.max(oldScrapI, oldScrapJ);
-                      const newMaxRem = Math.max(newScrapI, newScrapJ);
-                      shouldSwap = newMaxRem > oldMaxRem;
-                    }
-                  } else if (goal === 'max_reusable') {
-                    const oldMaxRem = Math.max(oldScrapI, oldScrapJ);
-                    const newMaxRem = Math.max(newScrapI, newScrapJ);
-                    shouldSwap =
-                      newMaxRem > oldMaxRem &&
-                      (newMaxRem >= targetRemnantMin || newUnusableScrap <= oldUnusableScrap);
-                  }
-
-                  if (shouldSwap) {
-                    pieces[j].splice(pJ, 1, pieceI1, pieceI2);
-                    pieces[i].splice(pI2, 1);
-                    pieces[i].splice(pI1, 1, pieceJ);
-                    sm[i] = newSmI;
-                    sm[j] = newSmJ;
-                    roundImproved = true;
-                    improved = true;
-                    break;
-                  }
-                }
-              }
-              if (roundImproved) break;
-            }
-            if (roundImproved) break;
-          }
-          if (roundImproved) break;
-        }
-        if (roundImproved) break;
-      }
-    }
-
-    if (!roundImproved) break;
-  }
-
-  if (!improved) return best;
-
-  // Rebuild outTxt and update metrics
-  const outTxt: string[] = [];
-  let othSm = 0;
-  let reusableLen = 0;
-  let targetRemnantsLen = 0;
-
-  for (let i = 0; i < kout; i++) {
-    pieces[i].sort((a, b) => b - a);
-    let txt = '';
-    let k = 1;
-    let t = -1;
-    for (let p = 0; p < pieces[i].length; p++) {
-      const len = pieces[i][p];
-      if (len === t) {
-        k++;
-      } else {
-        txt =
-          txt +
-          (k === 1 ? (txt === '' ? '' : ')') : ` - ${k} шт.)`) +
-          (txt === '' ? '' : ' + ') +
-          `(${len}${dRez > 0 ? '+' + dRez : ''}`;
-        k = 1;
-      }
-      if (p === pieces[i].length - 1) {
-        txt = txt + (k === 1 ? ')' : ` - ${k} шт.)`);
-      }
-      t = len;
-    }
-    outTxt.push(txt);
-
-    const remMm = (smIsh[i] - sm[i]) * nod;
-    othSm += smIsh[i] - sm[i];
-    if (delOst > 0 && remMm >= delOst) {
-      reusableLen += remMm;
-    }
-    if (remMm >= targetRemnantMin) {
-      targetRemnantsLen += remMm;
-    }
-  }
-
-  const kolVarBest = new Set(outTxt).size;
-
-  return {
-    ...best,
-    kout,
-    othSm,
-    kolVarBest,
-    reusableLen,
-    targetRemnantsLen,
-    outSmIsh: smIsh,
-    outSm: sm,
-    outTxt,
-    outPieces: pieces,
-  };
-}
-
-/**
- * Helper to build standard pattern description text
- */
-function buildPatternText(pieces: number[], dRez: number): string {
-  const sorted = [...pieces].sort((a, b) => b - a);
-  let txt = '';
-  let k = 1;
-  let t = -1;
-  for (let p = 0; p < sorted.length; p++) {
-    const len = sorted[p];
-    if (len === t) {
-      k++;
-    } else {
-      txt =
-        txt +
-        (k === 1 ? (txt === '' ? '' : ')') : ` - ${k} шт.)`) +
-        (txt === '' ? '' : ' + ') +
-        `(${len}${dRez > 0 ? '+' + dRez : ''}`;
-      k = 1;
-    }
-    if (p === sorted.length - 1) {
-      txt = txt + (k === 1 ? ')' : ` - ${k} шт.)`);
-    }
-    t = len;
-  }
-  return txt;
-}
-
-/**
- * Pattern Tail Consolidation & Recombination Optimizer (The Tail Squeezer)
- * Analyzes solution patterns, extracts pieces from fragmented tail/minor patterns,
- * synthesizes additional copies of dominant/major patterns, and repacks remnants.
- * Directly eliminates tail fragmentation and collapses card count to the theoretical minimum.
- */
-function consolidateTailPatterns(
-  best: BestSolutionState,
-  nod: number,
-  dRez: number,
-  krm: number,
-  delOst: number,
-  targetRemnantMin: number,
-  goal: AppSettings['optimizationGoal'],
-  customConfig?: CustomStrategyConfig,
-  onProgressStep?: (stepName: string, cardsCount: number, curKim: number) => void
-): BestSolutionState {
-  if (best.kout <= 2) return best;
-  if (customConfig && customConfig.enableTailConsolidation === false) return best;
-
-  let currentBest = best;
-  const maxPoolBars = customConfig?.tailConsolidationMaxBars ?? 15;
-  const scrapTolerance =
-    customConfig?.cardMergeScrapToleranceMm ??
-    (goal === 'variants' ? 800 : 500);
-
-  const candidateThresholds = [1, 2, 3, 4, 5, 6, 8, 10, 15].filter((t) => t <= maxPoolBars);
-  if (candidateThresholds.length === 0) candidateThresholds.push(Math.min(maxPoolBars, 2));
-
-  // Multi-pass consolidation loop: repeat as long as improvements are found
-  for (let iter = 0; iter < 6; iter++) {
-    if (onProgressStep) {
-      const totalSm = currentBest.outSm.reduce((a, b) => a + b, 0);
-      const totalCap = currentBest.outSmIsh.reduce((a, b) => a + b, 0);
-      const curKim = totalCap > 0 ? Number(((totalSm / totalCap) * 100).toFixed(1)) : 0;
-      onProgressStep(
-        `Схлопывание карт хвостов (итерация ${iter + 1}/6 · карт: ${currentBest.kolVarBest})`,
-        currentBest.kolVarBest,
-        curKim
-      );
-    }
-    // 1. Group bars by pattern signature
-    interface PatternGroup {
-      sig: string;
-      smIsh: number;
-      pieces: number[];
-      barIndices: number[];
-      count: number;
-    }
-
-    const groupsMap = new Map<string, PatternGroup>();
-    for (let i = 0; i < currentBest.kout; i++) {
-      const barPieces = [...currentBest.outPieces[i]].sort((a, b) => b - a);
-      const sig = `${currentBest.outSmIsh[i]}:${barPieces.join(',')}`;
-      const existing = groupsMap.get(sig);
-      if (existing) {
-        existing.count++;
-        existing.barIndices.push(i);
-      } else {
-        groupsMap.set(sig, {
-          sig,
-          smIsh: currentBest.outSmIsh[i],
-          pieces: barPieces,
-          barIndices: [i],
-          count: 1,
-        });
-      }
-    }
-
-    const groups = Array.from(groupsMap.values());
-    if (groups.length <= 1) break;
-
-    // Sort groups descending by count
-    groups.sort((a, b) => b.count - a.count);
-
-    // Major patterns: patterns with multiple bars (or highest count)
-    const majorGroups = groups.filter((g) => g.count >= 2);
-    if (majorGroups.length === 0 && groups.length > 0) {
-      majorGroups.push(groups[0]);
-    }
-
-    let improvedInIter = false;
-
-    // We try tail candidate thresholds bounded by customConfig.tailConsolidationMaxBars
-    for (const maxTailCount of candidateThresholds) {
-      const tailGroups = groups.filter((g) => g.count <= maxTailCount);
-      if (tailGroups.length === 0) continue;
-
-      // Pool all pieces and bar capacities from tail groups
-      const tailPieces: number[] = [];
-      const tailSmIshList: number[] = [];
-      for (const tg of tailGroups) {
-        for (let c = 0; c < tg.count; c++) {
-          tailPieces.push(...tg.pieces);
-          tailSmIshList.push(tg.smIsh);
-        }
-      }
-
-      if (tailPieces.length === 0) continue;
-
-      // Frequency map of available tail pieces
-      const tailFreq = new Map<number, number>();
-      for (const p of tailPieces) {
-        tailFreq.set(p, (tailFreq.get(p) || 0) + 1);
-      }
-
-      // Try synthesizing additional copies of any major pattern
-      for (const major of majorGroups) {
-        if (tailGroups.includes(major)) continue;
-        // Count pieces required per major bar
-        const requiredPerBar = new Map<number, number>();
-        for (const p of major.pieces) {
-          requiredPerBar.set(p, (requiredPerBar.get(p) || 0) + 1);
-        }
-
-        // How many additional major bars can we synthesize?
-        let maxAdditional = Infinity;
-        for (const [p, req] of requiredPerBar.entries()) {
-          const avail = tailFreq.get(p) || 0;
-          const possible = Math.floor(avail / req);
-          if (possible < maxAdditional) {
-            maxAdditional = possible;
-          }
-        }
-
-        if (maxAdditional <= 0 || maxAdditional === Infinity) continue;
-
-        // Test each possible number of additional bars: kAdd = maxAdditional down to 1
-        for (let kAdd = maxAdditional; kAdd >= 1; kAdd--) {
-          const usableTailBars = [...tailSmIshList].sort((a, b) => b - a);
-          const assignedBarsForMajor: number[] = [];
-          for (let k = 0; k < kAdd; k++) {
-            const bIdx = usableTailBars.findIndex((cap) => cap >= major.smIsh);
-            if (bIdx >= 0) {
-              assignedBarsForMajor.push(major.smIsh);
-              usableTailBars.splice(bIdx, 1);
-            }
-          }
-
-          if (assignedBarsForMajor.length < kAdd) continue;
-
-          // Deduct kAdd * major pieces from tail
-          const remainingTailFreq = new Map(tailFreq);
-          for (const [p, req] of requiredPerBar.entries()) {
-            remainingTailFreq.set(p, (remainingTailFreq.get(p) || 0) - req * kAdd);
-          }
-
-          const remainingPieces: number[] = [];
-          for (const [p, cnt] of remainingTailFreq.entries()) {
-            for (let c = 0; c < cnt; c++) remainingPieces.push(p);
-          }
-          remainingPieces.sort((a, b) => b - a);
-
-          // Now repack remainingPieces into usableTailBars using longSumEl or greedy
-          const repackedBars: { smIsh: number; sm: number; pieces: number[] }[] = [];
-          let barSlotIdx = 0;
-          let allRemainingPacked = true;
-          const unassignedPieces = [...remainingPieces];
-
-          while (unassignedPieces.length > 0) {
-            if (barSlotIdx >= usableTailBars.length) {
-              allRemainingPacked = false;
-              break;
-            }
-            const barCap = usableTailBars[barSlotIdx];
-            const totalRemainingScaled = unassignedPieces.reduce(
-              (sum, p) => sum + Math.floor((p + dRez) / nod),
-              0
-            );
-
-            let packedOnBar: number[] = [];
-            if (totalRemainingScaled <= barCap) {
-              packedOnBar.push(...unassignedPieces);
-              unassignedPieces.length = 0;
-            } else {
-              const scaledPieces = unassignedPieces.map((p) => Math.floor((p + dRez) / nod));
-              const scaledSumResult = longSumEl(scaledPieces, barCap, Math.floor(barCap * 0.15));
-
-              if (scaledSumResult && scaledSumResult.length > 0) {
-                const toRemoveIdx = new Set<number>();
-                for (const scVal of scaledSumResult) {
-                  const foundIdx = unassignedPieces.findIndex(
-                    (p, pI) => !toRemoveIdx.has(pI) && Math.floor((p + dRez) / nod) === scVal
-                  );
-                  if (foundIdx >= 0) {
-                    toRemoveIdx.add(foundIdx);
-                    packedOnBar.push(unassignedPieces[foundIdx]);
-                  }
-                }
-                const nextUnassigned: number[] = [];
-                for (let pI = 0; pI < unassignedPieces.length; pI++) {
-                  if (!toRemoveIdx.has(pI)) nextUnassigned.push(unassignedPieces[pI]);
-                }
-                unassignedPieces.length = 0;
-                unassignedPieces.push(...nextUnassigned);
-              } else {
-                let space = barCap;
-                const nextUnassigned: number[] = [];
-                for (const p of unassignedPieces) {
-                  const sc = Math.floor((p + dRez) / nod);
-                  if (sc <= space) {
-                    packedOnBar.push(p);
-                    space -= sc;
-                  } else {
-                    nextUnassigned.push(p);
-                  }
-                }
-                unassignedPieces.length = 0;
-                unassignedPieces.push(...nextUnassigned);
-              }
-            }
-
-            if (packedOnBar.length === 0) {
-              allRemainingPacked = false;
-              break;
-            }
-
-            const barSum = packedOnBar.reduce((sum, p) => sum + Math.floor((p + dRez) / nod), 0);
-            repackedBars.push({
-              smIsh: barCap,
-              sm: barSum,
-              pieces: packedOnBar,
-            });
-            barSlotIdx++;
-          }
-
-          if (!allRemainingPacked) continue;
-
-          // Check if total bars used by tail pieces is <= original tail bars count
-          const originalTailBarsCount = tailSmIshList.length;
-          const newTailBarsCount = kAdd + repackedBars.length;
-          if (newTailBarsCount > originalTailBarsCount) continue;
-
-          // Construct candidate solution
-          const preservedGroups = groups.filter((g) => !tailGroups.includes(g) && g !== major);
-          const candidatePieces: number[][] = [];
-          const candidateSmIsh: number[] = [];
-          const candidateSm: number[] = [];
-
-          // 1. Preserved groups
-          for (const pg of preservedGroups) {
-            for (let c = 0; c < pg.count; c++) {
-              candidatePieces.push([...pg.pieces]);
-              candidateSmIsh.push(pg.smIsh);
-              candidateSm.push(pg.pieces.reduce((s, p) => s + Math.floor((p + dRez) / nod), 0));
-            }
-          }
-
-          // 2. Major group + kAdd bars
-          const newMajorCount = major.count + kAdd;
-          const majorBarSum = major.pieces.reduce((s, p) => s + Math.floor((p + dRez) / nod), 0);
-          for (let c = 0; c < newMajorCount; c++) {
-            candidatePieces.push([...major.pieces]);
-            candidateSmIsh.push(major.smIsh);
-            candidateSm.push(majorBarSum);
-          }
-
-          // 3. Repacked tail bars
-          for (const rb of repackedBars) {
-            candidatePieces.push([...rb.pieces]);
-            candidateSmIsh.push(rb.smIsh);
-            candidateSm.push(rb.sm);
-          }
-
-          // Build txt and metrics
-          const candidateTxt: string[] = [];
-          let candidateOthSm = 0;
-          let candidateReusable = 0;
-          let candidateTargetRem = 0;
-
-          for (let i = 0; i < candidatePieces.length; i++) {
-            candidatePieces[i].sort((a, b) => b - a);
-            const txt = buildPatternText(candidatePieces[i], dRez);
-            candidateTxt.push(txt);
-
-            const remMm = (candidateSmIsh[i] - candidateSm[i]) * nod;
-            candidateOthSm += candidateSmIsh[i] - candidateSm[i];
-            if (delOst > 0 && remMm >= delOst) candidateReusable += remMm;
-            if (remMm >= targetRemnantMin) candidateTargetRem += remMm;
-          }
-
-          const candidateKolVar = new Set(candidateTxt).size;
-          const candidateKout = candidatePieces.length;
-
-          // Calculate current non-reusable unusable scrap
-          let curUnusableScrap = 0;
-          for (let i = 0; i < currentBest.kout; i++) {
-            const remMm = (currentBest.outSmIsh[i] - currentBest.outSm[i]) * nod;
-            if (delOst <= 0 || remMm < delOst) {
-              curUnusableScrap += remMm;
-            }
-          }
-          let candUnusableScrap = 0;
-          for (let i = 0; i < candidatePieces.length; i++) {
-            const remMm = (candidateSmIsh[i] - candidateSm[i]) * nod;
-            if (delOst <= 0 || remMm < delOst) {
-              candUnusableScrap += remMm;
-            }
-          }
-
-          // Evaluation: is candidate better?
-          let isBetter = false;
-          if (candidateKout < currentBest.kout) {
-            isBetter = true;
-          } else if (candidateKout === currentBest.kout) {
-            if (candidateKolVar < currentBest.kolVarBest) {
-              // Fewer cards/setups is strictly better unless it creates significantly more unusable scrap
-              isBetter = candUnusableScrap <= curUnusableScrap + scrapTolerance;
-            } else if (candidateKolVar === currentBest.kolVarBest) {
-              if (goal === 'min_waste') {
-                isBetter = candUnusableScrap <= curUnusableScrap;
-              } else if (goal === 'max_reusable') {
-                isBetter = candidateTargetRem >= currentBest.targetRemnantsLen;
-              } else {
-                isBetter = candUnusableScrap <= curUnusableScrap;
-              }
-            }
-          }
-
-          if (isBetter) {
-            if (onProgressStep && candidateKolVar < currentBest.kolVarBest) {
-              const totalSm = candidateSm.reduce((a, b) => a + b, 0);
-              const totalCap = candidateSmIsh.reduce((a, b) => a + b, 0);
-              const curKim = totalCap > 0 ? Number(((totalSm / totalCap) * 100).toFixed(1)) : 0;
-              onProgressStep(
-                `Успешное сжатие: карт сокращено с ${currentBest.kolVarBest} до ${candidateKolVar}!`,
-                candidateKolVar,
-                curKim
-              );
-            }
-            currentBest = {
-              ...currentBest,
-              kout: candidateKout,
-              othSm: candidateOthSm,
-              kolVarBest: candidateKolVar,
-              reusableLen: candidateReusable,
-              targetRemnantsLen: candidateTargetRem,
-              outSmIsh: candidateSmIsh,
-              outSm: candidateSm,
-              outTxt: candidateTxt,
-              outPieces: candidatePieces,
-            };
-            improvedInIter = true;
-            break;
-          }
-        }
-        if (improvedInIter) break;
-      }
-      if (improvedInIter) break;
-    }
-    if (!improvedInIter) break;
-  }
-
-  return currentBest;
-}
-
-/**
- * Full Port of Sub Raskroy() from MyRaskroy.bas with Batch Multiplicity Engine
- * Deeply differentiated by Optimization Goal and Search Speed
- */
-export function solveLinearCutting(
+function buildCutContext(
   stockInput: StockItem[],
   demandInput: DemandItem[],
   settings: AppSettings,
   options?: SolveLinearCuttingOptions
-): FullOptimizationSolution {
-  // If comprehensive mode requested, run suite and return the premier solution
-  if (settings.optimizationGoal === 'comprehensive') {
-    const res = runComprehensiveSuite(stockInput, demandInput, settings, options);
-    return res.bestSolution;
-  }
-
+): CutContext {
   const startTime = performance.now();
-  const startMemoryMb = getMemoryUsageMb();
-  let stage1EndTime = startTime;
-  let stage2EndTime = startTime;
-  let totalCombinationsChecked = 0;
-  let initialCardsCount = 0;
-
-  let dRez = Math.max(0, settings.bladeWidth || 0);
+  const dRez = Math.max(0, settings.bladeWidth || 0);
   const krm = Math.max(0, settings.edgeTrim || 0);
   const delOst = Math.max(0, settings.reusableRemnantMin || 0);
-  const targetRemnantMin =
-    settings.targetRemnantMinLength && settings.targetRemnantMinLength > 0
-      ? Math.max(delOst, settings.targetRemnantMinLength)
-      : Math.max(delOst, 1500);
-  const b2prof = settings.dualProfileCut === true;
-  const bGroupe = settings.groupSolutions !== false;
+  const targetRemnantMin = resolveIndexTargetRemnantLength(settings);
+  const remnantMinFillPct = Math.min(
+    100,
+    Math.max(0, settings.remnantMinFillPct ?? settings.targetRemnantKIM ?? 75)
+  );
+  const isPrioritizeRemnants = settings.prioritizeRemnants === true;
 
-  // Build immutable color and mark lookup map from demand specification
-  const demandColorMap = new Map<number, string>();
-  const demandMarkMap = new Map<number, string>();
-  demandInput.forEach((d, dIdx) => {
-    if (!demandColorMap.has(d.length)) {
-      demandColorMap.set(d.length, d.color || getDefaultDemandColor(dIdx, d.length));
-    }
-    if (d.mark && !demandMarkMap.has(d.length)) {
-      demandMarkMap.set(d.length, d.mark);
-    }
-  });
-
-  // Dual profile expansion:
-  // Demand expansion: Each piece is recorded with cutting loss dRez.
-  // With dynamic bundle cutting (b2prof), bundle sizes (2+ bars) are selected algorithmically per pattern.
   const rawRng: number[] = [];
-  let ostSmTotal = 0;
-
+  let totalDemandLengthMm = 0;
   for (const d of demandInput) {
     const s = d.length;
     if (s <= 0 || d.quantity <= 0) continue;
     for (let j = 0; j < d.quantity; j++) {
       rawRng.push(s + dRez);
-      ostSmTotal += s;
+      totalDemandLengthMm += s + dRez;
     }
   }
 
-  // Expand stock bars: smArr array in VBA
-  const isPrioritizeRemnants = settings.optimizationGoal === 'prioritize_remnants' || settings.prioritizeRemnants === true;
-  const targetRemnantKIM = Math.min(99, Math.max(1, settings.targetRemnantKIM ?? 75));
-
-  const totalDemandLength = rawRng.reduce((a, b) => a + b, 0);
-
-  const isRemnantStock = (st: StockItem): boolean => {
-    if (st.isStandardUnlimited) return false;
-    if (st.length === 6000 || st.length === 12000 || st.length === 11700) {
-      return false;
-    }
-    return st.length < 6000;
-  };
-
   const rawRemnantSmArr: number[] = [];
   const rawStandardSmArr: number[] = [];
-
-  const activeStandardLengths = stockInput
-    .filter((st) => st.isActive !== false && (st.isStandard || st.isStandardUnlimited || st.length === 6000 || st.length === 12000))
-    .map((st) => st.length);
+  const activeStandardLengths: number[] = [];
+  const remnantBarSizesSet = new Set<number>();
 
   for (const st of stockInput) {
     if (st.isActive === false) continue;
+    if (
+      st.isStandard ||
+      st.isStandardUnlimited ||
+      st.length === 6000 ||
+      st.length === 12000 ||
+      st.length === 11700
+    ) {
+      activeStandardLengths.push(st.length);
+    }
+
     const s = st.length - krm;
     if (s <= 0) continue;
 
     const isStandardAuto =
-      (st.length === 6000 || st.length === 12000 || st.isStandardUnlimited) &&
+      (st.length === 6000 ||
+        st.length === 12000 ||
+        st.length === 11700 ||
+        st.isStandardUnlimited) &&
       (st.quantity <= 0 || !st.quantity);
-    // Generous estimate so standard stock never runs out prematurely:
-    const neededEstimate = Math.ceil(totalDemandLength / s) * 2 + 100;
+    const neededEstimate = Math.ceil(totalDemandLengthMm / s) * 2 + 100;
     const qty = isStandardAuto ? Math.max(200, neededEstimate) : st.quantity;
     if (qty <= 0) continue;
 
-    const targetArr = isRemnantStock(st) ? rawRemnantSmArr : rawStandardSmArr;
+    const isRem = isRemnantStock(st);
+    if (isRem) {
+      remnantBarSizesSet.add(st.length);
+    }
+    const targetArr = isRem ? rawRemnantSmArr : rawStandardSmArr;
     for (let j = 0; j < qty; j++) {
       targetArr.push(s);
     }
   }
 
-  // Combined for non-remnant strategies (sorted descending by length)
   const rawSmArr = [...rawRemnantSmArr, ...rawStandardSmArr];
   rawSmArr.sort((a, b) => b - a);
 
-  if (rawRng.length === 0 || rawSmArr.length === 0) {
-    return {
-      totalStockLength: 0,
-      totalSpentLength: 0,
-      totalBarsUsed: 0,
-      totalWasteLength: 0,
-      totalReusableLength: 0,
-      overallKIM: 0,
-      rows: [],
-      remainingWarehouseStock: [],
-      unplacedDemand: [],
-      calculationTimeMs: 0,
-    };
-  }
-
-  // Calculate GCD (myGcd) for scaling reduction
   let nod = dRez || 1;
-  for (const r of rawRng) nod = myGcd(nod, r);
-  for (const sm of rawSmArr) nod = myGcd(nod, sm);
+  for (let i = 0; i < rawRng.length; i++) nod = myGcd(nod, rawRng[i]);
+  for (let i = 0; i < rawSmArr.length; i++) nod = myGcd(nod, rawSmArr[i]);
 
-  // Divide by nod
-  const scaledRng = rawRng.map((x) => Math.floor(x / nod));
-  const scaledSmArr = rawSmArr.map((x) => Math.floor(x / nod));
-  const scaledRemnants = rawRemnantSmArr.map((x) => Math.floor(x / nod));
-  const scaledStandard = rawStandardSmArr.map((x) => Math.floor(x / nod));
+  const scaledDemand = rawRng.map((x) => Math.floor(x / nod));
+  const scaledStockAll = rawSmArr.map((x) => Math.floor(x / nod));
+  const scaledStockRemnants = rawRemnantSmArr.map((x) => Math.floor(x / nod));
+  const scaledStockStandard = rawStandardSmArr.map((x) => Math.floor(x / nod));
 
-  // Determine search iterations based on speed setting and custom config
   const speed = settings.searchSpeed;
   const isDeep = speed === 'deep';
-  const isStandard = speed === 'standard';
+  const isStandard = speed === 'standard' || speed === 'exact';
   const isCustom = settings.optimizationGoal === 'custom';
-  const customCfg = isCustom
+  const customConfig = isCustom
     ? settings.customStrategyConfig || getDefaultCustomConfig()
     : undefined;
 
-  // Base search exploration depth
-  const baseSortZ = stockInput.length > 1 ? (isDeep ? 5 : isStandard ? 3 : 1) : 0;
+  // Перебор порядков склада имеет смысл только при РАЗНЫХ длинах хлыстов (а не числе строк склада)
+  const distinctStockLengths = new Set(scaledStockAll).size;
+  const baseSortZ = distinctStockLengths > 1 ? (isDeep ? 5 : isStandard ? 3 : 1) : 0;
   const baseSort = isDeep ? 28 : isStandard ? 14 : 7;
   const baseVar = isDeep ? 16 : isStandard ? 10 : 5;
 
-  const multiplier = isCustom ? Math.max(0.1, customCfg?.maxPassesMultiplier ?? 1.0) : 1.0;
-  const maxSortZ = Math.max(0, Math.round(baseSortZ * multiplier));
-  const maxSort = Math.max(1, Math.round(baseSort * multiplier));
-  const maxVar = Math.max(1, Math.round(baseVar * multiplier));
+  const multiplier = isCustom
+    ? Math.max(0.1, customConfig?.maxPassesMultiplier ?? 1.0)
+    : 1.0;
 
-  let best: BestSolutionState | null = null;
-
-  // Initial stage 1 progress
-  options?.onProgress?.({
-    stage: 1,
-    totalStages: 3,
-    stageName: 'Анализ спецификации и подготовка заготовок',
-    percent: 10,
-    placedParts: 0,
-    totalParts: rawRng.length,
-    usedBars: 0,
-    totalBarsEstimate: Math.ceil(totalDemandLength / (rawSmArr[0] || 6000)),
-    bestKIM: 0,
-    elapsedMs: Math.round(performance.now() - startTime),
-  });
-
-  const totalPasses = (maxSortZ + 1) * (maxSort + 1) * (maxVar + 1);
-  let currentPass = 0;
-  let lastProgressReportTime = performance.now();
-  stage1EndTime = performance.now();
-
-  // Search loops matching VBA heuristics with high-performance batch multiplicity
-  outerLoopSearch: for (let sortZ = 0; sortZ <= maxSortZ; sortZ++) {
-    let smArr: number[];
-    if (isPrioritizeRemnants) {
-      const sortedRemnants = sortLongArray(
-        scaledRemnants,
-        sortZ === 0 ? 1 : sortZ === 1 ? 2 : sortZ
-      );
-      const sortedStandard = sortLongArray(scaledStandard, 1);
-      smArr = [...sortedRemnants, ...sortedStandard];
-    } else {
-      smArr = sortLongArray(scaledSmArr, sortZ);
-    }
-
-    for (let sort = 0; sort <= maxSort; sort++) {
-      const rng = sortLongArray(scaledRng, sort);
-
-      for (let v = 0; v <= maxVar; v++) {
-        currentPass++;
-
-        // Check cancellation / early abort
-        if (options?.shouldAbort?.()) {
-          break outerLoopSearch;
-        }
-
-        let maxOst = 0;
-        let kout = 0;
-        let data = [...rng];
-        let sumData = data.reduce((a, b) => a + b, 0);
-        let iSm = 0;
-        let othSm = 0;
-        let ostSm = sumData;
-        let curRemnantsUsed = 0;
-        let curRemnantLengthUsed = 0;
-
-        const curOutSmIsh: number[] = [];
-        const curOutSm: number[] = [];
-        const curOutTxt: string[] = [];
-        const curOutPieces: number[][] = [];
-
-        while (iSm < smArr.length && data.length > 0) {
-          totalCombinationsChecked++;
-          const sm = smArr[iSm];
-
-          // 1. Candidate Pool Truncation & Frequency Mapping
-          const freqMap = new Map<number, number>();
-          for (let dIdx = 0; dIdx < data.length; dIdx++) {
-            const val = data[dIdx];
-            freqMap.set(val, (freqMap.get(val) || 0) + 1);
-          }
-
-          let candidateItems: number[] = [];
-          for (const [val, count] of freqMap.entries()) {
-            if (val <= sm) {
-              const maxCanFit = Math.floor(sm / val);
-              const take = Math.min(count, maxCanFit);
-              for (let c = 0; c < take; c++) {
-                candidateItems.push(val);
-              }
-            }
-          }
-
-          // Candidate ordering: sortLongArray applies Excel VBA sorting heuristics (sort = 0..maxSort)
-          candidateItems = sortLongArray(candidateItems, sort);
-
-          let arrEl: number[] | null = null;
-          if (v === 0) {
-            arrEl = greedyAlgo(candidateItems, sm);
-          } else {
-            let dm = 0;
-            if (settings.optimizationGoal === 'min_waste' || settings.optimizationGoal === 'variants') {
-              // Ищем нулевой или сверхмалый отход (dm = 0, 1, 2, 4, 8, 12, 16...)
-              if (v === 1) dm = 0;
-              else if (v === 2) dm = 1;
-              else if (v === 3) dm = 2;
-              else if (v === 4) dm = 4;
-              else dm = Math.floor((sm * (v - 3)) / 150);
-              arrEl = longSumEl(candidateItems, sm, dm);
-            } else if (settings.optimizationGoal === 'min_bars') {
-              // «Минимум хлыстов»: максимальное заполнение до предела хлыста
-              if (v === 1) dm = 0;
-              else if (v === 2) dm = 1;
-              else dm = Math.floor((sm * v) / 100);
-              arrEl = longSumEl(candidateItems, sm, dm);
-            } else if (settings.optimizationGoal === 'max_reusable') {
-              // «Максимум делового»: ищем либо 0 отход, либо прицельный деловой остаток >= targetRemnantMin
-              const scaledTarget = Math.floor(targetRemnantMin / nod);
-              if (v === 1) {
-                arrEl = longSumEl(candidateItems, sm, 0);
-              } else if (v === 2 && scaledTarget > 0 && sm > scaledTarget + 10) {
-                arrEl = longSumEl(candidateItems, sm - scaledTarget, 2);
-              } else if (v === 3 && scaledTarget > 0 && sm > Math.floor(scaledTarget * 1.3)) {
-                arrEl = longSumEl(candidateItems, sm - Math.floor(scaledTarget * 1.25), 2);
-              } else if (v === 4 && scaledTarget > 0 && sm > Math.floor(scaledTarget * 1.6)) {
-                arrEl = longSumEl(candidateItems, sm - Math.floor(scaledTarget * 1.5), 2);
-              } else if (v === 5 && scaledTarget > 0 && sm > Math.floor(scaledTarget * 2.1)) {
-                arrEl = longSumEl(candidateItems, sm - Math.floor(scaledTarget * 2.0), 2);
-              } else {
-                dm = Math.floor((sm * (v - 2)) / 90);
-                arrEl = longSumEl(candidateItems, sm, dm);
-              }
-            } else {
-              // Базовый:
-              const ceilDiv = Math.ceil(sumData / sm);
-              dm = ceilDiv > 0 ? Math.floor((sm - Math.floor(sumData / ceilDiv)) / 2) : 0;
-              arrEl = longSumEl(candidateItems, sm, dm);
-            }
-          }
-
-          if (arrEl && arrEl.length > 0) {
-            const sTemp = arrEl.reduce((a, b) => a + b, 0);
-            const barSpentMm = sTemp * nod + krm;
-            const barTotalMm = sm * nod + krm;
-            const isRemnantBar = barTotalMm < 6000;
-            const barKIM = (barSpentMm / barTotalMm) * 100;
-
-            // Remnant preservation check
-            if (isPrioritizeRemnants && isRemnantBar && barKIM < targetRemnantKIM) {
-              iSm++;
-              continue;
-            }
-
-            arrEl = sortLongArray(arrEl, 1);
-            const kEl = arrEl.length;
-
-            const patternCounts = new Map<number, number>();
-            for (let i = 0; i < kEl; i++) {
-              const el = arrEl[i];
-              patternCounts.set(el, (patternCounts.get(el) || 0) + 1);
-            }
-
-            // Multiplicity Batching
-            let maxPatternRepeats = Infinity;
-            for (const [el, neededPerBar] of patternCounts.entries()) {
-              const available = freqMap.get(el) || 0;
-              const repeats = Math.floor(available / neededPerBar);
-              if (repeats < maxPatternRepeats) {
-                maxPatternRepeats = repeats;
-              }
-            }
-
-            let identicalBarsAvailable = 0;
-            while (iSm + identicalBarsAvailable < smArr.length && smArr[iSm + identicalBarsAvailable] === sm) {
-              identicalBarsAvailable++;
-            }
-
-            const batchCount = Math.max(1, Math.min(maxPatternRepeats, identicalBarsAvailable));
-
-            let t = 0;
-            let k = 1;
-            let s = 0;
-            let txt = '';
-            const patternPieceLengths: number[] = [];
-
-            for (let i = 0; i < kEl; i++) {
-              const el = arrEl[i];
-              const pieceLen = el * nod - dRez;
-              patternPieceLengths.push(pieceLen);
-
-              if (el === t) {
-                k++;
-              } else {
-                txt =
-                  txt +
-                  (k === 1 ? (txt === '' ? '' : ')') : ` - ${k} шт.)`) +
-                  (txt === '' ? '' : ' + ') +
-                  `(${pieceLen}${dRez > 0 ? '+' + dRez : ''}`;
-                k = 1;
-              }
-
-              if (i === kEl - 1) {
-                txt = txt + (k === 1 ? ')' : ` - ${k} шт.)`);
-              }
-              t = el;
-              s += el;
-            }
-
-            // Adaptive bar length selection:
-            // If the pattern pieces sum fits into a shorter active standard bar (e.g. 6000 mm instead of 12000 mm),
-            // downsize sm to the shorter bar to save meters and eliminate unnecessary remnant/waste.
-            let effectiveSm = sm;
-            const barPhysicalMm = sm * nod + krm;
-            if (barPhysicalMm >= 11000 && activeStandardLengths.includes(6000)) {
-              const max6000Scaled = Math.floor((6000 - krm) / nod);
-              if (s <= max6000Scaled) {
-                effectiveSm = max6000Scaled;
-              }
-            }
-
-            const barWaste = effectiveSm - s;
-            const barWasteMm = barWaste * nod;
-            const hasScrapWaste = barWasteMm > 0 && (delOst <= 0 || barWasteMm < delOst);
-
-            // Strategy-Aware Dynamic Bundle Sizing (Пакетный рез):
-            let effectiveBatchCount = batchCount;
-            if (b2prof) {
-              if (settings.optimizationGoal === 'min_waste') {
-                // Стратегия «Минимум отходов» менее склонна к пакетированию при наличии отхода:
-                // если с палки образуется негодный обрезок/лом, пакетирование умножает этот лом!
-                // Поэтому при наличии лома режем по 1 хлысту (effectiveBatchCount = 1),
-                // позволяя следующим палкам найти идеальные комбинации с нулевым ломом.
-                // Пакетируем только при нулевом ломе или полноценном деловом остатке.
-                if (hasScrapWaste) {
-                  effectiveBatchCount = 1;
-                }
-              } else if (settings.optimizationGoal === 'variants') {
-                // Стратегия «По вариантам»: максимизирует пакетный рез (от 2х шт.)
-                // чтобы свести количество уникальных карт к минимуму
-                effectiveBatchCount = Math.max(1, effectiveBatchCount);
-              } else if (settings.fillControlEnabled && barKIM < (settings.fillControlThreshold ?? 50)) {
-                // Если КИМ ниже порога контроля заполнения, не пакетируем недозаполненную карту
-                effectiveBatchCount = 1;
-              }
-            } else {
-              // Если пакетный рез выключен, рассчитываем по 1 хлысту на этапе подбора
-              // (все одинаковые карты в финале гарантированно группируются в партии через canonicalKey)
-              effectiveBatchCount = 1;
-            }
-
-            for (let b = 0; b < effectiveBatchCount; b++) {
-              kout++;
-              curOutSmIsh.push(effectiveSm);
-              curOutSm.push(s);
-              curOutTxt.push(txt);
-              curOutPieces.push(patternPieceLengths);
-
-              if (isRemnantBar) {
-                curRemnantsUsed++;
-                curRemnantLengthUsed += barTotalMm;
-              }
-            }
-
-            othSm += barWaste * effectiveBatchCount;
-            if (maxOst < barWaste) maxOst = barWaste;
-
-            iSm += effectiveBatchCount;
-
-            const toRemove = new Map<number, number>();
-            for (const [el, neededPerBar] of patternCounts.entries()) {
-              toRemove.set(el, neededPerBar * effectiveBatchCount);
-            }
-
-            const nextData: number[] = [];
-            for (let i = 0; i < data.length; i++) {
-              const val = data[i];
-              const rem = toRemove.get(val);
-              if (rem && rem > 0) {
-                toRemove.set(val, rem - 1);
-              } else {
-                nextData.push(val);
-              }
-            }
-            data = nextData;
-            sumData -= s * effectiveBatchCount;
-            ostSm = Math.max(0, sumData);
-          } else {
-            iSm++;
-          }
-        }
-
-        // Count unique variants via Set
-        const kolVar = new Set(curOutTxt).size;
-
-        // Calculate reusable remnant length and targeted-size remnant length for this candidate solution
-        let curReusableLen = 0;
-        let curTargetRemnantsLen = 0;
-        for (let i = 0; i < curOutSmIsh.length; i++) {
-          const remMm = (curOutSmIsh[i] - curOutSm[i]) * nod;
-          if (delOst > 0 && remMm >= delOst) {
-            curReusableLen += remMm;
-          }
-          if (remMm >= targetRemnantMin) {
-            curTargetRemnantsLen += remMm;
-          }
-        }
-
-        // Differentiated Strategy Scoring & Fitness Function:
-        let bIsVarBest = false;
-        if (!best) {
-          bIsVarBest = true;
-        } else if (isPrioritizeRemnants) {
-          if (ostSm !== best.ostSm) {
-            bIsVarBest = ostSm < best.ostSm;
-          } else if (curRemnantsUsed !== best.remnantsUsed) {
-            bIsVarBest = curRemnantsUsed > best.remnantsUsed;
-          } else if (curRemnantLengthUsed !== best.remnantLengthUsed) {
-            bIsVarBest = curRemnantLengthUsed > best.remnantLengthUsed;
-          } else if (othSm !== best.othSm) {
-            bIsVarBest = othSm < best.othSm;
-          } else {
-            bIsVarBest = kolVar < best.kolVarBest;
-          }
-        } else if (
-          settings.optimizationGoal === 'variants' ||
-          (isCustom && customCfg?.preferFewerCards)
-        ) {
-          // 1. ПО ВАРИАНТАМ / ПОЛЬЗОВАТЕЛЬСКАЯ (ПРИОРИТЕТ КАРТ):
-          // Главный критерий экономии: минимум расхода хлыстов (не перерасходовать металл).
-          // При одинаковом расходе хлыстов строго побеждает решение с МЕНЬШИМ ЧИСЛОМ КАРТ/НАЛАДОК (kolVar)!
-          if (ostSm !== best.ostSm) {
-            bIsVarBest = ostSm < best.ostSm;
-          } else if (kout !== best.kout) {
-            bIsVarBest = kout < best.kout; // Меньше хлыстов побеждает!
-          } else if (kolVar !== best.kolVarBest) {
-            bIsVarBest = kolVar < best.kolVarBest; // При равных хлыстах меньше карт побеждает!
-          } else {
-            bIsVarBest = othSm < best.othSm;
-          }
-        } else if (settings.optimizationGoal === 'min_bars') {
-          // 2. МИНИМУМ ХЛЫСТОВ: строго минимизирует количество использованных заготовок (kout)
-          if (ostSm !== best.ostSm) {
-            bIsVarBest = ostSm < best.ostSm;
-          } else if (kout !== best.kout) {
-            bIsVarBest = kout < best.kout; // Меньше заготовок побеждает!
-          } else if (othSm !== best.othSm) {
-            bIsVarBest = othSm < best.othSm;
-          } else {
-            bIsVarBest = kolVar < best.kolVarBest;
-          }
-        } else if (settings.optimizationGoal === 'max_reusable') {
-          // 3. МАКСИМУМ ДЕЛОВОГО: строго стремится сформировать крупные остатки >= targetRemnantMin!
-          if (ostSm !== best.ostSm) {
-            bIsVarBest = ostSm < best.ostSm;
-          } else if (curTargetRemnantsLen !== best.targetRemnantsLen) {
-            bIsVarBest = curTargetRemnantsLen > best.targetRemnantsLen; // Больше целевых крупных остатков побеждает!
-          } else if (curReusableLen !== best.reusableLen) {
-            bIsVarBest = curReusableLen > best.reusableLen; // Больше общего делового побеждает!
-          } else if (othSm !== best.othSm) {
-            bIsVarBest = othSm < best.othSm; // Меньше лома побеждает!
-          } else {
-            bIsVarBest = kout < best.kout;
-          }
-        } else {
-          // 4. МИНИМУМ ОТХОДОВ: строго минимизирует неиспользуемый отход/лом (othSm)
-          if (ostSm !== best.ostSm) {
-            bIsVarBest = ostSm < best.ostSm;
-          } else if (othSm !== best.othSm) {
-            bIsVarBest = othSm < best.othSm; // Меньше отхода побеждает!
-          } else if (kout !== best.kout) {
-            bIsVarBest = kout < best.kout;
-          } else {
-            bIsVarBest = kolVar < best.kolVarBest;
-          }
-        }
-
-        if (bIsVarBest) {
-          best = {
-            kout,
-            maxOst,
-            ostSm,
-            othSm,
-            kolVarBest: kolVar,
-            remnantsUsed: curRemnantsUsed,
-            remnantLengthUsed: curRemnantLengthUsed,
-            reusableLen: curReusableLen,
-            targetRemnantsLen: curTargetRemnantsLen,
-            outSmIsh: [...curOutSmIsh],
-            outSm: [...curOutSm],
-            outTxt: [...curOutTxt],
-            outPieces: [...curOutPieces],
-            remainingData: [...data],
-          };
-        }
-
-        // Periodic Stage 2 progress report
-        const now = performance.now();
-        if (now - lastProgressReportTime > 50 || currentPass === totalPasses) {
-          lastProgressReportTime = now;
-          const elapsed = now - startTime;
-          const pct = Math.min(85, 10 + Math.round((currentPass / totalPasses) * 75));
-          const estTotal = pct > 0 ? (elapsed / pct) * 100 : 0;
-          const etaSec = Math.max(0, Math.round((estTotal - elapsed) / 1000));
-          const placed = rawRng.length - (best ? best.remainingData.length : data.length);
-          const currentBestKIM =
-            best && best.kout > 0
-              ? Number(
-                  (
-                    ((best.outSm.reduce((a, b) => a + b, 0) * nod) /
-                      (best.outSmIsh.reduce((a, b) => a + b, 0) * nod)) *
-                    100
-                  ).toFixed(1)
-                )
-              : 0;
-
-          options?.onProgress?.({
-            stage: 2,
-            totalStages: 3,
-            stageName: `Многопроходный подбор схем реза (проход ${currentPass}/${totalPasses})`,
-            stageStepName: `Поиск комбинаций: карт ${best ? best.kolVarBest : kolVar} · КИМ ${currentBestKIM}%`,
-            percent: pct,
-            placedParts: Math.max(0, placed),
-            totalParts: rawRng.length,
-            usedBars: best ? best.kout : kout,
-            totalBarsEstimate: Math.ceil(totalDemandLength / (rawSmArr[0] || 6000)),
-            bestKIM: currentBestKIM,
-            uniqueCardsCount: best ? best.kolVarBest : kolVar,
-            elapsedMs: Math.round(elapsed),
-            etaSeconds: etaSec,
-          });
-        }
-      }
-    }
-  }
-
-  stage2EndTime = performance.now();
-  if (best) {
-    initialCardsCount = best.kolVarBest;
-  }
-
-  // Stage 3: 2-Opt Inter-pattern Local Search and Tail Consolidation with granular progress
-  if (best && best.kout > 1) {
-    const totalBarsEst = Math.ceil(totalDemandLength / (rawSmArr[0] || 6000));
-    const placedPartsCount = rawRng.length - (best ? best.remainingData.length : 0);
-    const initialKIM =
-      best.kout > 0
-        ? Number(
-            (
-              ((best.outSm.reduce((a, b) => a + b, 0) * nod) /
-                (best.outSmIsh.reduce((a, b) => a + b, 0) * nod)) *
-              100
-            ).toFixed(1)
-          )
-        : 0;
-
-    options?.onProgress?.({
-      stage: 3,
-      totalStages: 3,
-      stageName: 'Локальная оптимизация и сжатие схем раскроя',
-      stageStepName: 'Инициализация 2-Opt переупаковки...',
-      percent: 86,
-      placedParts: placedPartsCount,
-      totalParts: rawRng.length,
-      usedBars: best.kout,
-      totalBarsEstimate: totalBarsEst,
-      bestKIM: initialKIM,
-      uniqueCardsCount: best.kolVarBest,
-      elapsedMs: Math.round(performance.now() - startTime),
-    });
-
-    best = run2OptLocalSearch(
-      best,
-      nod,
-      dRez,
-      krm,
-      delOst,
-      targetRemnantMin,
-      settings.optimizationGoal,
-      settings.searchSpeed,
-      customCfg,
-      (stepName, round, maxRounds, cardsCount, curKim) => {
-        const pct = Math.min(92, 86 + Math.round((round / maxRounds) * 6));
-        options?.onProgress?.({
-          stage: 3,
-          totalStages: 3,
-          stageName: 'Локальная переупаковка 2-Opt',
-          stageStepName: stepName,
-          percent: pct,
-          placedParts: placedPartsCount,
-          totalParts: rawRng.length,
-          usedBars: best ? best.kout : 0,
-          totalBarsEstimate: totalBarsEst,
-          bestKIM: curKim,
-          uniqueCardsCount: cardsCount,
-          elapsedMs: Math.round(performance.now() - startTime),
-        });
-      }
-    );
-
-    // Pattern Tail Consolidation & Recombination Optimizer (The Tail Squeezer)
-    // Synthesizes additional copies of major patterns from fragmented tail bars
-    // and repacks leftovers into concentrated, minimal-card layouts matching Excel
-    if (best.kout > 2) {
-      options?.onProgress?.({
-        stage: 3,
-        totalStages: 3,
-        stageName: 'Консолидация хвостов и схлопывание карт',
-        stageStepName: 'Анализ минорных карт и синтез базовых шаблонов...',
-        percent: 93,
-        placedParts: placedPartsCount,
-        totalParts: rawRng.length,
-        usedBars: best.kout,
-        totalBarsEstimate: totalBarsEst,
-        bestKIM: Number(
-          (
-            ((best.outSm.reduce((a, b) => a + b, 0) * nod) /
-              (best.outSmIsh.reduce((a, b) => a + b, 0) * nod)) *
-            100
-          ).toFixed(1)
-        ),
-        uniqueCardsCount: best.kolVarBest,
-        elapsedMs: Math.round(performance.now() - startTime),
-      });
-
-      best = consolidateTailPatterns(
-        best,
-        nod,
-        dRez,
-        krm,
-        delOst,
-        targetRemnantMin,
-        settings.optimizationGoal,
-        customCfg,
-        (stepName, cardsCount, curKim) => {
-          options?.onProgress?.({
-            stage: 3,
-            totalStages: 3,
-            stageName: 'Консолидация хвостов и схлопывание карт',
-            stageStepName: stepName,
-            percent: 97,
-            placedParts: placedPartsCount,
-            totalParts: rawRng.length,
-            usedBars: best ? best.kout : 0,
-            totalBarsEstimate: totalBarsEst,
-            bestKIM: curKim,
-            uniqueCardsCount: cardsCount,
-            elapsedMs: Math.round(performance.now() - startTime),
-          });
-        }
-      );
-    }
-  }
-
-  // Final Stage 3 completion report
-  options?.onProgress?.({
-    stage: 3,
-    totalStages: 3,
-    stageName: 'Формирование финальной раскладки',
-    stageStepName: 'Группировка карт и расчет итогового баланса',
-    percent: 99,
-    placedParts: rawRng.length - (best ? best.remainingData.length : 0),
-    totalParts: rawRng.length,
-    usedBars: best ? best.kout : 0,
-    totalBarsEstimate: Math.ceil(totalDemandLength / (rawSmArr[0] || 6000)),
-    bestKIM:
-      best && best.kout > 0
-        ? Number(
-            (
-              ((best.outSm.reduce((a, b) => a + b, 0) * nod) /
-                (best.outSmIsh.reduce((a, b) => a + b, 0) * nod)) *
-              100
-            ).toFixed(1)
-          )
-        : 0,
-    uniqueCardsCount: best ? best.kolVarBest : 0,
-    elapsedMs: Math.round(performance.now() - startTime),
-  });
-
-  if (!best || best.kout === 0) {
-    if (rawRng.length > 0) {
-      try {
-        return solveNaiveSequentialCutting(stockInput, demandInput, settings, 12000);
-      } catch (e) {
-        console.warn('Fallback solveNaiveSequentialCutting failed on early exit:', e);
-      }
-    }
-    return {
-      totalStockLength: 0,
-      totalSpentLength: 0,
-      totalBarsUsed: 0,
-      totalWasteLength: 0,
-      totalReusableLength: 0,
-      overallKIM: 0,
-      rows: [],
-      remainingWarehouseStock: [],
-      unplacedDemand: [],
-      calculationTimeMs: Number((performance.now() - startTime).toFixed(1)),
-    };
-  }
-
-  // Sort and group solution patterns by canonical multiset key
-  const getCanonicalPatternKey = (smIsh: number, pieces: number[]): string => {
-    const sorted = [...pieces].sort((a, b) => b - a);
-    return `${smIsh}:${sorted.join(',')}`;
+  return {
+    startTime,
+    bladeWidth: dRez,
+    edgeTrim: krm,
+    reusableRemnantMin: delOst,
+    searchRemnantMin: 0,
+    targetRemnantMin,
+    targetRemnantKIM: remnantMinFillPct,
+    remnantMinFillPct,
+    dualProfileCut: settings.dualProfileCut === true,
+    fillControlEnabled: settings.fillControlEnabled === true,
+    fillControlThreshold: settings.fillControlThreshold ?? 50,
+    groupSolutions: settings.groupSolutions !== false,
+    searchSpeed: speed,
+    prioritizeRemnants: isPrioritizeRemnants && scaledStockRemnants.length > 0,
+    nod,
+    scaledDemand,
+    scaledStockAll,
+    scaledStockRemnants,
+    scaledStockStandard,
+    activeStandardLengths,
+    remnantBarSizes: Array.from(remnantBarSizesSet),
+    totalDemandLengthMm,
+    totalPartsCount: rawRng.length,
+    totalBarsEstimate: Math.ceil(totalDemandLengthMm / (rawSmArr[0] || 6000)),
+    maxSortZ: Math.max(0, Math.round(baseSortZ * multiplier)),
+    maxSort: Math.max(1, Math.round(baseSort * multiplier)),
+    maxVar: Math.max(1, Math.round(baseVar * multiplier)),
+    stockInput,
+    settings,
+    customConfig,
+    onProgress: options?.onProgress,
+    shouldAbort: options?.shouldAbort,
   };
+}
 
-  interface PatternItem {
-    smIsh: number;
-    sm: number;
-    txt: string;
-    pieceLengths: number[];
-    canonicalKey: string;
-  }
-
-  const patternList: PatternItem[] = [];
-  for (let i = 0; i < best.kout; i++) {
-    const pLengths = best.outPieces[i] || [];
-    patternList.push({
-      smIsh: best.outSmIsh[i],
-      sm: best.outSm[i],
-      txt: best.outTxt[i],
-      pieceLengths: pLengths,
-      canonicalKey: getCanonicalPatternKey(best.outSmIsh[i], pLengths),
-    });
-  }
-
-  // Count frequencies of each canonical pattern to place largest batches first
-  const patternFreq = new Map<string, number>();
-  for (const item of patternList) {
-    patternFreq.set(item.canonicalKey, (patternFreq.get(item.canonicalKey) || 0) + 1);
-  }
-
-  patternList.sort((a, b) => {
-    // 1. Group by bar size (descending)
-    if (b.smIsh !== a.smIsh) return b.smIsh - a.smIsh;
-    // 2. Group by pattern multiplicity (descending: 76 bars, then 27 bars, then 1 bar)
-    const freqA = patternFreq.get(a.canonicalKey) || 0;
-    const freqB = patternFreq.get(b.canonicalKey) || 0;
-    if (freqB !== freqA) return freqB - freqA;
-    // 3. Group by canonical key to keep identical patterns strictly contiguous
-    if (a.canonicalKey !== b.canonicalKey) return a.canonicalKey.localeCompare(b.canonicalKey);
-    // 4. By spent
-    return b.sm - a.sm;
-  });
-
-  // Group patterns if bGroupe is true
-  interface GroupedRow {
-    barSize: number;
-    spent: number;
-    count: number;
-    pieceLengths: number[];
-  }
-
-  const groupedRows: GroupedRow[] = [];
-  let curKey = '';
-  let curK = 0;
-
-  for (let i = 0; i < patternList.length; i++) {
-    const item = patternList[i];
-    const barSize = item.smIsh * nod + krm;
-    const spent = item.sm * nod + krm;
-
-    if (item.canonicalKey !== curKey || !bGroupe) {
-      curK = 1;
-      groupedRows.push({
-        barSize,
-        spent,
-        count: curK,
-        pieceLengths: [...item.pieceLengths],
-      });
-      curKey = item.canonicalKey;
-    } else {
-      curK++;
-      groupedRows[groupedRows.length - 1].count = curK;
-    }
-  }
-
-  // Feature 1: Контроль заполнения заготовок при раскрое «В 2 профиля» (и длинномерных заготовок)
-  // Проверяем ВСЕ карты раскроя, где заполнение фактическими деталями
-  // ниже установленного порога fillControlThreshold (например, 32% на 12-метровом хлысте при пороге 70%).
-  if (settings.fillControlEnabled && groupedRows.length > 0) {
-    const threshold = settings.fillControlThreshold ?? 50;
-    const piecesToReNest: number[] = [];
-    const preservedRows: GroupedRow[] = [];
-
-    for (let rIdx = 0; rIdx < groupedRows.length; rIdx++) {
-      const row = groupedRows[rIdx];
-      const partsSum = row.pieceLengths.reduce((a, b) => a + b, 0);
-      const purePartsKIM = row.barSize > 0 ? (partsSum / row.barSize) * 100 : 0;
-
-      // Условие контроля заполнения:
-      // Любая карта, у которой полезное заполнение деталями (без учета остатка) ниже порога threshold,
-      // либо длинномерная заготовка (>= 5000 мм), на которой остаток превышает длину самих деталей.
-      const isUnderfilled =
-        row.pieceLengths.length > 0 &&
-        (purePartsKIM < threshold || (row.barSize >= 5000 && purePartsKIM < 70));
-
-      if (isUnderfilled) {
-        // Извлекаем все детали из недозаполненной карты раскроя для переупаковки
-        for (let c = 0; c < row.count; c++) {
-          piecesToReNest.push(...row.pieceLengths);
-        }
-      } else {
-        preservedRows.push(row);
-      }
-    }
-
-    if (piecesToReNest.length > 0) {
-      // Преобразуем детали в DemandItem
-      const pieceCounts = new Map<number, number>();
-      piecesToReNest.forEach((len) => {
-        pieceCounts.set(len, (pieceCounts.get(len) || 0) + 1);
-      });
-
-      const reCutDemands: DemandItem[] = [];
-      let dIdx = 1;
-      pieceCounts.forEach((qty, len) => {
-        reCutDemands.push({
-          id: `fill_renest_${dIdx++}`,
-          orderIndex: dIdx,
-          length: len,
-          quantity: qty,
-        });
-      });
-
-      // Рассчитываем оставшийся неиспользованный складской запас
-      const consumedCountByLength = new Map<number, number>();
-      preservedRows.forEach((r) => {
-        consumedCountByLength.set(
-          r.barSize,
-          (consumedCountByLength.get(r.barSize) || 0) + r.count
-        );
-      });
-
-      const reCutStockInput: StockItem[] = [];
-      stockInput.forEach((s) => {
-        if (s.isActive === false) return;
-        const isStandardUnlimited =
-          s.isStandardUnlimited ||
-          ((s.length === 6000 || s.length === 12000) && (!s.quantity || s.quantity <= 0));
-        if (isStandardUnlimited) {
-          reCutStockInput.push({ ...s });
-        } else {
-          const used = consumedCountByLength.get(s.length) || 0;
-          const remainingQty = Math.max(0, (s.quantity || 0) - used);
-          if (used > 0) {
-            consumedCountByLength.set(s.length, Math.max(0, used - (s.quantity || 0)));
-          }
-          if (remainingQty > 0) {
-            reCutStockInput.push({ ...s, quantity: remainingQty });
-          }
-        }
-      });
-
-      // Перераскрой деталей в 1 профиль (без спаривания) со стратегией 'min_waste'
-      const reCutSettings: AppSettings = {
-        ...settings,
-        dualProfileCut: false,
-        optimizationGoal: 'min_waste',
-        fillControlEnabled: false,
-      };
-
-      const reCutSolution = solveLinearCutting(reCutStockInput, reCutDemands, reCutSettings);
-
-      if (reCutSolution.rows.length > 0) {
-        groupedRows.length = 0;
-        groupedRows.push(...preservedRows);
-
-        for (const sRow of reCutSolution.rows) {
-          const pieceLengths: number[] = [];
-          sRow.pieces.forEach((p) => {
-            for (let i = 0; i < p.count; i++) {
-              pieceLengths.push(p.length);
-            }
-          });
-
-          groupedRows.push({
-            barSize: sRow.barSize,
-            spent: sRow.spent,
-            count: sRow.barsCount,
-            pieceLengths,
-          });
-        }
-
-        // Сортировка карт: по убыванию длины заготовки, затем по убыванию заполнения
-        groupedRows.sort((a, b) => {
-          if (b.barSize !== a.barSize) return b.barSize - a.barSize;
-          return b.spent - a.spent;
-        });
+function buildRowsFromCards(
+  cards: readonly CutCard[],
+  context: CutContext,
+  demandColorMap: ReadonlyMap<number, string>,
+  demandMarkMap: ReadonlyMap<number, string>
+): SolutionRow[] {
+  const expandedCards: CutCard[] = [];
+  if (context.groupSolutions) {
+    expandedCards.push(...cards);
+  } else {
+    for (const card of cards) {
+      for (let c = 0; c < card.count; c++) {
+        expandedCards.push({ ...card, count: 1 });
       }
     }
   }
 
-  // Build final SolutionRow items and formulas
-  let totalStockLength = 0;
-  let totalSpentLength = 0;
-  let totalBarsUsed = 0;
-  let totalWasteLength = 0;
-  let totalReusableLength = 0;
+  const dRez = context.bladeWidth;
+  const krm = context.edgeTrim;
 
-  const rows: SolutionRow[] = groupedRows.map((gr, idx) => {
-    // 1. Group pieces by length
+  return expandedCards.map((card, idx) => {
     const pieceCountMap = new Map<number, number>();
-    gr.pieceLengths.forEach((len) => {
+    for (let i = 0; i < card.pieceLengths.length; i++) {
+      const len = card.pieceLengths[i];
       pieceCountMap.set(len, (pieceCountMap.get(len) || 0) + 1);
-    });
+    }
+
     const sortedUniquePieces = Array.from(pieceCountMap.entries())
       .sort((a, b) => b[0] - a[0])
-      .map(([len, count]) => ({ length: len, count }));
+      .map(([length, count]) => ({ length, count }));
 
-    // 2. Build piece string in < >: e.g. <800х7 + 150х2>
     const piecesStr = sortedUniquePieces.map((p) => `${p.length}х${p.count}`).join(' + ');
-
-    // 3. Trim in [ ]: e.g. [10] or []
     const trimStr = krm > 0 ? `[${krm}]` : '[]';
     const trimCuts = krm > 0 ? 1 : 0;
-    const totalPiecesCount = gr.pieceLengths.length;
-    const totalPartsLength = gr.pieceLengths.reduce((a, b) => a + b, 0);
-
-    // 4. Physical cuts count: trim cut + internal cuts between pieces + cut separating piece from remainder
-    // If remainder > 0: trimCuts + (totalPiecesCount - 1) + 1 = trimCuts + totalPiecesCount
-    // If remainder === 0: trimCuts + Math.max(0, totalPiecesCount - 1)
-    const rawRemainderCheck = gr.barSize - totalPartsLength - krm;
+    const totalPiecesCount = card.pieceLengths.length;
+    const rawRemainderCheck = card.barSize - card.partsLengthMm - krm;
     const cutsCount =
       totalPiecesCount > 0
         ? trimCuts + Math.max(0, totalPiecesCount - 1) + (rawRemainderCheck > dRez ? 1 : 0)
         : trimCuts;
-    const kerfLoss = dRez * cutsCount;
 
-    // 5. Remainder calculation (exact millimeter balance: barSize = trim + parts + kerf + remainder)
-    const totalKerfAndParts = totalPartsLength + krm + kerfLoss;
-    const remainder = Math.max(0, gr.barSize - totalKerfAndParts);
-
-    const isReusable = delOst > 0 && remainder >= delOst;
-    const reusableRemnant = isReusable ? remainder : 0;
-    const scrapRemnant = isReusable ? 0 : remainder;
-
-    // Waste for the bar: trim + kerf cuts + scrap (торцовка + резы + лом)
-    const barWaste = krm + kerfLoss + scrapRemnant;
-
-    // 6. Format reusable remnant and waste
-    const reusableStr = isReusable ? `!<${reusableRemnant}>` : '!<>';
-    const wasteStr = scrapRemnant > 0 ? `(${dRez}х${cutsCount}+${scrapRemnant})` : `(${dRez}х${cutsCount})`;
-
-    // 7. Full formula matching user specification:
-    // 20х{[10] + <800х7 + 150х2> + !<> + (3х10+60)}=6000
-    const formulaStr = `${gr.count}х{${trimStr} + <${piecesStr}> + ${reusableStr} + ${wasteStr}}=${gr.barSize}`;
+    const reusableStr = card.isReusable ? `!<${card.reusableRemnantMm}>` : '!<>';
+    const wasteStr =
+      card.scrapRemnantMm > 0
+        ? `(${dRez}х${cutsCount}+${card.scrapRemnantMm})`
+        : `(${dRez}х${cutsCount})`;
+    const formulaStr = `${card.count}х{${trimStr} + <${piecesStr}> + ${reusableStr} + ${wasteStr}}=${card.barSize}`;
 
     let wasteLabel = 'О';
-    if (isReusable) {
-      wasteLabel = reusableRemnant >= 100 ? 'Остат' : 'Ос';
+    if (card.isReusable) {
+      wasteLabel = card.reusableRemnantMm >= 100 ? 'Остат' : 'Ос';
     }
 
     const pieces: SolutionPiece[] = sortedUniquePieces.map((p, sIdx) => ({
       id: `p_${idx}_${sIdx}`,
       length: p.length,
       count: p.count,
-      color: demandColorMap.get(p.length) || getColorForLength(p.length, sIdx),
+      color: demandColorMap.get(p.length) || getColorForLength(p.length),
       mark: demandMarkMap.get(p.length),
     }));
 
@@ -2214,7 +658,7 @@ export function solveLinearCutting(
     }
 
     sortedUniquePieces.forEach((p, sIdx) => {
-      const color = demandColorMap.get(p.length) || getColorForLength(p.length, sIdx);
+      const color = demandColorMap.get(p.length) || getColorForLength(p.length);
       const mark = demandMarkMap.get(p.length) || `${p.length}`;
       for (let c = 0; c < p.count; c++) {
         layoutItems.push({
@@ -2226,76 +670,196 @@ export function solveLinearCutting(
       }
     });
 
-    if (remainder > 0) {
+    if (card.remainderMm > 0) {
       layoutItems.push({
         id: `waste_${idx}`,
-        length: remainder,
-        color: isReusable ? '#FCD34D' : '#E2E8F0',
+        length: card.remainderMm,
+        color: card.isReusable ? '#FCD34D' : '#E2E8F0',
         isWaste: true,
-        wasteType: isReusable ? 'reusable' : 'scrap',
-        mark: isReusable ? `${reusableRemnant} (Ост)` : `${scrapRemnant}`,
+        wasteType: card.isReusable ? 'reusable' : 'scrap',
+        mark: card.isReusable
+          ? `${card.reusableRemnantMm} (Ост)`
+          : `${card.scrapRemnantMm}`,
       });
     }
 
-    totalStockLength += gr.barSize * gr.count;
-    totalSpentLength += totalPartsLength * gr.count;
-    totalBarsUsed += gr.count;
-    totalReusableLength += reusableRemnant * gr.count;
-    totalWasteLength += barWaste * gr.count;
-
-    const efficiency = Number(((((totalPartsLength + reusableRemnant) / gr.barSize)) * 100).toFixed(2));
+    const barWaste = card.trimLossMm + card.kerfLossMm + card.scrapRemnantMm;
+    const efficiency =
+      card.barSize > 0
+        ? Number(
+            (((card.partsLengthMm + card.reusableRemnantMm) / card.barSize) * 100).toFixed(2)
+          )
+        : 0;
 
     return {
       id: `row_${idx + 1}`,
       barIndex: idx + 1,
-      barSize: gr.barSize,
-      spent: totalPartsLength,
-      barsCount: gr.count,
+      barSize: card.barSize,
+      spent: card.partsLengthMm,
+      barsCount: card.count,
       formula: formulaStr,
       pieces,
       waste: barWaste,
-      reusableRemnant,
-      scrapRemnant,
-      kerfLoss,
-      trimLoss: krm,
-      isReusable,
+      reusableRemnant: card.reusableRemnantMm,
+      scrapRemnant: card.scrapRemnantMm,
+      kerfLoss: card.kerfLossMm,
+      trimLoss: card.trimLossMm,
+      isReusable: card.isReusable,
       wasteLabel,
       efficiency,
       layoutItems,
+      ...(card.isTailSingle ? { isTailSingle: true } : {}),
     };
   });
+}
 
-  // Calculate Overall KIM:
-  // (Total Stock - Total Non-reusable Waste) / Total Stock * 100%
-  const overallKIM =
-    totalStockLength > 0
-      ? Number((((totalStockLength - totalWasteLength) / totalStockLength) * 100).toFixed(2))
-      : 0;
+interface BatchAndTailSplit {
+  batchSize: number;
+  batchStock: StockItem[];
+  batchDemand: DemandItem[];
+  tailDemand: DemandItem[];
+}
 
-  // Calculate Net (Instant) KIM:
-  // Total Pieces Spent / Total Stock * 100% (without reusable remnant)
-  const netKIM =
-    totalStockLength > 0
-      ? Number(((totalSpentLength / totalStockLength) * 100).toFixed(2))
-      : 0;
+/**
+ * Пакетный рез в N (N >= 2) профилей с отдельным раскроем остатка по 1 профилю:
+ * детали с количеством q разбиваются на batch = floor(q / N) и tail = q % N.
+ * Пакетный режим не отключается молча при некратных количествах.
+ */
+function splitBatchAndTailInputs(
+  stock: StockItem[],
+  demand: DemandItem[],
+  batchSize: number
+): BatchAndTailSplit {
+  const batchDemand: DemandItem[] = [];
+  const tailDemand: DemandItem[] = [];
 
-  // Track warehouse remaining stock (Блок «Осталось»)
-  // Requirement 9: Remove rows with quantity <= 0
-  const usedCountByStockLength = new Map<number, number>();
-  groupedRows.forEach((r) => {
-    usedCountByStockLength.set(
-      r.barSize,
-      (usedCountByStockLength.get(r.barSize) || 0) + r.count
-    );
+  for (let i = 0; i < demand.length; i++) {
+    const d = demand[i];
+    if (d.length <= 0 || d.quantity <= 0) continue;
+    const batchQty = Math.floor(d.quantity / batchSize);
+    const tailQty = d.quantity % batchSize;
+    if (batchQty > 0) {
+      batchDemand.push({ ...d, quantity: batchQty });
+    }
+    if (tailQty > 0) {
+      tailDemand.push({ ...d, quantity: tailQty });
+    }
+  }
+
+  const batchStock = stock.map((st) =>
+    st.isStandardUnlimited ||
+    ((st.length === 6000 || st.length === 12000 || st.length === 11700) && st.quantity <= 0) ||
+    st.quantity <= 0
+      ? st
+      : { ...st, quantity: Math.floor(st.quantity / batchSize) }
+  );
+
+  return { batchSize, batchStock, batchDemand, tailDemand };
+}
+
+function buildRemainingStockAfterCards(
+  stockInput: StockItem[],
+  consumedCards: readonly CutCard[]
+): { remainingStock: StockItem[]; finiteSig: string } {
+  const consumedByLen = new Map<number, number>();
+  for (let i = 0; i < consumedCards.length; i++) {
+    const c = consumedCards[i];
+    consumedByLen.set(c.barSize, (consumedByLen.get(c.barSize) || 0) + c.count);
+  }
+
+  const remainingStock: StockItem[] = [];
+  const sigParts: string[] = [];
+  for (let i = 0; i < stockInput.length; i++) {
+    const s = stockInput[i];
+    if (s.isActive === false || s.length <= 0) continue;
+    const isAuto =
+      s.isStandardUnlimited ||
+      ((s.length === 6000 || s.length === 12000 || s.length === 11700) && s.quantity <= 0);
+    if (isAuto) {
+      remainingStock.push({ ...s, quantity: 0, isStandardUnlimited: true });
+      continue;
+    }
+    const used = consumedByLen.get(s.length) || 0;
+    const take = Math.min(s.quantity, used);
+    const rem = s.quantity - take;
+    if (take > 0) consumedByLen.set(s.length, used - take);
+    if (rem > 0) {
+      remainingStock.push({ ...s, quantity: rem });
+      sigParts.push(`${s.length}:${rem}`);
+    }
+  }
+  return { remainingStock, finiteSig: sigParts.join(',') };
+}
+function buildSolutionFromFinalState(
+  finalState: CutState,
+  context: CutContext,
+  stockInput: StockItem[],
+  demandInput: DemandItem[],
+  settings: AppSettings,
+  startMemoryMb: number | undefined,
+  startedAt: number
+): FullOptimizationSolution {
+  if (finalState.cards.length === 0 || finalState.metrics.totalBarsUsed === 0) {
+    if (context.totalPartsCount > 0) {
+      try {
+        return solveNaiveSequentialCutting(stockInput, demandInput, settings, 12000);
+      } catch (err: unknown) {
+        console.warn('Fallback solveNaiveSequentialCutting failed on early exit:', err);
+      }
+    }
+    return {
+      totalStockLength: 0,
+      totalSpentLength: 0,
+      totalBarsUsed: 0,
+      totalWasteLength: 0,
+      totalReusableLength: 0,
+      maxReusableRemnantLength: 0,
+      cuttingIndex: 0,
+      cuttingIndexMaterial: 0,
+      cuttingIndexSetup: 0,
+      overallKIM: 0,
+      netKIM: 0,
+      rows: [],
+      remainingWarehouseStock: [],
+      unplacedDemand: [],
+      calculationTimeMs: Number((performance.now() - startedAt).toFixed(1)),
+    };
+  }
+
+  // Build immutable color and mark lookup map from demand specification
+  const demandColorMap = new Map<number, string>();
+  const demandMarkMap = new Map<number, string>();
+  demandInput.forEach((d, dIdx) => {
+    if (!demandColorMap.has(d.length)) {
+      demandColorMap.set(d.length, d.color || getDefaultDemandColor(dIdx, d.length));
+    }
+    if (d.mark && !demandMarkMap.has(d.length)) {
+      demandMarkMap.set(d.length, d.mark);
+    }
   });
 
-  const remainingWarehouseStock: RemnantItem[] = [];
+  const rows = buildRowsFromCards(
+    finalState.cards,
+    context,
+    demandColorMap,
+    demandMarkMap
+  );
 
+  // Track warehouse remaining stock (Блок «Осталось»)
+  const usedCountByStockLength = new Map<number, number>();
+  for (const card of finalState.cards) {
+    usedCountByStockLength.set(
+      card.barSize,
+      (usedCountByStockLength.get(card.barSize) || 0) + card.count
+    );
+  }
+
+  const remainingWarehouseStock: RemnantItem[] = [];
   stockInput.forEach((s) => {
     if (s.isActive === false) return;
     const isAuto =
       s.isStandardUnlimited ||
-      ((s.length === 6000 || s.length === 12000) && s.quantity <= 0);
+      ((s.length === 6000 || s.length === 12000 || s.length === 11700) && s.quantity <= 0);
     if (isAuto) return;
     const used = usedCountByStockLength.get(s.length) || 0;
     const rem = Math.max(0, s.quantity - used);
@@ -2309,50 +873,50 @@ export function solveLinearCutting(
     }
   });
 
-  // Add reusable remnants from cut bars back to warehouse inventory (delOst > 0)
-  if (delOst > 0) {
-    rows.forEach((r) => {
-      if (r.isReusable && r.reusableRemnant >= delOst && r.reusableRemnant > 0) {
+  if (context.reusableRemnantMin > 0) {
+    for (const r of rows) {
+      if (
+        r.isReusable &&
+        r.reusableRemnant >= context.reusableRemnantMin &&
+        r.reusableRemnant > 0
+      ) {
         remainingWarehouseStock.push({
           length: r.reusableRemnant,
           quantity: r.barsCount,
           mark: 'Деловой остаток',
         });
       }
-    });
+    }
   }
 
   // Unplaced demand (Блок «Не сделано»)
   const unplacedDemand: UnplacedItem[] = [];
-  if (best.remainingData && best.remainingData.length > 0) {
+  if (finalState.unplacedScaled.length > 0) {
     const unplacedCounts = new Map<number, number>();
-    best.remainingData.forEach((scaled) => {
-      const len = scaled * nod - dRez;
+    for (const scaled of finalState.unplacedScaled) {
+      const len = scaled * context.nod - context.bladeWidth;
       unplacedCounts.set(len, (unplacedCounts.get(len) || 0) + 1);
-    });
+    }
     unplacedCounts.forEach((qty, len) => {
       unplacedDemand.push({
         length: len,
-        quantity: b2prof ? qty * 2 : qty,
+        quantity: qty,
       });
     });
   }
 
   const endTime = performance.now();
-  const totalDurationMs = Number((endTime - startTime).toFixed(1));
-  const stage1Ms = Number((stage1EndTime - startTime).toFixed(1));
-  const stage2Ms = Number((stage2EndTime - stage1EndTime).toFixed(1));
-  const stage3Ms = Number((endTime - stage2EndTime).toFixed(1));
-
+  const totalDurationMs = Number((endTime - startedAt).toFixed(1));
   const endMemoryMb = getMemoryUsageMb();
   const memoryDeltaMb =
     startMemoryMb !== undefined && endMemoryMb !== undefined
       ? Number((endMemoryMb - startMemoryMb).toFixed(2))
       : undefined;
 
-  const totalParts = rawRng.length;
   const throughput =
-    totalDurationMs > 0 ? Number(((totalParts / (totalDurationMs / 1000))).toFixed(1)) : 0;
+    totalDurationMs > 0
+      ? Number((context.totalPartsCount / (totalDurationMs / 1000)).toFixed(1))
+      : 0;
 
   const telemetry: CalculationTelemetry = {
     calculationId: `calc_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`,
@@ -2363,41 +927,4145 @@ export function solveLinearCutting(
         : 'client_main',
     totalDurationMs,
     stageTimingsMs: {
-      stage1Init: Math.max(0, stage1Ms),
-      stage2Search: Math.max(0, stage2Ms),
-      stage3Refine: Math.max(0, stage3Ms),
+      stage1Init: finalState.telemetryCounters.stage1Ms,
+      stage2Search: finalState.telemetryCounters.stage2Ms,
+      stage3Refine: finalState.telemetryCounters.stage3Ms,
     },
-    passesEvaluated: currentPass,
-    totalCombinationsChecked: Math.max(currentPass, totalCombinationsChecked),
-    twoOptSwapIterations: customCfg?.twoOptRounds ?? (speed === 'deep' ? 30 : speed === 'standard' ? 15 : 6),
+    passesEvaluated: finalState.telemetryCounters.passesEvaluated,
+    prunedPasses: finalState.telemetryCounters.prunedPasses ?? 0,
+    totalCombinationsChecked: Math.max(
+      finalState.telemetryCounters.passesEvaluated,
+      finalState.telemetryCounters.totalCombinationsChecked
+    ),
+    twoOptSwapIterations: finalState.telemetryCounters.twoOptSwapIterations,
     tailConsolidationCardsMerged:
-      best && initialCardsCount ? Math.max(0, initialCardsCount - best.kolVarBest) : 0,
+      finalState.telemetryCounters.tailConsolidationCardsMerged,
     throughputPartsPerSecond: throughput,
     memoryUsedMb: endMemoryMb,
     memoryDeltaMb,
     cpuLoadPercent: 100,
-    workerThreadCount: 1,
+    workerThreadCount: finalState.telemetryCounters.threadsUsed ?? 1,
+    chunksProcessed: finalState.telemetryCounters.chunksProcessed ?? 0,
   };
 
+  const abortedInfo = finalState.telemetryCounters.abortedDuringSearch
+    ? {
+        viewedPasses:
+          finalState.telemetryCounters.abortedStageViewedPasses ??
+          finalState.telemetryCounters.passesEvaluated,
+        totalPasses:
+          finalState.telemetryCounters.abortedStageTotalPasses ??
+          finalState.telemetryCounters.totalPassesPlanned ??
+          finalState.telemetryCounters.passesEvaluated,
+      }
+    : undefined;
+
+  let batchInfo: FullOptimizationSolution['batchInfo'] | undefined;
+  if (settings.dualProfileCut === true) {
+    const batchSize = resolveBatchSize(demandInput, settings);
+    batchInfo = computeBatchInfoFromCards(finalState.cards, demandInput, batchSize);
+  }
+
   return {
-    totalStockLength,
-    totalSpentLength,
-    totalBarsUsed,
-    totalWasteLength,
-    totalReusableLength,
-    overallKIM,
-    netKIM,
+    totalStockLength: finalState.metrics.totalStockLengthMm,
+    totalSpentLength: finalState.metrics.totalPartsLengthMm,
+    totalBarsUsed: finalState.metrics.totalBarsUsed,
+    totalWasteLength: finalState.metrics.totalWasteMm,
+    totalReusableLength: finalState.metrics.totalReusableMm,
+    maxReusableRemnantLength: finalState.metrics.maxReusableRemnantMm,
+    cuttingIndex: finalState.metrics.cuttingIndex,
+    cuttingIndexMaterial: finalState.metrics.cuttingIndexMaterial,
+    cuttingIndexSetup: finalState.metrics.cuttingIndexSetup,
+    overallKIM: finalState.metrics.overallKIM,
+    netKIM: finalState.metrics.netKIM,
     rows,
     remainingWarehouseStock,
     unplacedDemand,
     calculationTimeMs: totalDurationMs,
     telemetry,
+    ...(abortedInfo ? { abortedInfo } : {}),
+    ...(batchInfo ? { batchInfo } : {}),
+  };
+}
+
+function computeBatchInfoFromCards(
+  items: readonly { count: number; pieceLengths: readonly number[] }[],
+  demandInput: readonly DemandItem[],
+  batchSize: number
+): NonNullable<FullOptimizationSolution['batchInfo']> {
+  let batchBarsUsed = 0;
+  let tailBarsUsed = 0;
+  const singlePlacedByLen = new Map<number, number>();
+
+  for (let i = 0; i < items.length; i++) {
+    const item = items[i];
+    const { batchCount, singleCount } = getBatchRowSplit(item.count, batchSize);
+    batchBarsUsed += batchCount;
+    tailBarsUsed += singleCount;
+    if (singleCount > 0) {
+      for (let p = 0; p < item.pieceLengths.length; p++) {
+        const len = item.pieceLengths[p];
+        singlePlacedByLen.set(len, (singlePlacedByLen.get(len) || 0) + singleCount);
+      }
+    }
+  }
+
+  const demandQtyByLen = new Map<number, number>();
+  for (let i = 0; i < demandInput.length; i++) {
+    const d = demandInput[i];
+    if (d.length > 0 && d.quantity > 0) {
+      demandQtyByLen.set(d.length, (demandQtyByLen.get(d.length) || 0) + d.quantity);
+    }
+  }
+
+  const nonMultipleDetails: { length: number; quantity: number; tailQuantity: number }[] = [];
+  for (const [length, quantity] of demandQtyByLen.entries()) {
+    const rem = quantity % batchSize;
+    const singlePlaced = singlePlacedByLen.get(length) || 0;
+    if (rem !== 0 && singlePlaced > 0) {
+      nonMultipleDetails.push({
+        length,
+        quantity,
+        tailQuantity: Math.min(rem, singlePlaced),
+      });
+    }
+  }
+
+  return {
+    batchSize,
+    batchBarsUsed,
+    tailBarsUsed,
+    nonMultipleDetails,
+  };
+}
+
+function solveTailSingleCards(
+  stockInput: StockItem[],
+  consumedBatchCards: readonly CutCard[],
+  tailDemand: DemandItem[],
+  settings: AppSettings,
+  strategy: CuttingStrategy,
+  fullCtx: CutContext,
+  shouldAbort?: () => boolean
+): {
+  cards: CutCard[];
+  unplacedScaledFull: number[];
+  passesEvaluated: number;
+  prunedPasses: number;
+  totalCombinationsChecked: number;
+} {
+  if (tailDemand.length === 0) {
+    return {
+      cards: [],
+      unplacedScaledFull: [],
+      passesEvaluated: 0,
+      prunedPasses: 0,
+      totalCombinationsChecked: 0,
+    };
+  }
+  const { remainingStock } = buildRemainingStockAfterCards(stockInput, consumedBatchCards);
+  const tailSettings: AppSettings = {
+    ...settings,
+    dualProfileCut: false,
+    fillControlEnabled: false,
+  };
+  const tailCtx = buildCutContext(remainingStock, tailDemand, tailSettings, { shouldAbort });
+  if (tailCtx.scaledDemand.length === 0 || tailCtx.scaledStockAll.length === 0) {
+    const fallbackUnplaced: number[] = [];
+    for (const d of tailDemand) {
+      if (d.length > 0 && d.quantity > 0) {
+        const sc = Math.floor((d.length + fullCtx.bladeWidth) / fullCtx.nod);
+        for (let k = 0; k < d.quantity; k++) fallbackUnplaced.push(sc);
+      }
+    }
+    return {
+      cards: [],
+      unplacedScaledFull: fallbackUnplaced,
+      passesEvaluated: 0,
+      prunedPasses: 0,
+      totalCombinationsChecked: 0,
+    };
+  }
+
+  const tailInitial: CutState = {
+    cards: [],
+    metrics: calculateMetrics([], tailCtx, tailCtx.scaledDemand),
+    unplacedScaled: tailCtx.scaledDemand,
+    score: -Infinity,
+    context: tailCtx,
+    telemetryCounters: {
+      passesEvaluated: 0,
+      prunedPasses: 0,
+      totalCombinationsChecked: 0,
+      twoOptSwapIterations: 0,
+      tailConsolidationCardsMerged: 0,
+      initialCardsCount: 0,
+      stage1Ms: 0,
+      stage2Ms: 0,
+      stage3Ms: 0,
+    },
+  };
+
+  const tailSolved = runCuttingPipeline(tailInitial, strategy);
+  const tailCards = tailSolved.cards.map((c) =>
+    createCardWithTailFlag(c, fullCtx, true)
+  );
+  const unplacedScaledFull = tailSolved.unplacedScaled.map((u) => {
+    const pieceMm = u * tailCtx.nod - tailCtx.bladeWidth;
+    return Math.floor((pieceMm + fullCtx.bladeWidth) / fullCtx.nod);
+  });
+
+  return {
+    cards: tailCards,
+    unplacedScaledFull,
+    passesEvaluated: tailSolved.telemetryCounters.passesEvaluated,
+    prunedPasses: tailSolved.telemetryCounters.prunedPasses ?? 0,
+    totalCombinationsChecked: tailSolved.telemetryCounters.totalCombinationsChecked,
+  };
+}
+
+function createCardWithTailFlag(
+  card: CutCard,
+  context: CutContext,
+  isTailSingle: boolean
+): CutCard {
+  const signature = `${card.barSize}:${card.pieceLengths.join(',')}${isTailSingle ? ':S' : ''}${card.isLockedRemnant ? ':R' : ''}`;
+  const effectiveSm = Math.max(0, Math.floor((card.barSize - context.edgeTrim) / (context.nod || 1)));
+  let spentSm = 0;
+  for (let i = 0; i < card.pieceLengths.length; i++) {
+    spentSm += Math.floor((card.pieceLengths[i] + context.bladeWidth) / (context.nod || 1));
+  }
+  return {
+    ...card,
+    signature,
+    effectiveSm,
+    spentSm,
+    ...(isTailSingle ? { isTailSingle: true } : {}),
+    ...(card.isLockedRemnant ? { isLockedRemnant: true } : {}),
+  };
+}
+
+function combineBatchAndTailState(
+  batchState: CutState,
+  batchSize: number,
+  batchCtx: CutContext,
+  fullCtx: CutContext,
+  stockInput: StockItem[],
+  tailDemand: DemandItem[],
+  settings: AppSettings,
+  tailStrategy: CuttingStrategy,
+  tailCache?: Map<
+    string,
+    {
+      cards: CutCard[];
+      unplacedScaledFull: number[];
+      passesEvaluated: number;
+      prunedPasses: number;
+      totalCombinationsChecked: number;
+    }
+  >
+): CutState {
+  const batchCards: CutCard[] = [];
+  for (let i = 0; i < batchState.cards.length; i++) {
+    const c = batchState.cards[i];
+    batchCards.push(
+      createCardWithTailFlag({ ...c, count: c.count * batchSize }, fullCtx, false)
+    );
+  }
+
+  const batchUnplacedFull: number[] = [];
+  for (let i = 0; i < batchState.unplacedScaled.length; i++) {
+    const pieceMm = batchState.unplacedScaled[i] * batchCtx.nod - batchCtx.bladeWidth;
+    const fullSc = Math.floor((pieceMm + fullCtx.bladeWidth) / fullCtx.nod);
+    for (let k = 0; k < batchSize; k++) batchUnplacedFull.push(fullSc);
+  }
+
+  let tailRes: {
+    cards: CutCard[];
+    unplacedScaledFull: number[];
+    passesEvaluated: number;
+    prunedPasses: number;
+    totalCombinationsChecked: number;
+  };
+  if (tailDemand.length === 0) {
+    tailRes = {
+      cards: [],
+      unplacedScaledFull: [],
+      passesEvaluated: 0,
+      prunedPasses: 0,
+      totalCombinationsChecked: 0,
+    };
+  } else if (tailCache) {
+    const { finiteSig } = buildRemainingStockAfterCards(stockInput, batchCards);
+    const cached = tailCache.get(finiteSig);
+    if (cached) {
+      tailRes = cached;
+    } else {
+      tailRes = solveTailSingleCards(
+        stockInput,
+        batchCards,
+        tailDemand,
+        settings,
+        tailStrategy,
+        fullCtx,
+        fullCtx.shouldAbort
+      );
+      tailCache.set(finiteSig, tailRes);
+    }
+  } else {
+    tailRes = solveTailSingleCards(
+      stockInput,
+      batchCards,
+      tailDemand,
+      settings,
+      tailStrategy,
+      fullCtx,
+      fullCtx.shouldAbort
+    );
+  }
+
+  const mergedCards = groupIdenticalCards([...batchCards, ...tailRes.cards], fullCtx);
+  const mergedUnplaced = [...batchUnplacedFull, ...tailRes.unplacedScaledFull];
+  const metrics = calculateMetrics(mergedCards, fullCtx, mergedUnplaced);
+
+  return {
+    ...batchState,
+    cards: mergedCards,
+    unplacedScaled: mergedUnplaced,
+    metrics,
+    score: tailStrategy.score(mergedCards, metrics, fullCtx),
+    context: fullCtx,
+    telemetryCounters: {
+      ...batchState.telemetryCounters,
+      passesEvaluated: batchState.telemetryCounters.passesEvaluated + tailRes.passesEvaluated,
+      prunedPasses:
+        (batchState.telemetryCounters.prunedPasses ?? 0) + (tailRes.prunedPasses ?? 0),
+      totalCombinationsChecked:
+        batchState.telemetryCounters.totalCombinationsChecked + tailRes.totalCombinationsChecked,
+    },
+  };
+}
+
+interface BatchFillControlOutcome {
+  state: CutState;
+  untouchedBatchCards: CutCard[];
+  hasSinglePoolWork: boolean;
+}
+
+/**
+ * Applies fillControl on batch cards after batch-mode optimization:
+ * inspects non-tail batch cards (`!c.isTailSingle`) with purePartsKIM < fillControlThreshold,
+ * repacks all pieces from underfilled batch cards on remaining stock in single-profile mode
+ * using the active strategy, and accepts ONLY if unplaced did not increase,
+ * totalBarsUsed did not increase, and strategy.score() did not worsen.
+ */
+function applyBatchFillControl(
+  combinedState: CutState,
+  stockInput: StockItem[],
+  settings: AppSettings,
+  fullCtx: CutContext,
+  strategy: CuttingStrategy
+): BatchFillControlOutcome {
+  if (combinedState.cards.length === 0) {
+    return { state: combinedState, untouchedBatchCards: [], hasSinglePoolWork: false };
+  }
+
+  const threshold = settings.fillControlThreshold ?? 50;
+  const underfilledPieces: number[] = [];
+  const underfilledCards: CutCard[] = [];
+  const preservedBatchCards: CutCard[] = [];
+  const preservedTailCards: CutCard[] = [];
+
+  for (let i = 0; i < combinedState.cards.length; i++) {
+    const c = combinedState.cards[i];
+    const purePartsKIM = c.barSize > 0 ? (c.partsLengthMm / c.barSize) * 100 : 0;
+    if (!c.isTailSingle && c.pieceLengths.length > 0 && purePartsKIM < threshold) {
+      underfilledCards.push(c);
+      for (let cnt = 0; cnt < c.count; cnt++) {
+        for (let p = 0; p < c.pieceLengths.length; p++) {
+          underfilledPieces.push(c.pieceLengths[p]);
+        }
+      }
+    } else if (c.isTailSingle) {
+      preservedTailCards.push(c);
+    } else {
+      preservedBatchCards.push(c);
+    }
+  }
+
+  if (underfilledPieces.length === 0) {
+    return {
+      state: combinedState,
+      untouchedBatchCards: preservedBatchCards,
+      hasSinglePoolWork: false,
+    };
+  }
+
+  const preservedCards: CutCard[] = [...preservedBatchCards, ...preservedTailCards];
+  const { remainingStock: remainingStockInput } = buildRemainingStockAfterCards(
+    stockInput,
+    preservedCards
+  );
+
+  const pieceQtyByLen = new Map<number, number>();
+  for (let i = 0; i < underfilledPieces.length; i++) {
+    const len = underfilledPieces[i];
+    pieceQtyByLen.set(len, (pieceQtyByLen.get(len) || 0) + 1);
+  }
+
+  const underfilledDemand: DemandItem[] = [];
+  let dIdx = 1;
+  for (const [len, qty] of pieceQtyByLen.entries()) {
+    underfilledDemand.push({
+      id: `fc_d_${len}_${dIdx}`,
+      orderIndex: dIdx++,
+      length: len,
+      quantity: qty,
+    });
+  }
+
+  const nonPairSettings: AppSettings = {
+    ...settings,
+    dualProfileCut: false,
+    fillControlEnabled: false,
+  };
+
+  const repackCtx = buildCutContext(remainingStockInput, underfilledDemand, nonPairSettings, {
+    shouldAbort: fullCtx.shouldAbort,
+  });
+
+  if (repackCtx.scaledDemand.length === 0 || repackCtx.scaledStockAll.length === 0) {
+    return {
+      state: combinedState,
+      untouchedBatchCards: [...preservedBatchCards, ...underfilledCards],
+      hasSinglePoolWork: false,
+    };
+  }
+
+  const repackInitial: CutState = {
+    cards: [],
+    metrics: calculateMetrics([], repackCtx, repackCtx.scaledDemand),
+    unplacedScaled: repackCtx.scaledDemand,
+    score: -Infinity,
+    context: repackCtx,
+    telemetryCounters: combinedState.telemetryCounters,
+  };
+
+  const repackedState = runCuttingPipeline(repackInitial, strategy);
+  if (repackedState.cards.length === 0 || repackedState.metrics.unplacedCount > 0) {
+    return {
+      state: combinedState,
+      untouchedBatchCards: [...preservedBatchCards, ...underfilledCards],
+      hasSinglePoolWork: false,
+    };
+  }
+
+  // Note: unplacedScaled in combinedState is already in fullCtx.nod units!
+  const origGroupedCards = groupIdenticalCards(combinedState.cards, fullCtx);
+  const origMetrics = calculateMetrics(origGroupedCards, fullCtx, combinedState.unplacedScaled);
+  const origScore = strategy.score(origGroupedCards, origMetrics, fullCtx);
+
+  const mergedCards = groupIdenticalCards([...preservedCards, ...repackedState.cards], fullCtx);
+  const candMetrics = calculateMetrics(mergedCards, fullCtx, combinedState.unplacedScaled);
+  const candScore = strategy.score(mergedCards, candMetrics, fullCtx);
+
+  if (
+    candMetrics.unplacedCount <= origMetrics.unplacedCount &&
+    candMetrics.totalBarsUsed <= origMetrics.totalBarsUsed &&
+    candScore >= origScore
+  ) {
+    let cardsChanged = mergedCards.length !== origGroupedCards.length;
+    if (!cardsChanged) {
+      for (let i = 0; i < mergedCards.length; i++) {
+        if (
+          mergedCards[i].signature !== origGroupedCards[i].signature ||
+          mergedCards[i].count !== origGroupedCards[i].count
+        ) {
+          cardsChanged = true;
+          break;
+        }
+      }
+    }
+    if (!cardsChanged) {
+      return {
+        state: combinedState,
+        untouchedBatchCards: [...preservedBatchCards, ...underfilledCards],
+        hasSinglePoolWork: false,
+      };
+    }
+    return {
+      state: {
+        ...combinedState,
+        cards: mergedCards,
+        metrics: candMetrics,
+        score: candScore,
+        telemetryCounters: {
+          ...combinedState.telemetryCounters,
+          passesEvaluated:
+            combinedState.telemetryCounters.passesEvaluated +
+            repackedState.telemetryCounters.passesEvaluated,
+          prunedPasses:
+            (combinedState.telemetryCounters.prunedPasses ?? 0) +
+            (repackedState.telemetryCounters.prunedPasses ?? 0),
+          totalCombinationsChecked:
+            combinedState.telemetryCounters.totalCombinationsChecked +
+            repackedState.telemetryCounters.totalCombinationsChecked,
+        },
+      },
+      untouchedBatchCards: preservedBatchCards,
+      hasSinglePoolWork: true,
+    };
+  }
+
+  return {
+    state: combinedState,
+    untouchedBatchCards: [...preservedBatchCards, ...underfilledCards],
+    hasSinglePoolWork: false,
   };
 }
 
 /**
+ * Post-step after batch cutting + tail + fillControl:
+ * collects pieces from ALL single-bar allocations (isTailSingle cards, fill-control repacked
+ * non-batch cards, and single bars inside mixed batch+single cards) into a single pool,
+ * repacks them once in ordinary non-batch mode with the same strategy and searchSpeed,
+ * and accepts ONLY if unplacedCount and totalBarsUsed do not increase and strategy.score() does not worsen.
+ * Untouched batch cards remain strictly untouched.
+ */
+function consolidateUnifiedSinglePool(
+  currentState: CutState,
+  batchSize: number,
+  untouchedBatchCardsHint: readonly CutCard[] | null,
+  hasFillControlWork: boolean,
+  stockInput: StockItem[],
+  settings: AppSettings,
+  fullCtx: CutContext,
+  strategy: CuttingStrategy
+): CutState {
+  if (currentState.cards.length === 0) return currentState;
+
+  let hasNonBatchMod = false;
+  for (let i = 0; i < currentState.cards.length; i++) {
+    const c = currentState.cards[i];
+    if (!c.isTailSingle && c.count % batchSize !== 0) {
+      hasNonBatchMod = true;
+      break;
+    }
+  }
+  if (!hasFillControlWork && !hasNonBatchMod) {
+    return currentState;
+  }
+
+  const untouchedCountBySig = new Map<string, number>();
+  if (untouchedBatchCardsHint) {
+    for (let i = 0; i < untouchedBatchCardsHint.length; i++) {
+      const c = untouchedBatchCardsHint[i];
+      if (!c.isTailSingle && c.count > 0) {
+        untouchedCountBySig.set(c.signature, (untouchedCountBySig.get(c.signature) || 0) + c.count);
+      }
+    }
+  }
+
+  const untouchedBatchCards: CutCard[] = [];
+  const singlePoolPieces: number[] = [];
+
+  for (let i = 0; i < currentState.cards.length; i++) {
+    const c = currentState.cards[i];
+    if (c.count <= 0) continue;
+
+    if (c.isTailSingle) {
+      for (let cnt = 0; cnt < c.count; cnt++) {
+        for (let p = 0; p < c.pieceLengths.length; p++) {
+          singlePoolPieces.push(c.pieceLengths[p]);
+        }
+      }
+      continue;
+    }
+
+    if (untouchedBatchCardsHint) {
+      const keepBatch = Math.min(c.count, untouchedCountBySig.get(c.signature) || 0);
+      if (keepBatch > 0) {
+        untouchedCountBySig.set(
+          c.signature,
+          (untouchedCountBySig.get(c.signature) || 0) - keepBatch
+        );
+        untouchedBatchCards.push(
+          keepBatch === c.count
+            ? c
+            : createCardWithTailFlag({ ...c, count: keepBatch }, fullCtx, false)
+        );
+      }
+      const singleBars = c.count - keepBatch;
+      for (let cnt = 0; cnt < singleBars; cnt++) {
+        for (let p = 0; p < c.pieceLengths.length; p++) {
+          singlePoolPieces.push(c.pieceLengths[p]);
+        }
+      }
+    } else {
+      const batchBars = Math.floor(c.count / batchSize) * batchSize;
+      const singleBars = c.count - batchBars;
+      if (batchBars > 0) {
+        untouchedBatchCards.push(
+          batchBars === c.count
+            ? c
+            : createCardWithTailFlag({ ...c, count: batchBars }, fullCtx, false)
+        );
+      }
+      for (let cnt = 0; cnt < singleBars; cnt++) {
+        for (let p = 0; p < c.pieceLengths.length; p++) {
+          singlePoolPieces.push(c.pieceLengths[p]);
+        }
+      }
+    }
+  }
+
+  if (singlePoolPieces.length === 0) return currentState;
+
+  const { remainingStock } = buildRemainingStockAfterCards(stockInput, untouchedBatchCards);
+  const qtyByLen = new Map<number, number>();
+  for (let i = 0; i < singlePoolPieces.length; i++) {
+    const len = singlePoolPieces[i];
+    qtyByLen.set(len, (qtyByLen.get(len) || 0) + 1);
+  }
+
+  const poolDemand: DemandItem[] = [];
+  let dIdx = 1;
+  for (const [len, qty] of qtyByLen.entries()) {
+    poolDemand.push({
+      id: `sp_d_${len}_${dIdx}`,
+      orderIndex: dIdx++,
+      length: len,
+      quantity: qty,
+    });
+  }
+
+  const nonPairSettings: AppSettings = {
+    ...settings,
+    dualProfileCut: false,
+    fillControlEnabled: false,
+  };
+
+  const poolCtx = buildCutContext(remainingStock, poolDemand, nonPairSettings, {
+    shouldAbort: fullCtx.shouldAbort,
+  });
+
+  if (poolCtx.scaledDemand.length === 0 || poolCtx.scaledStockAll.length === 0) {
+    return currentState;
+  }
+
+  const poolInitial: CutState = {
+    cards: [],
+    metrics: calculateMetrics([], poolCtx, poolCtx.scaledDemand),
+    unplacedScaled: poolCtx.scaledDemand,
+    score: -Infinity,
+    context: poolCtx,
+    telemetryCounters: currentState.telemetryCounters,
+  };
+
+  const poolSolved = runCuttingPipeline(poolInitial, strategy);
+  if (poolSolved.cards.length === 0 || poolSolved.metrics.unplacedCount > 0) {
+    return currentState;
+  }
+
+  const origGroupedCards = groupIdenticalCards(currentState.cards, fullCtx);
+  const origMetrics = calculateMetrics(origGroupedCards, fullCtx, currentState.unplacedScaled);
+  const origScore = strategy.score(origGroupedCards, origMetrics, fullCtx);
+
+  const poolCards = poolSolved.cards.map((c) => createCardWithTailFlag(c, fullCtx, true));
+  const mergedCards = groupIdenticalCards([...untouchedBatchCards, ...poolCards], fullCtx);
+  const candMetrics = calculateMetrics(mergedCards, fullCtx, currentState.unplacedScaled);
+  const candScore = strategy.score(mergedCards, candMetrics, fullCtx);
+
+  if (
+    candMetrics.unplacedCount <= origMetrics.unplacedCount &&
+    candMetrics.totalBarsUsed <= origMetrics.totalBarsUsed &&
+    candScore >= origScore
+  ) {
+    return {
+      ...currentState,
+      cards: mergedCards,
+      metrics: candMetrics,
+      score: candScore,
+      telemetryCounters: {
+        ...currentState.telemetryCounters,
+        passesEvaluated:
+          currentState.telemetryCounters.passesEvaluated +
+          poolSolved.telemetryCounters.passesEvaluated,
+        prunedPasses:
+          (currentState.telemetryCounters.prunedPasses ?? 0) +
+          (poolSolved.telemetryCounters.prunedPasses ?? 0),
+        totalCombinationsChecked:
+          currentState.telemetryCounters.totalCombinationsChecked +
+          poolSolved.telemetryCounters.totalCombinationsChecked,
+      },
+    };
+  }
+
+  return currentState;
+}
+
+interface ForcedRemnantShapingPrepared {
+  cutoffMm: number;
+  preservedCards: CutCard[];
+  remainingStock: StockItem[];
+  poolDemand: DemandItem[];
+  poolCtx: CutContext;
+  poolInitial: CutState;
+  shapingStrategy: ForcedRemnantShapingStrategy;
+  shapingProfiles: PassSearchProfile[];
+  shapingTotalPasses: number;
+}
+
+function resolveStandardPassProfiles(
+  searchSpeed: AppSettings['searchSpeed']
+): PassSearchProfile[] {
+  const profiles: PassSearchProfile[] = ['best'];
+  if (searchSpeed === 'standard' || searchSpeed === 'exact' || searchSpeed === 'deep') {
+    profiles.push('fastPrefix');
+  }
+  if (searchSpeed === 'deep') {
+    profiles.push('stdPrefix');
+  }
+  return profiles;
+}
+
+function prepareForcedRemnantShaping(
+  currentState: CutState,
+  stockInput: StockItem[],
+  settings: AppSettings,
+  fullCtx: CutContext
+): ForcedRemnantShapingPrepared | null {
+  if (
+    settings.shapeRemnantsInSearch !== true ||
+    fullCtx.reusableRemnantMin <= 0 ||
+    currentState.cards.length === 0 ||
+    fullCtx.shouldAbort?.() ||
+    currentState.telemetryCounters.abortedDuringSearch
+  ) {
+    return null;
+  }
+
+  const delOst = fullCtx.reusableRemnantMin;
+  const pct = Math.min(100, Math.max(0, settings.shapeRemnantsThresholdPct ?? 50));
+  const cutoffMm = Math.floor((delOst * pct) / 100);
+
+  const preservedCards: CutCard[] = [];
+  const poolPieces: number[] = [];
+
+  for (let i = 0; i < currentState.cards.length; i++) {
+    const c = currentState.cards[i];
+    if (c.count <= 0 || c.pieceLengths.length === 0) continue;
+    if (!c.isLockedRemnant && !c.isReusable && c.scrapRemnantMm > cutoffMm) {
+      for (let k = 0; k < c.count; k++) {
+        for (let p = 0; p < c.pieceLengths.length; p++) {
+          poolPieces.push(c.pieceLengths[p]);
+        }
+      }
+    } else {
+      preservedCards.push(c);
+    }
+  }
+
+  if (poolPieces.length === 0) {
+    return null;
+  }
+
+  const { remainingStock } = buildRemainingStockAfterCards(stockInput, preservedCards);
+  const qtyByLen = new Map<number, number>();
+  for (let i = 0; i < poolPieces.length; i++) {
+    const len = poolPieces[i];
+    qtyByLen.set(len, (qtyByLen.get(len) || 0) + 1);
+  }
+
+  const poolDemand: DemandItem[] = [];
+  let dIdx = 1;
+  for (const [len, qty] of qtyByLen.entries()) {
+    poolDemand.push({
+      id: `rs_d_${len}_${dIdx}`,
+      orderIndex: dIdx++,
+      length: len,
+      quantity: qty,
+    });
+  }
+
+  const poolSettings: AppSettings = {
+    ...settings,
+    dualProfileCut: false,
+    fillControlEnabled: false,
+    shapeRemnantsInSearch: false,
+  };
+
+  const poolCtxRaw = buildCutContext(remainingStock, poolDemand, poolSettings, {
+    shouldAbort: fullCtx.shouldAbort,
+    onProgress: fullCtx.onProgress,
+  });
+
+  if (poolCtxRaw.scaledDemand.length === 0 || poolCtxRaw.scaledStockAll.length === 0) {
+    return null;
+  }
+
+  const poolCtx: CutContext = {
+    ...poolCtxRaw,
+    searchRemnantMin: delOst,
+  };
+
+  const poolInitial: CutState = {
+    cards: [],
+    metrics: calculateMetrics([], poolCtx, poolCtx.scaledDemand),
+    unplacedScaled: poolCtx.scaledDemand,
+    score: -Infinity,
+    context: poolCtx,
+    telemetryCounters: {
+      passesEvaluated: 0,
+      prunedPasses: 0,
+      totalCombinationsChecked: 0,
+      twoOptSwapIterations: 0,
+      tailConsolidationCardsMerged: 0,
+      initialCardsCount: 0,
+      stage1Ms: 0,
+      stage2Ms: 0,
+      stage3Ms: 0,
+      threadsUsed: 1,
+      chunksProcessed: 0,
+    },
+  };
+
+  const shapingTotalPasses =
+    (poolCtx.maxSortZ + 1) * (poolCtx.maxSort + 1) * (poolCtx.maxVar + 1);
+
+  return {
+    cutoffMm,
+    preservedCards,
+    remainingStock,
+    poolDemand,
+    poolCtx,
+    poolInitial,
+    shapingStrategy: new ForcedRemnantShapingStrategy(cutoffMm),
+    shapingProfiles: resolveStandardPassProfiles(poolSettings.searchSpeed),
+    shapingTotalPasses,
+  };
+}
+
+function finalizeForcedRemnantShaping(
+  currentState: CutState,
+  poolSolved: CutState,
+  prep: ForcedRemnantShapingPrepared,
+  demandInput: DemandItem[],
+  settings: AppSettings,
+  fullCtx: CutContext,
+  origStrategy: CuttingStrategy
+): CutState {
+  const { cutoffMm, preservedCards, shapingTotalPasses } = prep;
+  const shapingAborted = Boolean(
+    poolSolved.telemetryCounters.abortedDuringSearch || fullCtx.shouldAbort?.()
+  );
+
+  const mergedTelemetry = {
+    ...currentState.telemetryCounters,
+    passesEvaluated:
+      currentState.telemetryCounters.passesEvaluated +
+      poolSolved.telemetryCounters.passesEvaluated,
+    prunedPasses:
+      (currentState.telemetryCounters.prunedPasses ?? 0) +
+      (poolSolved.telemetryCounters.prunedPasses ?? 0),
+    totalCombinationsChecked:
+      currentState.telemetryCounters.totalCombinationsChecked +
+      poolSolved.telemetryCounters.totalCombinationsChecked,
+    threadsUsed: Math.max(
+      currentState.telemetryCounters.threadsUsed ?? 1,
+      poolSolved.telemetryCounters.threadsUsed ?? 1
+    ),
+    chunksProcessed:
+      (currentState.telemetryCounters.chunksProcessed ?? 0) +
+      (poolSolved.telemetryCounters.chunksProcessed ?? 0),
+    ...(shapingAborted
+      ? {
+          abortedDuringSearch: true,
+          abortedStageViewedPasses: poolSolved.telemetryCounters.passesEvaluated,
+          abortedStageTotalPasses:
+            poolSolved.telemetryCounters.totalPassesPlanned ?? shapingTotalPasses,
+        }
+      : {}),
+  };
+
+  if (poolSolved.cards.length === 0 || poolSolved.metrics.unplacedCount > 0) {
+    return shapingAborted
+      ? { ...currentState, telemetryCounters: mergedTelemetry }
+      : currentState;
+  }
+
+  const isBatchMode = settings.dualProfileCut === true;
+  const batchSize = isBatchMode ? resolveBatchSize(demandInput, settings) : 1;
+  const convertedPoolCards: CutCard[] = [];
+
+  for (let i = 0; i < poolSolved.cards.length; i++) {
+    const c = poolSolved.cards[i];
+    if (c.count <= 0) continue;
+    if (isBatchMode && batchSize >= 2) {
+      const { batchCount, singleCount } = getBatchRowSplit(c.count, batchSize);
+      if (batchCount > 0) {
+        convertedPoolCards.push(
+          createCardWithTailFlag({ ...c, count: batchCount }, fullCtx, false)
+        );
+      }
+      if (singleCount > 0) {
+        convertedPoolCards.push(
+          createCardWithTailFlag({ ...c, count: singleCount }, fullCtx, true)
+        );
+      }
+    } else {
+      convertedPoolCards.push(createCardWithTailFlag(c, fullCtx, false));
+    }
+  }
+
+  const origGroupedCards = groupIdenticalCards(currentState.cards, fullCtx);
+  const origMetrics = calculateMetrics(origGroupedCards, fullCtx, currentState.unplacedScaled);
+  const mergedCards = groupIdenticalCards(
+    [...preservedCards, ...convertedPoolCards],
+    fullCtx
+  );
+  const candMetrics = calculateMetrics(mergedCards, fullCtx, currentState.unplacedScaled);
+
+  const countBadScrap = (cards: readonly CutCard[]): number => {
+    let sum = 0;
+    for (let i = 0; i < cards.length; i++) {
+      const c = cards[i];
+      if (!c.isReusable && c.scrapRemnantMm > cutoffMm) {
+        sum += c.scrapRemnantMm * c.count;
+      }
+    }
+    return sum;
+  };
+
+  const origBadScrapMm = countBadScrap(origGroupedCards);
+  const candBadScrapMm = countBadScrap(mergedCards);
+
+  const improved =
+    candMetrics.unplacedCount <= origMetrics.unplacedCount &&
+    candMetrics.totalStockLengthMm <= origMetrics.totalStockLengthMm &&
+    (candMetrics.totalStockLengthMm < origMetrics.totalStockLengthMm ||
+      candBadScrapMm < origBadScrapMm ||
+      candMetrics.totalReusableMm > origMetrics.totalReusableMm ||
+      candMetrics.totalScrapMm < origMetrics.totalScrapMm);
+
+  if (!improved) {
+    return shapingAborted
+      ? { ...currentState, telemetryCounters: mergedTelemetry }
+      : currentState;
+  }
+
+  return {
+    ...currentState,
+    cards: mergedCards,
+    metrics: candMetrics,
+    score: origStrategy.score(mergedCards, candMetrics, fullCtx),
+    telemetryCounters: mergedTelemetry,
+  };
+}
+
+/**
+ * Final post-processing stage when `shapeRemnantsInSearch` is enabled:
+ * Finds all cards with non-reusable scrap exceeding `shapeRemnantsThresholdPct`% of `reusableRemnantMin`,
+ * breaks all their pieces into a unified demand pool on remaining stock, and repacks them using
+ * ForcedRemnantShapingStrategy (based on MinimizeMaterialStrategy) to elevate scrap into reusable remnants.
+ */
+function applyForcedRemnantShaping(
+  currentState: CutState,
+  stockInput: StockItem[],
+  demandInput: DemandItem[],
+  settings: AppSettings,
+  fullCtx: CutContext,
+  origStrategy: CuttingStrategy
+): CutState {
+  const prep = prepareForcedRemnantShaping(currentState, stockInput, settings, fullCtx);
+  if (!prep) return currentState;
+
+  const poolSolved = runCuttingPipeline(prep.poolInitial, prep.shapingStrategy);
+  return finalizeForcedRemnantShaping(
+    currentState,
+    poolSolved,
+    prep,
+    demandInput,
+    settings,
+    fullCtx,
+    origStrategy
+  );
+}
+
+async function applyForcedRemnantShapingAsync(
+  currentState: CutState,
+  stockInput: StockItem[],
+  demandInput: DemandItem[],
+  settings: AppSettings,
+  fullCtx: CutContext,
+  origStrategy: CuttingStrategy,
+  parallelExecutor?: ParallelPassExecutor
+): Promise<CutState> {
+  const prep = prepareForcedRemnantShaping(currentState, stockInput, settings, fullCtx);
+  if (!prep) return currentState;
+
+  const { finalState: poolSolved } = await runStage2AndRefineMaybeParallel(
+    prep.poolInitial,
+    prep.shapingStrategy,
+    prep.remainingStock,
+    prep.poolDemand,
+    prep.shapingProfiles,
+    parallelExecutor
+  );
+
+  return finalizeForcedRemnantShaping(
+    currentState,
+    poolSolved,
+    prep,
+    demandInput,
+    settings,
+    fullCtx,
+    origStrategy
+  );
+}
+
+function isExactSolverActive(settings: AppSettings): boolean {
+  return settings.exactSolverEnabled === true || settings.searchSpeed === 'exact';
+}
+
+interface RemnantStageAResult {
+  lockedCards: CutCard[];
+  lockedRemnantMm: number;
+  remainingDemand: DemandItem[];
+  standardStock: StockItem[];
+  stageBSettings: AppSettings;
+  passesEvaluated: number;
+  prunedPasses: number;
+  totalCombinationsChecked: number;
+  stage1Ms: number;
+  stage2Ms: number;
+}
+
+function runPrioritizeRemnantsStageA(
+  stockInput: StockItem[],
+  demandInput: DemandItem[],
+  settings: AppSettings,
+  fullCtx: CutContext,
+  options?: SolveLinearCuttingOptions
+): RemnantStageAResult | null {
+  if (settings.prioritizeRemnants !== true) return null;
+
+  const remnantStock: StockItem[] = [];
+  const standardStock: StockItem[] = [];
+  for (let i = 0; i < stockInput.length; i++) {
+    const st = stockInput[i];
+    if (st.isActive === false) continue;
+    if (isRemnantStock(st) && st.length > 0 && st.quantity > 0) {
+      remnantStock.push(st);
+    } else if (!isRemnantStock(st)) {
+      standardStock.push(st);
+    }
+  }
+
+  if (remnantStock.length === 0) return null;
+
+  const stageBSettings: AppSettings = {
+    ...settings,
+    prioritizeRemnants: false,
+  };
+
+  const activeDemand = demandInput.filter((d) => d.length > 0 && d.quantity > 0);
+  if (activeDemand.length === 0) {
+    return {
+      lockedCards: [],
+      lockedRemnantMm: 0,
+      remainingDemand: [],
+      standardStock,
+      stageBSettings,
+      passesEvaluated: 0,
+      prunedPasses: 0,
+      totalCombinationsChecked: 0,
+      stage1Ms: 0,
+      stage2Ms: 0,
+    };
+  }
+
+  const stageASettings: AppSettings = {
+    ...settings,
+    optimizationGoal: 'min_bars',
+    dualProfileCut: false,
+    fillControlEnabled: false,
+    shapeRemnantsInSearch: false,
+    exactSolverEnabled: false,
+    searchSpeed: settings.searchSpeed === 'exact' ? 'standard' : settings.searchSpeed,
+    prioritizeRemnants: true,
+  };
+
+  const stageACtx = buildCutContext(remnantStock, activeDemand, stageASettings, {
+    shouldAbort: options?.shouldAbort,
+    onProgress: (p) => {
+      options?.onProgress?.({
+        ...p,
+        stage: 1,
+        totalStages: 3,
+        stageName: 'Этап 1: раскрой деловых остатков со склада',
+        percent: Math.min(20, Math.max(2, Math.round(p.percent * 0.2))),
+      });
+    },
+  });
+
+  if (stageACtx.scaledDemand.length === 0 || stageACtx.scaledStockAll.length === 0) {
+    return {
+      lockedCards: [],
+      lockedRemnantMm: 0,
+      remainingDemand: activeDemand,
+      standardStock,
+      stageBSettings,
+      passesEvaluated: 0,
+      prunedPasses: 0,
+      totalCombinationsChecked: 0,
+      stage1Ms: 0,
+      stage2Ms: 0,
+    };
+  }
+
+  const remnantStrategy = new RemnantFillStrategy();
+  const stageAInit: CutState = {
+    cards: [],
+    metrics: calculateMetrics([], stageACtx, stageACtx.scaledDemand),
+    unplacedScaled: stageACtx.scaledDemand,
+    score: -Infinity,
+    context: stageACtx,
+    telemetryCounters: {
+      passesEvaluated: 0,
+      prunedPasses: 0,
+      totalCombinationsChecked: 0,
+      twoOptSwapIterations: 0,
+      tailConsolidationCardsMerged: 0,
+      initialCardsCount: 0,
+      stage1Ms: 0,
+      stage2Ms: 0,
+      stage3Ms: 0,
+    },
+  };
+
+  const stageASolved = runCuttingPipeline(stageAInit, remnantStrategy);
+  const minFillPct = Math.min(
+    100,
+    Math.max(0, settings.remnantMinFillPct ?? settings.targetRemnantKIM ?? 75)
+  );
+
+  const rawLockedCards: CutCard[] = [];
+  for (let i = 0; i < stageASolved.cards.length; i++) {
+    const c = stageASolved.cards[i];
+    if (c.count <= 0 || c.barSize <= 0 || c.pieceLengths.length === 0) continue;
+    const pureFillPct = (c.partsLengthMm / c.barSize) * 100;
+    if (minFillPct > 0 && pureFillPct < minFillPct - 1e-6) continue;
+    rawLockedCards.push(
+      createCutCard(c.barSize, c.pieceLengths, c.count, fullCtx, false, true)
+    );
+  }
+  const lockedCards = groupIdenticalCards(rawLockedCards, fullCtx);
+
+  let lockedRemnantMm = 0;
+  const placedByLen = new Map<number, number>();
+  for (let i = 0; i < lockedCards.length; i++) {
+    const card = lockedCards[i];
+    lockedRemnantMm += card.barSize * card.count;
+    for (let p = 0; p < card.pieceLengths.length; p++) {
+      const len = card.pieceLengths[p];
+      placedByLen.set(len, (placedByLen.get(len) || 0) + card.count);
+    }
+  }
+
+  const remainingDemand: DemandItem[] = [];
+  for (let i = 0; i < activeDemand.length; i++) {
+    const d = activeDemand[i];
+    const availPlaced = placedByLen.get(d.length) || 0;
+    const take = Math.min(d.quantity, availPlaced);
+    if (take > 0) placedByLen.set(d.length, availPlaced - take);
+    const remQty = d.quantity - take;
+    if (remQty > 0) {
+      remainingDemand.push({ ...d, quantity: remQty });
+    }
+  }
+
+  return {
+    lockedCards,
+    lockedRemnantMm,
+    remainingDemand,
+    standardStock,
+    stageBSettings,
+    passesEvaluated: stageASolved.telemetryCounters.passesEvaluated,
+    prunedPasses: stageASolved.telemetryCounters.prunedPasses ?? 0,
+    totalCombinationsChecked: stageASolved.telemetryCounters.totalCombinationsChecked,
+    stage1Ms: stageASolved.telemetryCounters.stage1Ms,
+    stage2Ms: stageASolved.telemetryCounters.stage2Ms,
+  };
+}
+
+function mergeLockedRemnantsWithStageB(
+  stageA: RemnantStageAResult,
+  stageBState: CutState,
+  stageBCtx: CutContext,
+  fullCtx: CutContext,
+  strategy: CuttingStrategy
+): CutState {
+  const convertedStageBCards = stageBState.cards.map((c) =>
+    createCardWithTailFlag(c, fullCtx, Boolean(c.isTailSingle))
+  );
+  const mergedCards = groupIdenticalCards(
+    [...stageA.lockedCards, ...convertedStageBCards],
+    fullCtx
+  );
+  const unplacedFull = stageBState.unplacedScaled.map((u) => {
+    const pieceMm = u * stageBCtx.nod - stageBCtx.bladeWidth;
+    return Math.floor((pieceMm + fullCtx.bladeWidth) / fullCtx.nod);
+  });
+  const metrics = calculateMetrics(mergedCards, fullCtx, unplacedFull);
+  return {
+    ...stageBState,
+    cards: mergedCards,
+    unplacedScaled: unplacedFull,
+    metrics,
+    score: strategy.score(mergedCards, metrics, fullCtx),
+    context: fullCtx,
+    telemetryCounters: {
+      ...stageBState.telemetryCounters,
+      passesEvaluated: stageA.passesEvaluated + stageBState.telemetryCounters.passesEvaluated,
+      prunedPasses: stageA.prunedPasses + (stageBState.telemetryCounters.prunedPasses ?? 0),
+      totalCombinationsChecked:
+        stageA.totalCombinationsChecked + stageBState.telemetryCounters.totalCombinationsChecked,
+      stage1Ms: stageA.stage1Ms + stageBState.telemetryCounters.stage1Ms,
+      stage2Ms: stageA.stage2Ms + stageBState.telemetryCounters.stage2Ms,
+    },
+  };
+}
+
+function resolvePrimaryStandardBarLength(
+  baseSol: FullOptimizationSolution,
+  context: CutContext,
+  stockInput: StockItem[]
+): number {
+  const stdSet = new Set(context.activeStandardLengths);
+  const stdUsage = new Map<number, number>();
+  for (const r of baseSol.rows) {
+    if (stdSet.has(r.barSize) || r.barSize === 6000 || r.barSize === 12000 || r.barSize === 11700) {
+      stdUsage.set(r.barSize, (stdUsage.get(r.barSize) || 0) + r.barsCount);
+    }
+  }
+  if (stdUsage.size > 0) {
+    let bestLen = 0;
+    let bestCount = -1;
+    for (const [len, cnt] of stdUsage.entries()) {
+      if (cnt > bestCount || (cnt === bestCount && len > bestLen)) {
+        bestCount = cnt;
+        bestLen = len;
+      }
+    }
+    if (bestLen > 0) return bestLen;
+  }
+  if (context.activeStandardLengths.length > 0) {
+    return Math.max(...context.activeStandardLengths);
+  }
+  let maxActive = 0;
+  for (const s of stockInput) {
+    if (s.isActive !== false && s.length > maxActive) {
+      maxActive = s.length;
+    }
+  }
+  return maxActive > 0 ? maxActive : 6000;
+}
+
+function formatTolerancePct(pct: number): string {
+  const rounded = Number(pct.toFixed(2));
+  return rounded.toString().replace('.', ',');
+}
+
+function buildParetoFrontier(
+  candidates: readonly { solution: FullOptimizationSolution; isBaseline: boolean }[]
+): Array<{ solution: FullOptimizationSolution; isBaseline: boolean }> {
+  const sorted = candidates.slice().sort((a, b) => {
+    if (a.solution.totalStockLength !== b.solution.totalStockLength) {
+      return a.solution.totalStockLength - b.solution.totalStockLength;
+    }
+    if (a.solution.rows.length !== b.solution.rows.length) {
+      return a.solution.rows.length - b.solution.rows.length;
+    }
+    return a.solution.totalWasteLength - b.solution.totalWasteLength;
+  });
+
+  const nonDominated: Array<{ solution: FullOptimizationSolution; isBaseline: boolean }> = [];
+  for (const cand of sorted) {
+    if (nonDominated.length === 0) {
+      nonDominated.push(cand);
+      continue;
+    }
+    const prev = nonDominated[nonDominated.length - 1];
+    if (cand.solution.rows.length < prev.solution.rows.length) {
+      if (cand.solution.totalStockLength === prev.solution.totalStockLength) {
+        nonDominated[nonDominated.length - 1] = cand;
+      } else {
+        nonDominated.push(cand);
+      }
+    }
+  }
+  return nonDominated;
+}
+
+/**
+ * Runs «Баланс: материал <-> наладки» strategy suite:
+ * 1) Single baseline run with MinimizeMaterialStrategy (min_material) -> (M*, C0)
+ * 2) Single extreme setups run with MinimizeSetupsStrategy -> (M_s, C_s)
+ * 3) If C_s < C0: fixed tolerances p in {0.1%, 0.5%, 1%, 2%} strictly < M_s,
+ *    followed by up to 4 adaptive bisection midpoints on largest card-drop intervals (>= 2 cards),
+ *    capped at <= 9 total runs.
+ * 4) Strict non-dominated Pareto filtering along (totalStockLength, uniqueCardsCount).
+ */
+export function runBalanceSuite(
+  stockInput: StockItem[],
+  demandInput: DemandItem[],
+  baseSettings: AppSettings,
+  options?: SolveLinearCuttingOptions
+): BalanceResult {
+  const suiteStart = performance.now();
+  const startMemoryMb = getMemoryUsageMb();
+  const effSettings: AppSettings = {
+    ...baseSettings,
+    optimizationGoal: 'min_bars',
+    dualProfileCut: false,
+  };
+
+  const fullCtx = buildCutContext(stockInput, demandInput, effSettings, {
+    shouldAbort: options?.shouldAbort,
+  });
+
+  if (fullCtx.scaledDemand.length === 0 || fullCtx.scaledStockAll.length === 0) {
+    const emptySol: FullOptimizationSolution = {
+      totalStockLength: 0,
+      totalSpentLength: 0,
+      totalBarsUsed: 0,
+      totalWasteLength: 0,
+      totalReusableLength: 0,
+      maxReusableRemnantLength: 0,
+      cuttingIndex: 0,
+      cuttingIndexMaterial: 0,
+      cuttingIndexSetup: 0,
+      overallKIM: 0,
+      netKIM: 0,
+      rows: [],
+      remainingWarehouseStock: [],
+      unplacedDemand: [],
+      calculationTimeMs: 0,
+    };
+    return { suite: [], bestSolution: emptySol, timings: [], totalDurationMs: 0 };
+  }
+
+  const stageA = runPrioritizeRemnantsStageA(
+    stockInput,
+    demandInput,
+    effSettings,
+    fullCtx,
+    options
+  );
+  const stageBStock = stageA ? stageA.standardStock : stockInput;
+  const stageBDemand = stageA ? stageA.remainingDemand : demandInput;
+  const stageBSettings = stageA ? stageA.stageBSettings : effSettings;
+  const stageBUserSettings = stageA ? { ...baseSettings, prioritizeRemnants: false } : baseSettings;
+  const matStrategy = new MinimizeMaterialStrategy();
+  const setupsStrategy = new MinimizeSetupsStrategy();
+
+  if (stageA && stageBDemand.length === 0) {
+    const lockedMetrics = calculateMetrics(stageA.lockedCards, fullCtx, []);
+    const lockedState: CutState = {
+      cards: stageA.lockedCards,
+      metrics: lockedMetrics,
+      unplacedScaled: [],
+      score: matStrategy.score(stageA.lockedCards, lockedMetrics, fullCtx),
+      context: fullCtx,
+      telemetryCounters: {
+        passesEvaluated: stageA.passesEvaluated,
+        prunedPasses: stageA.prunedPasses,
+        totalCombinationsChecked: stageA.totalCombinationsChecked,
+        twoOptSwapIterations: 0,
+        tailConsolidationCardsMerged: 0,
+        initialCardsCount: lockedMetrics.uniqueCardsCount,
+        stage1Ms: stageA.stage1Ms,
+        stage2Ms: stageA.stage2Ms,
+        stage3Ms: 0,
+      },
+    };
+    const lockedSol = buildSolutionFromFinalState(
+      lockedState,
+      fullCtx,
+      stockInput,
+      demandInput,
+      baseSettings,
+      startMemoryMb,
+      suiteStart
+    );
+    const totalDurationMs = Number((performance.now() - suiteStart).toFixed(1));
+    return {
+      suite: [
+        {
+          goal: 'balance',
+          title: 'Баланс',
+          badge: '⚖️ Баланс',
+          description: 'Оптимальный вариант по расходу материала и числу карт раскроя',
+          solution: lockedSol,
+        },
+      ],
+      bestSolution: lockedSol,
+      timings: [
+        {
+          label: 'Минимум материала',
+          capMm: lockedSol.totalStockLength,
+          durationMs: totalDurationMs,
+          stockMm: lockedSol.totalStockLength,
+          bars: lockedSol.totalBarsUsed,
+          cards: lockedSol.rows.length,
+        },
+      ],
+      totalDurationMs,
+    };
+  }
+
+  const stageBFullCtx = stageA
+    ? buildCutContext(stageBStock, stageBDemand, stageBSettings, {
+        shouldAbort: options?.shouldAbort,
+      })
+    : fullCtx;
+
+  const isBatchMode = baseSettings.dualProfileCut === true;
+  const batchSplit = isBatchMode
+    ? splitBatchAndTailInputs(
+        stageBStock,
+        stageBDemand,
+        resolveBatchSize(stageBDemand, stageBUserSettings)
+      )
+    : null;
+
+  // Edge case: batch mode enabled, but every demand quantity < batchSize -> everything goes to single tail
+  if (batchSplit && batchSplit.batchDemand.length === 0) {
+    const tailRes = solveTailSingleCards(
+      stageBStock,
+      [],
+      batchSplit.tailDemand,
+      stageBUserSettings,
+      matStrategy,
+      stageBFullCtx,
+      options?.shouldAbort
+    );
+    const tailCards = groupIdenticalCards(tailRes.cards, stageBFullCtx);
+    const tailMetrics = calculateMetrics(tailCards, stageBFullCtx, tailRes.unplacedScaledFull);
+    const tailStateRaw: CutState = {
+      cards: tailCards,
+      unplacedScaled: tailRes.unplacedScaledFull,
+      metrics: tailMetrics,
+      score: matStrategy.score(tailCards, tailMetrics, stageBFullCtx),
+      context: stageBFullCtx,
+      telemetryCounters: {
+        passesEvaluated: tailRes.passesEvaluated,
+        prunedPasses: tailRes.prunedPasses,
+        totalCombinationsChecked: tailRes.totalCombinationsChecked,
+        twoOptSwapIterations: 0,
+        tailConsolidationCardsMerged: 0,
+        initialCardsCount: tailMetrics.uniqueCardsCount,
+        stage1Ms: 0,
+        stage2Ms: 0,
+        stage3Ms: 0,
+      },
+    };
+    const shapedTail = applyForcedRemnantShaping(
+      tailStateRaw,
+      stageBStock,
+      stageBDemand,
+      stageBUserSettings,
+      stageBFullCtx,
+      matStrategy
+    );
+    const tailState = stageA
+      ? mergeLockedRemnantsWithStageB(stageA, shapedTail, stageBFullCtx, fullCtx, matStrategy)
+      : shapedTail;
+    const tailSol = buildSolutionFromFinalState(
+      tailState,
+      fullCtx,
+      stockInput,
+      demandInput,
+      baseSettings,
+      startMemoryMb,
+      suiteStart
+    );
+    const totalDurationMs = Number((performance.now() - suiteStart).toFixed(1));
+    return {
+      suite: [
+        {
+          goal: 'balance',
+          title: 'Баланс',
+          badge: '⚖️ Баланс',
+          description: 'Оптимальный вариант по расходу материала и числу карт раскроя',
+          solution: tailSol,
+        },
+      ],
+      bestSolution: tailSol,
+      timings: [
+        {
+          label: 'Минимум материала',
+          capMm: tailSol.totalStockLength,
+          durationMs: totalDurationMs,
+          stockMm: tailSol.totalStockLength,
+          bars: tailSol.totalBarsUsed,
+          cards: tailSol.rows.length,
+        },
+      ],
+      totalDurationMs,
+    };
+  }
+
+  const baseCtx = buildCutContext(
+    batchSplit ? batchSplit.batchStock : stageBStock,
+    batchSplit ? batchSplit.batchDemand : stageBDemand,
+    stageBSettings,
+    {
+      shouldAbort: options?.shouldAbort,
+      onProgress: (p) => {
+        options?.onProgress?.({
+          ...p,
+          stage: 1,
+          totalStages: 6,
+          stageName: 'Баланс: минимум материала',
+          percent: Math.min(25, Math.max(2, Math.round(p.percent * 0.25))),
+        });
+      },
+    }
+  );
+
+  const emptyMetrics = calculateMetrics([], baseCtx, baseCtx.scaledDemand);
+  const initialState: CutState = {
+    cards: [],
+    metrics: emptyMetrics,
+    unplacedScaled: baseCtx.scaledDemand,
+    score: -Infinity,
+    context: baseCtx,
+    telemetryCounters: {
+      passesEvaluated: 0,
+      prunedPasses: 0,
+      totalCombinationsChecked: 0,
+      twoOptSwapIterations: 0,
+      tailConsolidationCardsMerged: 0,
+      initialCardsCount: 0,
+      stage1Ms: 0,
+      stage2Ms: 0,
+      stage3Ms: 0,
+    },
+  };
+
+  const tailCache = new Map<
+    string,
+    {
+      cards: CutCard[];
+      unplacedScaledFull: number[];
+      passesEvaluated: number;
+      prunedPasses: number;
+      totalCombinationsChecked: number;
+    }
+  >();
+
+  const finalizeVariantState = (
+    rawBatchState: CutState,
+    variantCtx: CutContext,
+    strategy: CuttingStrategy
+  ): { state: CutState; evalCtx: CutContext } => {
+    let stageBFinal: CutState;
+    let stageBEvalCtx: CutContext;
+    if (!batchSplit) {
+      stageBFinal = applyForcedRemnantShaping(
+        rawBatchState,
+        stageBStock,
+        stageBDemand,
+        stageBUserSettings,
+        variantCtx,
+        strategy
+      );
+      stageBEvalCtx = variantCtx;
+    } else {
+      let combined = combineBatchAndTailState(
+        rawBatchState,
+        batchSplit.batchSize,
+        variantCtx,
+        stageBFullCtx,
+        stageBStock,
+        batchSplit.tailDemand,
+        stageBUserSettings,
+        strategy,
+        tailCache
+      );
+      let untouchedBatchHint: readonly CutCard[] | null = null;
+      let hasFillControlWork = false;
+      if (stageBUserSettings.fillControlEnabled) {
+        const fcOutcome = applyBatchFillControl(
+          combined,
+          stageBStock,
+          stageBUserSettings,
+          stageBFullCtx,
+          strategy
+        );
+        combined = fcOutcome.state;
+        untouchedBatchHint = fcOutcome.untouchedBatchCards;
+        hasFillControlWork = fcOutcome.hasSinglePoolWork;
+      }
+      combined = consolidateUnifiedSinglePool(
+        combined,
+        batchSplit.batchSize,
+        untouchedBatchHint,
+        hasFillControlWork,
+        stageBStock,
+        stageBUserSettings,
+        stageBFullCtx,
+        strategy
+      );
+      combined = applyForcedRemnantShaping(
+        combined,
+        stageBStock,
+        stageBDemand,
+        stageBUserSettings,
+        stageBFullCtx,
+        strategy
+      );
+      stageBFinal = combined;
+      stageBEvalCtx = stageBFullCtx;
+    }
+    if (stageA) {
+      return {
+        state: mergeLockedRemnantsWithStageB(stageA, stageBFinal, stageBEvalCtx, fullCtx, strategy),
+        evalCtx: fullCtx,
+      };
+    }
+    return { state: stageBFinal, evalCtx: stageBEvalCtx };
+  };
+
+  // 1. Baseline run: MinimizeMaterialStrategy (runs ONCE)
+  const baseRunStart = performance.now();
+  const baseFinalBatch = runCuttingPipeline(initialState, matStrategy);
+  const baseRunDurationMs = Number((performance.now() - baseRunStart).toFixed(1));
+  const { state: baseFinalFull, evalCtx: baseEvalCtx } = finalizeVariantState(
+    baseFinalBatch,
+    baseCtx,
+    matStrategy
+  );
+  const baseSol = buildSolutionFromFinalState(
+    baseFinalFull,
+    baseEvalCtx,
+    stockInput,
+    demandInput,
+    baseSettings,
+    startMemoryMb,
+    baseRunStart
+  );
+
+  const mStar = baseSol.totalStockLength;
+  const c0 = baseSol.rows.length;
+  const primaryStdLen = resolvePrimaryStandardBarLength(baseSol, fullCtx, stockInput);
+  const lockedRemnantMmBaseline = stageA ? stageA.lockedRemnantMm : 0;
+  const tailStockMmBaseline = batchSplit
+    ? baseFinalFull.cards.reduce((s, c) => (c.isTailSingle ? s + c.barSize * c.count : s), 0)
+    : 0;
+  const toBatchCapMm = (totalCapMm: number): number => {
+    const remCap = Math.max(0, totalCapMm - lockedRemnantMmBaseline - tailStockMmBaseline);
+    return batchSplit ? Math.floor(remCap / batchSplit.batchSize) : remCap;
+  };
+
+  const timings: BalanceRunTiming[] = [
+    {
+      label: 'Минимум материала',
+      capMm: mStar,
+      durationMs: baseRunDurationMs,
+      stockMm: baseSol.totalStockLength,
+      bars: baseSol.totalBarsUsed,
+      cards: c0,
+    },
+  ];
+
+  const candidates: Array<{ solution: FullOptimizationSolution; isBaseline: boolean }> = [
+    { solution: baseSol, isBaseline: true },
+  ];
+  const probedCaps = new Set<number>([mStar]);
+  const probeHistory: Array<{ capMm: number; cards: number }> = [{ capMm: mStar, cards: c0 }];
+  let totalRunsExecuted = 1;
+
+  // 2. Extreme setups run: MinimizeSetupsStrategy (runs ONCE)
+  let mSetups = mStar;
+  let cSetups = c0;
+  if (!options?.shouldAbort?.()) {
+    const setupsStart = performance.now();
+    const setupsCtx: CutContext = {
+      ...baseCtx,
+      startTime: setupsStart,
+      onProgress: (p) => {
+        options?.onProgress?.({
+          ...p,
+          stage: 2,
+          totalStages: 6,
+          stageName: 'Баланс: минимум наладок',
+          percent: Math.min(45, 25 + Math.round(p.percent * 0.2)),
+        });
+      },
+    };
+    const setupsBatch = runCuttingPipeline(
+      { ...initialState, context: setupsCtx },
+      setupsStrategy
+    );
+    const setupsDurationMs = Number((performance.now() - setupsStart).toFixed(1));
+    const { state: setupsFull, evalCtx: setupsEvalCtx } = finalizeVariantState(
+      setupsBatch,
+      setupsCtx,
+      setupsStrategy
+    );
+    const setupsSol = buildSolutionFromFinalState(
+      setupsFull,
+      setupsEvalCtx,
+      stockInput,
+      demandInput,
+      baseSettings,
+      startMemoryMb,
+      setupsStart
+    );
+    totalRunsExecuted++;
+    mSetups = setupsSol.totalStockLength;
+    cSetups = setupsSol.rows.length;
+    probedCaps.add(mSetups);
+    probeHistory.push({ capMm: mSetups, cards: cSetups });
+    candidates.push({ solution: setupsSol, isBaseline: false });
+    timings.push({
+      label: 'Минимум наладок',
+      capMm: mSetups,
+      durationMs: setupsDurationMs,
+      stockMm: mSetups,
+      bars: setupsSol.totalBarsUsed,
+      cards: cSetups,
+    });
+  }
+
+  // 3. If C_s < C0, run fixed tolerances < M_s, then adaptive bisection midpoints (<= 9 runs total)
+  const balanceCtx: CutContext = {
+    ...baseCtx,
+    startTime: performance.now(),
+    onProgress: (p) => {
+      options?.onProgress?.({
+        ...p,
+        stage: 3,
+        totalStages: 6,
+        stageName: 'Баланс: подбор промежуточных точек',
+        percent: Math.min(72, 45 + Math.round(p.percent * 0.27)),
+      });
+    },
+  };
+  const balanceInitial: CutState = {
+    ...initialState,
+    context: balanceCtx,
+  };
+
+  if (cSetups < c0 && !options?.shouldAbort?.()) {
+    const fixedTolerances: Array<{ p: number; label: string }> = [
+      { p: 0.001, label: '+0,1%' },
+      { p: 0.005, label: '+0,5%' },
+      { p: 0.01, label: '+1%' },
+      { p: 0.02, label: '+2%' },
+    ];
+
+    const capMap = new Map<number, { capMm: number; label: string }>();
+    for (const def of fixedTolerances) {
+      const delta = Math.max(Math.round(mStar * def.p), primaryStdLen);
+      const capMm = mStar + delta;
+      if (capMm < mSetups && !probedCaps.has(capMm) && !capMap.has(capMm)) {
+        capMap.set(capMm, { capMm, label: def.label });
+      }
+    }
+
+    const maxFixedAllowed = Math.max(0, 9 - totalRunsExecuted);
+    const fixedEntries = Array.from(capMap.values())
+      .sort((a, b) => a.capMm - b.capMm)
+      .slice(0, maxFixedAllowed);
+
+    if (fixedEntries.length > 0 && !options?.shouldAbort?.()) {
+      for (const e of fixedEntries) probedCaps.add(e.capMm);
+      const capsForPipeline = fixedEntries.map((e) => toBatchCapMm(e.capMm));
+
+      let capStageStart = performance.now();
+      runMultiCapBalancePipelines(
+        balanceInitial,
+        baseFinalBatch,
+        capsForPipeline,
+        (idx) => {
+          capStageStart = performance.now();
+          const pct = Math.min(82, 72 + Math.round(((idx + 0.5) / fixedEntries.length) * 10));
+          options?.onProgress?.({
+            stage: 4,
+            totalStages: 6,
+            stageName: `Баланс: допуск ${fixedEntries[idx].label}`,
+            stageStepName: `Оптимизация карт при допуске ${fixedEntries[idx].label}`,
+            percent: pct,
+            placedParts: fullCtx.totalPartsCount,
+            totalParts: fullCtx.totalPartsCount,
+            usedBars: baseSol.totalBarsUsed,
+            totalBarsEstimate: fullCtx.totalBarsEstimate,
+            bestKIM: baseSol.overallKIM,
+            uniqueCardsCount: c0,
+            elapsedMs: Math.round(performance.now() - suiteStart),
+          });
+        },
+        (idx, _total, resState, stage3DurationMs) => {
+          const { state: resFull, evalCtx: resEvalCtx } = finalizeVariantState(
+            resState,
+            balanceCtx,
+            setupsStrategy
+          );
+          const sol = buildSolutionFromFinalState(
+            resFull,
+            resEvalCtx,
+            stockInput,
+            demandInput,
+            baseSettings,
+            startMemoryMb,
+            capStageStart
+          );
+          const reportedDurationMs =
+            idx === 0
+              ? Number((resState.telemetryCounters.stage2Ms + stage3DurationMs).toFixed(1))
+              : stage3DurationMs;
+          const capMm = fixedEntries[idx].capMm;
+          probeHistory.push({ capMm, cards: sol.rows.length });
+          timings.push({
+            label: fixedEntries[idx].label,
+            capMm,
+            durationMs: reportedDurationMs,
+            stockMm: sol.totalStockLength,
+            bars: sol.totalBarsUsed,
+            cards: sol.rows.length,
+          });
+          candidates.push({ solution: sol, isBaseline: false });
+        }
+      );
+      totalRunsExecuted += fixedEntries.length;
+    }
+
+    // 4. Adaptive interval splitting (up to 4 additional midpoint points, total <= 9 runs)
+    let adaptiveDone = 0;
+    while (adaptiveDone < 4 && totalRunsExecuted < 9 && !options?.shouldAbort?.()) {
+      const frontier = buildParetoFrontier(candidates);
+      let bestCapMid: number | null = null;
+      let bestCardDrop = 1;
+      let bestSpan = 0;
+
+      for (let i = 0; i < frontier.length - 1; i++) {
+        const leftSol = frontier[i].solution;
+        const rightSol = frontier[i + 1].solution;
+        const cardDrop = leftSol.rows.length - rightSol.rows.length;
+        if (cardDrop < 2) continue;
+
+        let effectiveLeft = leftSol.totalStockLength;
+        for (const pr of probeHistory) {
+          if (
+            pr.capMm > effectiveLeft &&
+            pr.capMm < rightSol.totalStockLength &&
+            pr.cards >= leftSol.rows.length
+          ) {
+            effectiveLeft = pr.capMm;
+          }
+        }
+
+        const span = rightSol.totalStockLength - effectiveLeft;
+        if (span < primaryStdLen) continue;
+
+        let capMid =
+          Math.round((effectiveLeft + rightSol.totalStockLength) / 2 / primaryStdLen) *
+          primaryStdLen;
+        if (capMid <= effectiveLeft) capMid = effectiveLeft + primaryStdLen;
+        if (capMid >= rightSol.totalStockLength) capMid = rightSol.totalStockLength - primaryStdLen;
+        if (capMid <= effectiveLeft || capMid >= rightSol.totalStockLength) continue;
+        if (probedCaps.has(capMid)) continue;
+
+        if (cardDrop > bestCardDrop || (cardDrop === bestCardDrop && span > bestSpan)) {
+          bestCardDrop = cardDrop;
+          bestSpan = span;
+          bestCapMid = capMid;
+        }
+      }
+
+      if (bestCapMid === null) break;
+      probedCaps.add(bestCapMid);
+
+      const midCap = bestCapMid;
+      const midLabel = `Бисекция #${adaptiveDone + 1}`;
+      const capForPipe = toBatchCapMm(midCap);
+      let midStageStart = performance.now();
+      const midCtx: CutContext = {
+        ...balanceCtx,
+        startTime: midStageStart,
+        onProgress: undefined,
+      };
+
+      runMultiCapBalancePipelines(
+        { ...balanceInitial, context: midCtx },
+        baseFinalBatch,
+        [capForPipe],
+        () => {
+          midStageStart = performance.now();
+          const pct = Math.min(97, 83 + adaptiveDone * 3);
+          options?.onProgress?.({
+            stage: 5,
+            totalStages: 6,
+            stageName: `Баланс: адаптивный поиск (${adaptiveDone + 1}/4)`,
+            stageStepName: `Уточнение границы расхода (${Math.round(midCap / 1000)} м)`,
+            percent: pct,
+            placedParts: fullCtx.totalPartsCount,
+            totalParts: fullCtx.totalPartsCount,
+            usedBars: baseSol.totalBarsUsed,
+            totalBarsEstimate: fullCtx.totalBarsEstimate,
+            bestKIM: baseSol.overallKIM,
+            uniqueCardsCount: c0,
+            elapsedMs: Math.round(performance.now() - suiteStart),
+          });
+        },
+        (_idx, _total, resState, stage3DurationMs) => {
+          const { state: resFull, evalCtx: resEvalCtx } = finalizeVariantState(
+            resState,
+            midCtx,
+            setupsStrategy
+          );
+          const sol = buildSolutionFromFinalState(
+            resFull,
+            resEvalCtx,
+            stockInput,
+            demandInput,
+            baseSettings,
+            startMemoryMb,
+            midStageStart
+          );
+          const reportedDurationMs = Number(
+            (resState.telemetryCounters.stage2Ms + stage3DurationMs).toFixed(1)
+          );
+          probeHistory.push({ capMm: midCap, cards: sol.rows.length });
+          timings.push({
+            label: midLabel,
+            capMm: midCap,
+            durationMs: reportedDurationMs,
+            stockMm: sol.totalStockLength,
+            bars: sol.totalBarsUsed,
+            cards: sol.rows.length,
+          });
+          candidates.push({ solution: sol, isBaseline: false });
+        }
+      );
+
+      adaptiveDone++;
+      totalRunsExecuted++;
+    }
+  }
+
+  // 5. Final strict non-dominated Pareto filtering
+  const nonDominated = buildParetoFrontier(candidates);
+
+  // 6. Label variants cleanly
+  const suite: ComprehensiveSuiteItem[] = nonDominated.map((item, idx) => {
+    const cardsCount = item.solution.rows.length;
+    if (nonDominated.length === 1) {
+      return {
+        goal: 'balance',
+        title: 'Баланс',
+        badge: '⚖️ Баланс',
+        description: 'Оптимальный вариант по расходу материала и числу карт раскроя',
+        solution: item.solution,
+      };
+    }
+
+    if (idx === 0) {
+      return {
+        goal: 'balance',
+        title: 'Минимум материала',
+        badge: 'Мин. материал',
+        description: 'Базовый вариант с минимальным расходом материала',
+        solution: item.solution,
+      };
+    }
+
+    const baseVariant = nonDominated[0].solution;
+    const deltaStockMm = item.solution.totalStockLength - baseVariant.totalStockLength;
+    const rawDeltaBars = item.solution.totalBarsUsed - baseVariant.totalBarsUsed;
+    const deltaBars =
+      rawDeltaBars > 0
+        ? rawDeltaBars
+        : Math.max(1, Math.round(deltaStockMm / primaryStdLen));
+    const pct =
+      baseVariant.totalStockLength > 0
+        ? (deltaStockMm / baseVariant.totalStockLength) * 100
+        : 0;
+    const pctStr = formatTolerancePct(pct);
+
+    return {
+      goal: 'balance',
+      title: `+${deltaBars} заготовок (+${pctStr}%), ${cardsCount} карт`,
+      badge: `⚖️ +${deltaBars} загот. (+${pctStr}%)`,
+      description: `Допуск по материалу +${pctStr}% (+${(deltaStockMm / 1000).toFixed(2)} м): сокращение до ${cardsCount} карт раскроя`,
+      solution: item.solution,
+    };
+  });
+
+  const totalDurationMs = Number((performance.now() - suiteStart).toFixed(1));
+  const bestSolution = suite[0]?.solution || baseSol;
+  return { suite, bestSolution, timings, totalDurationMs };
+}
+
+export function solveLinearCutting(
+  stockInput: StockItem[],
+  demandInput: DemandItem[],
+  settings: AppSettings,
+  options?: SolveLinearCuttingOptions
+): FullOptimizationSolution {
+  if (settings.optimizationGoal === 'comprehensive') {
+    const res = runComprehensiveSuite(stockInput, demandInput, settings, options);
+    return res.bestSolution;
+  }
+  if (settings.optimizationGoal === 'balance') {
+    const res = runBalanceSuite(stockInput, demandInput, settings, options);
+    return res.bestSolution;
+  }
+
+  const startMemoryMb = getMemoryUsageMb();
+  const isBatchMode = settings.dualProfileCut === true;
+  // Пакетный режим моделируется делённой спецификацией, поэтому в расчёте контекст идёт без dualProfileCut
+  const effSettings: AppSettings = isBatchMode ? { ...settings, dualProfileCut: false } : settings;
+  const fullCtx = buildCutContext(stockInput, demandInput, effSettings, options);
+
+  if (fullCtx.scaledDemand.length === 0 || fullCtx.scaledStockAll.length === 0) {
+    return {
+      totalStockLength: 0,
+      totalSpentLength: 0,
+      totalBarsUsed: 0,
+      totalWasteLength: 0,
+      totalReusableLength: 0,
+      maxReusableRemnantLength: 0,
+      cuttingIndex: 0,
+      cuttingIndexMaterial: 0,
+      cuttingIndexSetup: 0,
+      overallKIM: 0,
+      netKIM: 0,
+      rows: [],
+      remainingWarehouseStock: [],
+      unplacedDemand: [],
+      calculationTimeMs: 0,
+    };
+  }
+
+  const strategy = getStrategy(settings.optimizationGoal, settings);
+  const stageA = runPrioritizeRemnantsStageA(
+    stockInput,
+    demandInput,
+    effSettings,
+    fullCtx,
+    options
+  );
+  const stageBStock = stageA ? stageA.standardStock : stockInput;
+  const stageBDemand = stageA ? stageA.remainingDemand : demandInput;
+  const stageBSettings = stageA ? stageA.stageBSettings : effSettings;
+  const stageBUserSettings = stageA ? { ...settings, prioritizeRemnants: false } : settings;
+
+  let finalState: CutState;
+  const buildCtx: CutContext = fullCtx;
+
+  if (stageA && stageBDemand.length === 0) {
+    const lockedMetrics = calculateMetrics(stageA.lockedCards, fullCtx, []);
+    finalState = {
+      cards: stageA.lockedCards,
+      metrics: lockedMetrics,
+      unplacedScaled: [],
+      score: strategy.score(stageA.lockedCards, lockedMetrics, fullCtx),
+      context: fullCtx,
+      telemetryCounters: {
+        passesEvaluated: stageA.passesEvaluated,
+        prunedPasses: stageA.prunedPasses,
+        totalCombinationsChecked: stageA.totalCombinationsChecked,
+        twoOptSwapIterations: 0,
+        tailConsolidationCardsMerged: 0,
+        initialCardsCount: lockedMetrics.uniqueCardsCount,
+        stage1Ms: stageA.stage1Ms,
+        stage2Ms: stageA.stage2Ms,
+        stage3Ms: 0,
+      },
+    };
+  } else {
+    const stageBFullCtx = stageA
+      ? buildCutContext(stageBStock, stageBDemand, stageBSettings, options)
+      : fullCtx;
+    const batchSplit = isBatchMode
+      ? splitBatchAndTailInputs(
+          stageBStock,
+          stageBDemand,
+          resolveBatchSize(stageBDemand, stageBUserSettings)
+        )
+      : null;
+
+    let stageBState: CutState;
+
+    if (batchSplit) {
+      if (batchSplit.batchDemand.length === 0) {
+        const tailRes = solveTailSingleCards(
+          stageBStock,
+          [],
+          batchSplit.tailDemand,
+          stageBUserSettings,
+          strategy,
+          stageBFullCtx,
+          options?.shouldAbort
+        );
+        const tailCards = groupIdenticalCards(tailRes.cards, stageBFullCtx);
+        const tailMetrics = calculateMetrics(
+          tailCards,
+          stageBFullCtx,
+          tailRes.unplacedScaledFull
+        );
+        stageBState = applyForcedRemnantShaping(
+          {
+            cards: tailCards,
+            metrics: tailMetrics,
+            unplacedScaled: tailRes.unplacedScaledFull,
+            score: strategy.score(tailCards, tailMetrics, stageBFullCtx),
+            context: stageBFullCtx,
+            telemetryCounters: {
+              passesEvaluated: tailRes.passesEvaluated,
+              prunedPasses: tailRes.prunedPasses,
+              totalCombinationsChecked: tailRes.totalCombinationsChecked,
+              twoOptSwapIterations: 0,
+              tailConsolidationCardsMerged: 0,
+              initialCardsCount: tailMetrics.uniqueCardsCount,
+              stage1Ms: 0,
+              stage2Ms: 0,
+              stage3Ms: 0,
+            },
+          },
+          stageBStock,
+          stageBDemand,
+          stageBUserSettings,
+          stageBFullCtx,
+          strategy
+        );
+      } else {
+        const batchCtx = buildCutContext(
+          batchSplit.batchStock,
+          batchSplit.batchDemand,
+          stageBSettings,
+          options
+        );
+        const emptyMetrics = calculateMetrics([], batchCtx, batchCtx.scaledDemand);
+        const batchInitial: CutState = {
+          cards: [],
+          metrics: emptyMetrics,
+          unplacedScaled: batchCtx.scaledDemand,
+          score: -Infinity,
+          context: batchCtx,
+          telemetryCounters: {
+            passesEvaluated: 0,
+            prunedPasses: 0,
+            totalCombinationsChecked: 0,
+            twoOptSwapIterations: 0,
+            tailConsolidationCardsMerged: 0,
+            initialCardsCount: 0,
+            stage1Ms: 0,
+            stage2Ms: 0,
+            stage3Ms: 0,
+          },
+        };
+        const batchSolved = runCuttingPipeline(batchInitial, strategy);
+        stageBState = combineBatchAndTailState(
+          batchSolved,
+          batchSplit.batchSize,
+          batchCtx,
+          stageBFullCtx,
+          stageBStock,
+          batchSplit.tailDemand,
+          stageBUserSettings,
+          strategy
+        );
+        let untouchedBatchHint: readonly CutCard[] | null = null;
+        let hasFillControlWork = false;
+        if (stageBUserSettings.fillControlEnabled) {
+          const fcOutcome = applyBatchFillControl(
+            stageBState,
+            stageBStock,
+            stageBUserSettings,
+            stageBFullCtx,
+            strategy
+          );
+          stageBState = fcOutcome.state;
+          untouchedBatchHint = fcOutcome.untouchedBatchCards;
+          hasFillControlWork = fcOutcome.hasSinglePoolWork;
+        }
+        stageBState = consolidateUnifiedSinglePool(
+          stageBState,
+          batchSplit.batchSize,
+          untouchedBatchHint,
+          hasFillControlWork,
+          stageBStock,
+          stageBUserSettings,
+          stageBFullCtx,
+          strategy
+        );
+        stageBState = applyForcedRemnantShaping(
+          stageBState,
+          stageBStock,
+          stageBDemand,
+          stageBUserSettings,
+          stageBFullCtx,
+          strategy
+        );
+      }
+    } else {
+      const emptyMetrics = calculateMetrics([], stageBFullCtx, stageBFullCtx.scaledDemand);
+      const initialState: CutState = {
+        cards: [],
+        metrics: emptyMetrics,
+        unplacedScaled: stageBFullCtx.scaledDemand,
+        score: -Infinity,
+        context: stageBFullCtx,
+        telemetryCounters: {
+          passesEvaluated: 0,
+          prunedPasses: 0,
+          totalCombinationsChecked: 0,
+          twoOptSwapIterations: 0,
+          tailConsolidationCardsMerged: 0,
+          initialCardsCount: 0,
+          stage1Ms: 0,
+          stage2Ms: 0,
+          stage3Ms: 0,
+        },
+      };
+      stageBState = runCuttingPipeline(initialState, strategy);
+      stageBState = applyForcedRemnantShaping(
+        stageBState,
+        stageBStock,
+        stageBDemand,
+        stageBUserSettings,
+        stageBFullCtx,
+        strategy
+      );
+    }
+
+    finalState = stageA
+      ? mergeLockedRemnantsWithStageB(stageA, stageBState, stageBFullCtx, fullCtx, strategy)
+      : stageBState;
+  }
+
+  // Final Stage 3 completion progress report using the exact Single Source of Truth metrics
+  buildCtx.onProgress?.({
+    stage: 3,
+    totalStages: 3,
+    stageName: 'Формирование финальной раскладки',
+    stageStepName: 'Группировка карт и расчет итогового баланса',
+    percent: 99,
+    placedParts: buildCtx.totalPartsCount - finalState.metrics.unplacedCount,
+    totalParts: buildCtx.totalPartsCount,
+    usedBars: finalState.metrics.totalBarsUsed,
+    totalBarsEstimate: buildCtx.totalBarsEstimate,
+    bestKIM: finalState.metrics.overallKIM,
+    uniqueCardsCount: finalState.metrics.uniqueCardsCount,
+    elapsedMs: Math.round(performance.now() - buildCtx.startTime),
+    hasMeasurableProgress: false,
+  });
+
+  return buildSolutionFromFinalState(
+    finalState,
+    buildCtx,
+    stockInput,
+    demandInput,
+    settings,
+    startMemoryMb,
+    buildCtx.startTime
+  );
+}
+
+export const PARALLEL_MIN_PASSES_THRESHOLD = PASS_CHUNK_SIZE * 2;
+export const PARALLEL_MIN_ESTIMATED_SECONDS = 3;
+
+/**
+ * Computes auto helper worker count N = min(navigator.hardwareConcurrency - 1, 6).
+ */
+export function getAvailableHelperThreadLimit(): number {
+  if (typeof navigator === 'undefined') return 0;
+  const cores =
+    typeof navigator.hardwareConcurrency === 'number' ? navigator.hardwareConcurrency : 1;
+  return Math.max(0, Math.min(cores - 1, 6));
+}
+
+export function getMaxHelperThreads(): number {
+  if (typeof Worker === 'undefined') return 0;
+  return getAvailableHelperThreadLimit();
+}
+
+/**
+ * Determines whether Stage-2 pass search should run via worker pool:
+ * - Only when settings.multiThreadEnabled === true and searchSpeed === 'deep'
+ * - Only for MinimizeMaterialStrategy (or Balance baseline front)
+ * - Requires N >= 2 hardware threads and workload above ~3s small-order threshold
+ */
+export function shouldUseParallelPassSearch(
+  ctx: CutContext,
+  strategy: CuttingStrategy,
+  stockInput: StockItem[],
+  demandInput: DemandItem[]
+): boolean {
+  if (ctx.settings.multiThreadEnabled !== true) return false;
+  if (ctx.settings.searchSpeed !== 'deep') return false;
+  if (strategy.type !== 'min_material' && strategy.type !== 'forced_remnant_shaping') {
+    return false;
+  }
+  if (getAvailableHelperThreadLimit() < 2) return false;
+
+  const totalPasses = (ctx.maxSortZ + 1) * (ctx.maxSort + 1) * (ctx.maxVar + 1);
+  if (totalPasses < PARALLEL_MIN_PASSES_THRESHOLD) return false;
+
+  const complexity = estimateCalculationComplexity(stockInput, demandInput, ctx.settings);
+  const estSeconds =
+    complexity.isHeavy && ctx.totalPartsCount >= 100
+      ? complexity.estimatedSeconds.deep
+      : totalPasses * ctx.totalPartsCount * (1 + complexity.uniqueParts * 0.03) * 0.00002;
+
+  return estSeconds >= PARALLEL_MIN_ESTIMATED_SECONDS;
+}
+
+export function toSerializableCutContext(ctx: CutContext): SerializableCutContext {
+  const copy: CutContext = { ...ctx };
+  delete (copy as { onProgress?: unknown }).onProgress;
+  delete (copy as { shouldAbort?: unknown }).shouldAbort;
+  return copy;
+}
+
+export interface ParallelPassSearchRequest {
+  context: SerializableCutContext;
+  strategyType: StrategyType;
+  materialCapMm?: number;
+  cutoffMm?: number;
+  totalPasses: number;
+  profiles: readonly PassSearchProfile[];
+}
+
+export interface WorkerPoolProgressInfo {
+  completedPasses: number;
+  totalPasses: number;
+  chunksCompleted: number;
+  totalChunks: number;
+  threadsUsed: number;
+}
+
+export interface ParallelPassSearchResult {
+  merged: MergedPassResults;
+  threadsUsed: number;
+  chunksProcessed: number;
+  nestedUnsupported?: boolean;
+}
+
+export type ParallelPassExecutor = (
+  request: ParallelPassSearchRequest,
+  onProgress?: (progress: WorkerPoolProgressInfo) => void
+) => Promise<ParallelPassSearchResult | null>;
+
+let globalParallelJobSeq = 0;
+
+interface WorkerChunkTask {
+  chunkId: number;
+  fromPass: number;
+  toPass: number;
+}
+
+/**
+ * Executes Stage-2 pass chunks across a pool of reusable helper Web Workers.
+ * - Spawns helpers sequentially up to maxHelpers while immediately dispatching chunks to ready helpers.
+ * - Soft-stops cleanly on shouldAbort (waits for in-flight chunks, merges finished results).
+ * - Recovers from helper crashes by re-queuing chunks and falling back to sequential if 0 helpers survive.
+ * - Never terminates living helpers mid-run (helpers remain reusable in poolCache until page unload).
+ */
+export async function executeWorkerPool(options: {
+  poolCache: Worker[];
+  createWorker: () => Worker;
+  request: ParallelPassSearchRequest;
+  maxHelpers: number;
+  shouldAbort?: () => boolean;
+  onProgress?: (progress: WorkerPoolProgressInfo) => void;
+}): Promise<ParallelPassSearchResult> {
+  const { poolCache, createWorker, request, maxHelpers, shouldAbort, onProgress } = options;
+  const { totalPasses, profiles, context, strategyType, materialCapMm, cutoffMm } = request;
+
+  const chunks: WorkerChunkTask[] = [];
+  for (let f = 0, id = 0; f < totalPasses; f += PASS_CHUNK_SIZE, id++) {
+    chunks.push({
+      chunkId: id,
+      fromPass: f,
+      toPass: Math.min(totalPasses, f + PASS_CHUNK_SIZE),
+    });
+  }
+
+  if (chunks.length === 0) {
+    return {
+      merged: mergePassResults([]),
+      threadsUsed: 1,
+      chunksProcessed: 0,
+      nestedUnsupported: false,
+    };
+  }
+
+  const targetHelpers = Math.min(Math.max(1, maxHelpers), chunks.length);
+  const jobId = ++globalParallelJobSeq;
+
+  let nextChunkIdx = 0;
+  const retryQueue: WorkerChunkTask[] = [];
+  const results: PassRangeExecutionResult[] = [];
+  let completedPasses = 0;
+  let inFlightCount = 0;
+  let earliestEarlyExit: number | null = null;
+  let maxThreadsUsed = 0;
+  let anyChunkCompleted = false;
+  let spawningActive = true;
+  let resolved = false;
+
+  const aliveWorkers = new Set<Worker>();
+  const workerInFlight = new Map<Worker, WorkerChunkTask | null>();
+
+  const takeNextChunk = (): WorkerChunkTask | null => {
+    if (shouldAbort?.()) return null;
+    while (retryQueue.length > 0) {
+      const c = retryQueue.shift();
+      if (c && (earliestEarlyExit === null || c.fromPass <= earliestEarlyExit)) {
+        return c;
+      }
+    }
+    while (nextChunkIdx < chunks.length) {
+      const c = chunks[nextChunkIdx++];
+      if (earliestEarlyExit !== null && c.fromPass > earliestEarlyExit) {
+        nextChunkIdx = chunks.length;
+        return null;
+      }
+      return c;
+    }
+    return null;
+  };
+
+  const hasPendingWork = (): boolean => {
+    if (shouldAbort?.()) return false;
+    for (let i = 0; i < retryQueue.length; i++) {
+      if (earliestEarlyExit === null || retryQueue[i].fromPass <= earliestEarlyExit) {
+        return true;
+      }
+    }
+    if (nextChunkIdx < chunks.length) {
+      const c = chunks[nextChunkIdx];
+      if (earliestEarlyExit === null || c.fromPass <= earliestEarlyExit) {
+        return true;
+      }
+    }
+    return false;
+  };
+
+  const runRemainingSequentially = () => {
+    const localCtx: CutContext = {
+      ...context,
+      shouldAbort,
+    };
+    const localStrategy: CuttingStrategy =
+      strategyType === 'balance' && materialCapMm !== undefined
+        ? new MinimizeBalanceStrategy(materialCapMm)
+        : strategyType === 'forced_remnant_shaping'
+          ? new ForcedRemnantShapingStrategy(cutoffMm ?? 0)
+          : getStrategy(strategyType, context.settings);
+
+    while (true) {
+      const c = takeNextChunk();
+      if (!c) break;
+      const res = executePassRange(localCtx, localStrategy, c.fromPass, c.toPass, profiles);
+      results.push(res);
+      completedPasses += res.passesEvaluated;
+      if (
+        res.earlyExitPassIndex !== null &&
+        (earliestEarlyExit === null || res.earlyExitPassIndex < earliestEarlyExit)
+      ) {
+        earliestEarlyExit = res.earlyExitPassIndex;
+      }
+      onProgress?.({
+        completedPasses,
+        totalPasses,
+        chunksCompleted: results.length,
+        totalChunks: chunks.length,
+        threadsUsed: Math.max(1, maxThreadsUsed),
+      });
+    }
+  };
+
+  return new Promise<ParallelPassSearchResult>((resolve) => {
+    const finalize = (nestedUnsupported: boolean) => {
+      if (resolved) return;
+      resolved = true;
+      for (const w of aliveWorkers) {
+        w.onmessage = null;
+        w.onerror = null;
+      }
+      const merged = mergePassResults(results);
+      resolve({
+        merged,
+        threadsUsed: nestedUnsupported ? 1 : Math.max(1, maxThreadsUsed),
+        chunksProcessed: results.length,
+        nestedUnsupported,
+      });
+    };
+
+    const checkDone = () => {
+      if (resolved) return;
+      if (inFlightCount > 0) return;
+
+      if (hasPendingWork()) {
+        if (!spawningActive && aliveWorkers.size === 0) {
+          runRemainingSequentially();
+          finalize(false);
+        }
+        return;
+      }
+
+      if (!spawningActive || shouldAbort?.() || earliestEarlyExit !== null || !hasPendingWork()) {
+        finalize(false);
+      }
+    };
+
+    const dispatchToWorker = (w: Worker) => {
+      if (resolved || !aliveWorkers.has(w)) return;
+      if (workerInFlight.get(w)) return;
+      const chunk = takeNextChunk();
+      if (!chunk) {
+        checkDone();
+        return;
+      }
+      workerInFlight.set(w, chunk);
+      inFlightCount++;
+      const msg: PassWorkerInMessage = {
+        type: 'RUN_CHUNK',
+        payload: {
+          jobId,
+          chunkId: chunk.chunkId,
+          fromPass: chunk.fromPass,
+          toPass: chunk.toPass,
+          profiles,
+        },
+      };
+      w.postMessage(msg);
+    };
+
+    const dispatchToIdleWorkers = () => {
+      for (const w of aliveWorkers) {
+        if (!workerInFlight.get(w)) {
+          dispatchToWorker(w);
+        }
+      }
+    };
+
+    const handleWorkerFailure = (w: Worker, isStartupZero: boolean) => {
+      aliveWorkers.delete(w);
+      const poolIdx = poolCache.indexOf(w);
+      if (poolIdx !== -1) {
+        poolCache.splice(poolIdx, 1);
+      }
+      w.onmessage = null;
+      w.onerror = null;
+
+      const assigned = workerInFlight.get(w);
+      workerInFlight.set(w, null);
+      if (assigned) {
+        inFlightCount = Math.max(0, inFlightCount - 1);
+        retryQueue.push(assigned);
+      }
+
+      if (isStartupZero && !anyChunkCompleted && aliveWorkers.size === 0) {
+        spawningActive = false;
+        finalize(true);
+        return;
+      }
+
+      if (aliveWorkers.size > 0) {
+        dispatchToIdleWorkers();
+      } else if (!spawningActive && inFlightCount === 0) {
+        runRemainingSequentially();
+        finalize(false);
+      }
+    };
+
+    const initHelperSequentially = (index: number): Promise<boolean> => {
+      return new Promise<boolean>((resolveInit) => {
+        if (resolved || shouldAbort?.() || !hasPendingWork()) {
+          resolveInit(false);
+          return;
+        }
+
+        let w: Worker;
+        let createdNew = false;
+        if (index < poolCache.length) {
+          w = poolCache[index];
+        } else {
+          try {
+            w = createWorker();
+            createdNew = true;
+          } catch {
+            if (index === 0 && !anyChunkCompleted && poolCache.length === 0) {
+              finalize(true);
+            }
+            resolveInit(false);
+            return;
+          }
+        }
+
+        let initSettled = false;
+
+        w.onerror = () => {
+          if (!initSettled) {
+            initSettled = true;
+            handleWorkerFailure(w, index === 0);
+            resolveInit(false);
+            return;
+          }
+          handleWorkerFailure(w, false);
+        };
+
+        w.onmessage = (ev: MessageEvent<PassWorkerOutMessage>) => {
+          const msg = ev.data;
+          if (!msg) return;
+
+          if (msg.type === 'INIT_OK') {
+            if (msg.payload.jobId !== jobId) return;
+            if (!initSettled) {
+              initSettled = true;
+              if (createdNew) {
+                poolCache.push(w);
+              }
+              aliveWorkers.add(w);
+              maxThreadsUsed = Math.max(maxThreadsUsed, aliveWorkers.size);
+              workerInFlight.set(w, null);
+              dispatchToWorker(w);
+              resolveInit(true);
+            }
+            return;
+          }
+
+          if (msg.type === 'CHUNK_DONE') {
+            if (msg.payload.jobId !== jobId) return;
+            anyChunkCompleted = true;
+            const assigned = workerInFlight.get(w);
+            workerInFlight.set(w, null);
+            if (assigned) {
+              inFlightCount = Math.max(0, inFlightCount - 1);
+            }
+
+            const chunkRes = msg.payload.result;
+            results.push(chunkRes);
+            completedPasses += chunkRes.passesEvaluated;
+            if (
+              chunkRes.earlyExitPassIndex !== null &&
+              (earliestEarlyExit === null || chunkRes.earlyExitPassIndex < earliestEarlyExit)
+            ) {
+              earliestEarlyExit = chunkRes.earlyExitPassIndex;
+            }
+            onProgress?.({
+              completedPasses,
+              totalPasses,
+              chunksCompleted: results.length,
+              totalChunks: chunks.length,
+              threadsUsed: Math.max(1, maxThreadsUsed, aliveWorkers.size),
+            });
+            dispatchToWorker(w);
+            return;
+          }
+
+          if (msg.type === 'ERROR') {
+            if (msg.payload.jobId !== jobId) return;
+            if (!initSettled) {
+              initSettled = true;
+              handleWorkerFailure(w, index === 0);
+              resolveInit(false);
+              return;
+            }
+            handleWorkerFailure(w, false);
+          }
+        };
+
+        const initMsg: PassWorkerInMessage = {
+          type: 'INIT',
+          payload: {
+            jobId,
+            context,
+            strategyType,
+            materialCapMm,
+            cutoffMm,
+          },
+        };
+        w.postMessage(initMsg);
+      });
+    };
+
+    void (async () => {
+      for (let i = 0; i < targetHelpers; i++) {
+        if (resolved || shouldAbort?.() || !hasPendingWork()) break;
+        const ok = await initHelperSequentially(i);
+        if (!ok && i === 0 && resolved) return;
+        if (!ok && aliveWorkers.size === 0) break;
+      }
+      spawningActive = false;
+      if (!resolved) {
+        dispatchToIdleWorkers();
+        checkDone();
+      }
+    })();
+  });
+}
+
+async function runStage2AndRefineMaybeParallel(
+  initialState: CutState,
+  strategy: CuttingStrategy,
+  stockInput: StockItem[],
+  demandInput: DemandItem[],
+  profiles: readonly PassSearchProfile[],
+  parallelExecutor?: ParallelPassExecutor,
+  allowExactSolver = false
+): Promise<{ finalState: CutState; merged: MergedPassResults | null }> {
+  const ctx = initialState.context;
+  const totalPasses = (ctx.maxSortZ + 1) * (ctx.maxSort + 1) * (ctx.maxVar + 1);
+  const isShaping = strategy instanceof ForcedRemnantShapingStrategy;
+  const isShapingPlanned =
+    !isShaping && ctx.settings.shapeRemnantsInSearch === true && ctx.reusableRemnantMin > 0;
+  const pctMin = isShaping ? 65 : 5;
+  const pctMax = isShaping ? 90 : isShapingPlanned ? 65 : 90;
+
+  const useExactLp =
+    allowExactSolver &&
+    !isShaping &&
+    strategy.type === 'min_material' &&
+    !ctx.settings.dualProfileCut &&
+    isExactSolverActive(ctx.settings);
+
+  let workCtx: CutContext = ctx;
+  let workInitialState: CutState = initialState;
+  let lpResult: ReturnType<typeof computeLpCandidate> = null;
+
+  if (useExactLp && !ctx.shouldAbort?.()) {
+    const solver = await loadHighsSolver();
+    if (solver && !ctx.shouldAbort?.()) {
+      lpResult = computeLpCandidate(ctx, solver);
+      if (lpResult?.lpMinBarsLowerBound !== undefined && lpResult.lpMinBarsLowerBound > 0) {
+        workCtx = {
+          ...ctx,
+          lpMinBarsLowerBound: lpResult.lpMinBarsLowerBound,
+        };
+        workInitialState = {
+          ...initialState,
+          context: workCtx,
+        };
+      }
+    }
+  }
+
+  let passFinalState: CutState;
+  let merged: MergedPassResults | null = null;
+
+  if (parallelExecutor && shouldUseParallelPassSearch(workCtx, strategy, stockInput, demandInput)) {
+    const stage1End = performance.now();
+    const stage1Ms = Math.max(0, Number((stage1End - workCtx.startTime).toFixed(1)));
+    const totalChunks = Math.ceil(totalPasses / PASS_CHUNK_SIZE);
+    const plannedThreads = Math.min(Math.max(1, getAvailableHelperThreadLimit()), Math.max(1, totalChunks));
+
+    if (isShaping) {
+      workCtx.onProgress?.({
+        stage: 3,
+        totalStages: 3,
+        stageName: 'Формирование деловых остатков',
+        stageStepName: `Запуск многопоточного перебора (${totalPasses} проходов)`,
+        percent: 65,
+        placedParts: 0,
+        totalParts: workCtx.totalPartsCount,
+        usedBars: 0,
+        totalBarsEstimate: workCtx.totalBarsEstimate,
+        bestKIM: 0,
+        uniqueCardsCount: 0,
+        elapsedMs: Math.round(stage1End - workCtx.startTime),
+        viewedPasses: 0,
+        totalPasses,
+        workerThreadCount: plannedThreads,
+        chunksCompleted: 0,
+        totalChunks,
+        hasMeasurableProgress: true,
+      });
+    } else {
+      workCtx.onProgress?.({
+        stage: 1,
+        totalStages: 3,
+        stageName: 'Анализ спецификации и подготовка заготовок',
+        percent: 5,
+        placedParts: 0,
+        totalParts: workCtx.totalPartsCount,
+        usedBars: 0,
+        totalBarsEstimate: workCtx.totalBarsEstimate,
+        bestKIM: 0,
+        uniqueCardsCount: 0,
+        elapsedMs: Math.round(stage1End - workCtx.startTime),
+        hasMeasurableProgress: false,
+      });
+      workCtx.onProgress?.({
+        stage: 2,
+        totalStages: 3,
+        stageName: `Многопоточный перебор схем реза (0/${totalPasses})`,
+        stageStepName: `Запуск потоков (${totalPasses} проходов)`,
+        percent: 5,
+        placedParts: 0,
+        totalParts: workCtx.totalPartsCount,
+        usedBars: 0,
+        totalBarsEstimate: workCtx.totalBarsEstimate,
+        bestKIM: 0,
+        uniqueCardsCount: 0,
+        elapsedMs: Math.round(stage1End - workCtx.startTime),
+        viewedPasses: 0,
+        totalPasses,
+        workerThreadCount: plannedThreads,
+        chunksCompleted: 0,
+        totalChunks,
+        hasMeasurableProgress: true,
+      });
+    }
+
+    const stage2Start = performance.now();
+    const poolResult = await parallelExecutor(
+      {
+        context: toSerializableCutContext(workCtx),
+        strategyType: strategy.type,
+        materialCapMm: workCtx.materialCapMm,
+        cutoffMm: isShaping ? strategy.cutoffMm : undefined,
+        totalPasses,
+        profiles,
+      },
+      ({ completedPasses, totalPasses: total, chunksCompleted, totalChunks: chunksTotal, threadsUsed }) => {
+        const elapsed = performance.now() - workCtx.startTime;
+        const pct = Math.min(
+          pctMax,
+          pctMin + Math.round((completedPasses / Math.max(1, total)) * (pctMax - pctMin))
+        );
+        workCtx.onProgress?.({
+          stage: isShaping ? 3 : 2,
+          totalStages: 3,
+          stageName: isShaping
+            ? 'Формирование деловых остатков'
+            : `Многопоточный перебор схем реза (${completedPasses}/${total})`,
+          stageStepName: `Обработано ${completedPasses} из ${total} проходов`,
+          percent: pct,
+          placedParts: workCtx.totalPartsCount,
+          totalParts: workCtx.totalPartsCount,
+          usedBars: 0,
+          totalBarsEstimate: workCtx.totalBarsEstimate,
+          bestKIM: 0,
+          elapsedMs: Math.round(elapsed),
+          viewedPasses: completedPasses,
+          totalPasses: total,
+          workerThreadCount: threadsUsed,
+          chunksCompleted,
+          totalChunks: chunksTotal,
+          hasMeasurableProgress: true,
+        });
+      }
+    );
+
+    if (poolResult) {
+      const stage2Ms = Math.max(0, Number((performance.now() - stage2Start).toFixed(1)));
+      const baseState = buildBaseStateFromMergedPassResults(
+        workCtx,
+        poolResult.merged,
+        stage1Ms,
+        stage2Ms,
+        totalPasses,
+        poolResult.threadsUsed,
+        poolResult.chunksProcessed
+      );
+      const abortedState: CutState =
+        workCtx.shouldAbort?.() && !baseState.telemetryCounters.abortedDuringSearch
+          ? {
+              ...baseState,
+              telemetryCounters: {
+                ...baseState.telemetryCounters,
+                abortedDuringSearch: true,
+              },
+            }
+          : baseState;
+      passFinalState = refineBaseStateWithPipeline(abortedState, strategy);
+      merged = poolResult.merged;
+    } else {
+      passFinalState = runCuttingPipeline(workInitialState, strategy);
+    }
+  } else {
+    passFinalState = runCuttingPipeline(workInitialState, strategy);
+  }
+
+  let finalState = passFinalState;
+  if (
+    useExactLp &&
+    lpResult &&
+    lpResult.cards.length > 0 &&
+    !workCtx.shouldAbort?.() &&
+    !passFinalState.telemetryCounters.abortedDuringSearch
+  ) {
+    const lpCards = groupIdenticalCards(lpResult.cards, workCtx);
+    const lpMetrics = calculateMetrics(lpCards, workCtx, []);
+    const lpBaseState: CutState = {
+      cards: lpCards,
+      metrics: lpMetrics,
+      unplacedScaled: [],
+      score: strategy.score(lpCards, lpMetrics, workCtx),
+      context: workCtx,
+      telemetryCounters: {
+        ...passFinalState.telemetryCounters,
+        twoOptSwapIterations: 0,
+        tailConsolidationCardsMerged: 0,
+        initialCardsCount: lpMetrics.uniqueCardsCount,
+        stage3Ms: 0,
+      },
+    };
+    const lpRefined = refineBaseStateWithPipeline(lpBaseState, strategy);
+    if (lpRefined.score > passFinalState.score) {
+      finalState = {
+        ...lpRefined,
+        telemetryCounters: {
+          ...lpRefined.telemetryCounters,
+          passesEvaluated: passFinalState.telemetryCounters.passesEvaluated,
+          prunedPasses: passFinalState.telemetryCounters.prunedPasses,
+          totalCombinationsChecked: passFinalState.telemetryCounters.totalCombinationsChecked,
+          stage1Ms: passFinalState.telemetryCounters.stage1Ms,
+          stage2Ms: passFinalState.telemetryCounters.stage2Ms,
+          stage3Ms:
+            passFinalState.telemetryCounters.stage3Ms +
+            lpRefined.telemetryCounters.stage3Ms,
+          threadsUsed: passFinalState.telemetryCounters.threadsUsed,
+          chunksProcessed: passFinalState.telemetryCounters.chunksProcessed,
+          totalPassesPlanned: passFinalState.telemetryCounters.totalPassesPlanned,
+        },
+      };
+    }
+  }
+
+  return { finalState, merged };
+}
+
+function selectFrontPointForCap(
+  front: readonly ParetoFrontPoint[],
+  capMm: number
+): ParetoFrontPoint | null {
+  let chosen: ParetoFrontPoint | null = null;
+  for (let i = 0; i < front.length; i++) {
+    const pt = front[i];
+    if (pt.totalStockLengthMm > capMm) break;
+    if (
+      !chosen ||
+      pt.uniqueCardsCount < chosen.uniqueCardsCount ||
+      (pt.uniqueCardsCount === chosen.uniqueCardsCount &&
+        (pt.totalStockLengthMm < chosen.totalStockLengthMm ||
+          (pt.totalStockLengthMm === chosen.totalStockLengthMm &&
+            (pt.totalBarsUsed < chosen.totalBarsUsed ||
+              (pt.totalBarsUsed === chosen.totalBarsUsed &&
+                pt.totalWasteMm < chosen.totalWasteMm)))))
+    ) {
+      chosen = pt;
+    }
+  }
+  return chosen;
+}
+
+export async function runComprehensiveSuiteAsync(
+  stockInput: StockItem[],
+  demandInput: DemandItem[],
+  baseSettings: AppSettings,
+  options?: SolveLinearCuttingOptions,
+  parallelExecutor?: ParallelPassExecutor
+): Promise<ComprehensiveResult> {
+  const hasActive12m = stockInput.some(
+    (s) => s.isActive !== false && (s.length === 12000 || s.length === 11700)
+  );
+  const hasActive6m = stockInput.some(
+    (s) => s.isActive !== false && s.length === 6000
+  );
+  const isMultiStandard = hasActive12m && hasActive6m;
+
+  const configs: Array<{
+    goal: 'variants' | 'min_bars';
+    title: string;
+    badge: string;
+    description: string;
+    stockModifier?: (stocks: StockItem[]) => StockItem[];
+  }> = isMultiStandard
+    ? [
+        {
+          goal: 'min_bars',
+          title: '12м + 6м Оптимальный',
+          badge: 'Мин. материал',
+          description: 'Минимум заготовок; при равенстве меньше карт и отхода',
+        },
+        {
+          goal: 'min_bars',
+          title: 'Только 12м профили',
+          badge: '📏 Стандарт 12м',
+          description: 'Раскрой исключительно из 12-метрового проката',
+          stockModifier: (stocks) =>
+            stocks.map((s) => (s.length === 6000 ? { ...s, isActive: false } : s)),
+        },
+        {
+          goal: 'min_bars',
+          title: 'Только 6м профили',
+          badge: '📐 Стандарт 6м',
+          description: 'Раскрой исключительно из 6-метрового проката',
+          stockModifier: (stocks) =>
+            stocks.map((s) =>
+              s.length === 12000 || s.length === 11700 ? { ...s, isActive: false } : s
+            ),
+        },
+        {
+          goal: 'variants',
+          title: 'Минимум наладок (Серийный)',
+          badge: '⚡ Меньше наладок',
+          description: 'Минимум уникальных карт для максимальной повторяемости',
+        },
+      ]
+    : [
+        {
+          goal: 'min_bars',
+          title: 'Минимум материала',
+          badge: 'Мин. материал',
+          description: 'Минимум заготовок; при равенстве меньше карт и отхода',
+        },
+        {
+          goal: 'variants',
+          title: 'Минимум наладок',
+          badge: '⚡ Меньше наладок',
+          description: 'Минимум уникальных карт для быстрой резки на станке',
+        },
+      ];
+
+  const suite: ComprehensiveSuiteItem[] = [];
+
+  for (let idx = 0; idx < configs.length; idx++) {
+    if (options?.shouldAbort?.()) break;
+    const cfg = configs[idx];
+    const goalSettings: AppSettings = {
+      ...baseSettings,
+      optimizationGoal: cfg.goal,
+    };
+
+    const currentStock = cfg.stockModifier ? cfg.stockModifier(stockInput) : stockInput;
+
+    const sol = await solveLinearCuttingAsync(
+      currentStock,
+      demandInput,
+      goalSettings,
+      {
+        onProgress: (p) => {
+          options?.onProgress?.({
+            ...p,
+            stage: idx + 1,
+            totalStages: configs.length,
+            stageName: `Комплексный расчет (${idx + 1}/${configs.length}): ${cfg.title}`,
+            percent: Math.min(99, Math.round(((idx + p.percent / 100) / configs.length) * 100)),
+          });
+        },
+        shouldAbort: options?.shouldAbort,
+      },
+      parallelExecutor
+    );
+
+    suite.push({
+      goal: cfg.goal,
+      title: cfg.title,
+      badge: cfg.badge,
+      description: cfg.description,
+      solution: sol,
+    });
+  }
+
+  let best = suite[0]?.solution;
+  for (const item of suite) {
+    if (!best || item.solution.overallKIM > best.overallKIM) {
+      best = item.solution;
+    }
+  }
+
+  return { suite, bestSolution: best };
+}
+
+export async function runBalanceSuiteAsync(
+  stockInput: StockItem[],
+  demandInput: DemandItem[],
+  baseSettings: AppSettings,
+  options?: SolveLinearCuttingOptions,
+  parallelExecutor?: ParallelPassExecutor
+): Promise<BalanceResult> {
+  const effSettings: AppSettings = {
+    ...baseSettings,
+    optimizationGoal: 'min_bars',
+    dualProfileCut: false,
+  };
+  const suiteStart = performance.now();
+  const startMemoryMb = getMemoryUsageMb();
+  const fullCtx = buildCutContext(stockInput, demandInput, effSettings, {
+    shouldAbort: options?.shouldAbort,
+  });
+
+  if (fullCtx.scaledDemand.length === 0 || fullCtx.scaledStockAll.length === 0) {
+    return runBalanceSuite(stockInput, demandInput, baseSettings, options);
+  }
+
+  const stageA = runPrioritizeRemnantsStageA(
+    stockInput,
+    demandInput,
+    effSettings,
+    fullCtx,
+    options
+  );
+  const stageBStock = stageA ? stageA.standardStock : stockInput;
+  const stageBDemand = stageA ? stageA.remainingDemand : demandInput;
+  const stageBSettings = stageA ? stageA.stageBSettings : effSettings;
+  const stageBUserSettings = stageA ? { ...baseSettings, prioritizeRemnants: false } : baseSettings;
+  const matStrategy = new MinimizeMaterialStrategy();
+  const setupsStrategy = new MinimizeSetupsStrategy();
+
+  if (stageA && stageBDemand.length === 0) {
+    return runBalanceSuite(stockInput, demandInput, baseSettings, options);
+  }
+
+  const stageBFullCtx = stageA
+    ? buildCutContext(stageBStock, stageBDemand, stageBSettings, {
+        shouldAbort: options?.shouldAbort,
+      })
+    : fullCtx;
+
+  const isBatchMode = baseSettings.dualProfileCut === true;
+  const batchSplit = isBatchMode
+    ? splitBatchAndTailInputs(
+        stageBStock,
+        stageBDemand,
+        resolveBatchSize(stageBDemand, stageBUserSettings)
+      )
+    : null;
+
+  if (batchSplit && batchSplit.batchDemand.length === 0) {
+    return runBalanceSuite(stockInput, demandInput, baseSettings, options);
+  }
+
+  const checkCtx = batchSplit
+    ? buildCutContext(batchSplit.batchStock, batchSplit.batchDemand, stageBSettings)
+    : stageBFullCtx;
+  const canParallel =
+    !!parallelExecutor &&
+    shouldUseParallelPassSearch(
+      checkCtx,
+      matStrategy,
+      batchSplit ? batchSplit.batchStock : stageBStock,
+      batchSplit ? batchSplit.batchDemand : stageBDemand
+    );
+
+  // Sync fast path when neither worker pool nor async HiGHS LP is needed
+  if (!canParallel && (!isExactSolverActive(baseSettings) || isBatchMode)) {
+    return runBalanceSuite(stockInput, demandInput, baseSettings, options);
+  }
+
+  const baseCtx = buildCutContext(
+    batchSplit ? batchSplit.batchStock : stageBStock,
+    batchSplit ? batchSplit.batchDemand : stageBDemand,
+    stageBSettings,
+    {
+      shouldAbort: options?.shouldAbort,
+      onProgress: (p) => {
+        const isShapingSub =
+          p.stage === 3 && p.stageName === 'Формирование деловых остатков';
+        options?.onProgress?.({
+          ...p,
+          stage: 1,
+          totalStages: 6,
+          stageName: isShapingSub
+            ? 'Баланс: формирование деловых остатков'
+            : canParallel
+              ? 'Баланс: многопоточный расчёт фронта'
+              : 'Баланс: минимум материала',
+          percent: Math.min(35, Math.max(2, Math.round(p.percent * 0.35))),
+        });
+      },
+    }
+  );
+
+  const emptyMetrics = calculateMetrics([], baseCtx, baseCtx.scaledDemand);
+  const initialState: CutState = {
+    cards: [],
+    metrics: emptyMetrics,
+    unplacedScaled: baseCtx.scaledDemand,
+    score: -Infinity,
+    context: baseCtx,
+    telemetryCounters: {
+      passesEvaluated: 0,
+      prunedPasses: 0,
+      totalCombinationsChecked: 0,
+      twoOptSwapIterations: 0,
+      tailConsolidationCardsMerged: 0,
+      initialCardsCount: 0,
+      stage1Ms: 0,
+      stage2Ms: 0,
+      stage3Ms: 0,
+    },
+  };
+
+  const tailCache = new Map<
+    string,
+    {
+      cards: CutCard[];
+      unplacedScaledFull: number[];
+      passesEvaluated: number;
+      prunedPasses: number;
+      totalCombinationsChecked: number;
+    }
+  >();
+
+  const finalizeVariantStateAsync = async (
+    rawBatchState: CutState,
+    variantCtx: CutContext,
+    strategy: CuttingStrategy
+  ): Promise<{ state: CutState; evalCtx: CutContext }> => {
+    let stageBFinal: CutState;
+    let stageBEvalCtx: CutContext;
+    if (!batchSplit) {
+      stageBFinal = await applyForcedRemnantShapingAsync(
+        rawBatchState,
+        stageBStock,
+        stageBDemand,
+        stageBUserSettings,
+        variantCtx,
+        strategy,
+        parallelExecutor
+      );
+      stageBEvalCtx = variantCtx;
+    } else {
+      let combined = combineBatchAndTailState(
+        rawBatchState,
+        batchSplit.batchSize,
+        variantCtx,
+        stageBFullCtx,
+        stageBStock,
+        batchSplit.tailDemand,
+        stageBUserSettings,
+        strategy,
+        tailCache
+      );
+      let untouchedBatchHint: readonly CutCard[] | null = null;
+      let hasFillControlWork = false;
+      if (stageBUserSettings.fillControlEnabled) {
+        const fcOutcome = applyBatchFillControl(
+          combined,
+          stageBStock,
+          stageBUserSettings,
+          stageBFullCtx,
+          strategy
+        );
+        combined = fcOutcome.state;
+        untouchedBatchHint = fcOutcome.untouchedBatchCards;
+        hasFillControlWork = fcOutcome.hasSinglePoolWork;
+      }
+      combined = consolidateUnifiedSinglePool(
+        combined,
+        batchSplit.batchSize,
+        untouchedBatchHint,
+        hasFillControlWork,
+        stageBStock,
+        stageBUserSettings,
+        stageBFullCtx,
+        strategy
+      );
+      combined = await applyForcedRemnantShapingAsync(
+        combined,
+        stageBStock,
+        stageBDemand,
+        stageBUserSettings,
+        stageBFullCtx,
+        strategy,
+        parallelExecutor
+      );
+      stageBFinal = combined;
+      stageBEvalCtx = stageBFullCtx;
+    }
+
+    if (stageA) {
+      return {
+        state: mergeLockedRemnantsWithStageB(stageA, stageBFinal, stageBEvalCtx, fullCtx, strategy),
+        evalCtx: fullCtx,
+      };
+    }
+    return { state: stageBFinal, evalCtx: stageBEvalCtx };
+  };
+
+  // 1. Baseline run (parallel Pareto-front or sequential + optional HiGHS LP) with MinimizeMaterialStrategy
+  const baseRunStart = performance.now();
+  const baseProfiles: PassSearchProfile[] = canParallel
+    ? ['best', 'fastPrefix', 'stdPrefix', 'front']
+    : resolveStandardPassProfiles(stageBSettings.searchSpeed);
+  const { finalState: baseFinalBatch, merged: baseMerged } = await runStage2AndRefineMaybeParallel(
+    initialState,
+    matStrategy,
+    batchSplit ? batchSplit.batchStock : stageBStock,
+    batchSplit ? batchSplit.batchDemand : stageBDemand,
+    baseProfiles,
+    parallelExecutor,
+    !isBatchMode
+  );
+
+  const baseRunDurationMs = Number((performance.now() - baseRunStart).toFixed(1));
+  const { state: baseFinalFull, evalCtx: baseEvalCtx } = await finalizeVariantStateAsync(
+    baseFinalBatch,
+    baseCtx,
+    matStrategy
+  );
+  const baseSol = buildSolutionFromFinalState(
+    baseFinalFull,
+    baseEvalCtx,
+    stockInput,
+    demandInput,
+    baseSettings,
+    startMemoryMb,
+    baseRunStart
+  );
+
+  const mStar = baseSol.totalStockLength;
+  const c0 = baseSol.rows.length;
+  const primaryStdLen = resolvePrimaryStandardBarLength(baseSol, fullCtx, stockInput);
+  const lockedRemnantMmBaseline = stageA ? stageA.lockedRemnantMm : 0;
+  const tailStockMmBaseline = batchSplit
+    ? baseFinalFull.cards.reduce((s, c) => (c.isTailSingle ? s + c.barSize * c.count : s), 0)
+    : 0;
+  const toBatchCapMm = (totalCapMm: number): number => {
+    const remCap = Math.max(0, totalCapMm - lockedRemnantMmBaseline - tailStockMmBaseline);
+    return batchSplit ? Math.floor(remCap / batchSplit.batchSize) : remCap;
+  };
+
+  const timings: BalanceRunTiming[] = [
+    {
+      label: 'Минимум материала',
+      capMm: mStar,
+      durationMs: baseRunDurationMs,
+      stockMm: baseSol.totalStockLength,
+      bars: baseSol.totalBarsUsed,
+      cards: c0,
+    },
+  ];
+
+  const candidates: Array<{ solution: FullOptimizationSolution; isBaseline: boolean }> = [
+    { solution: baseSol, isBaseline: true },
+  ];
+  const probedCaps = new Set<number>([mStar]);
+  const probeHistory: Array<{ capMm: number; cards: number }> = [{ capMm: mStar, cards: c0 }];
+  let totalRunsExecuted = 1;
+
+  // 2. Extreme setups run sequentially (MinimizeSetupsStrategy)
+  let mSetups = mStar;
+  let cSetups = c0;
+  if (!options?.shouldAbort?.()) {
+    const setupsStart = performance.now();
+    const setupsCtx: CutContext = {
+      ...baseCtx,
+      startTime: setupsStart,
+      onProgress: (p) => {
+        options?.onProgress?.({
+          ...p,
+          stage: 2,
+          totalStages: 6,
+          stageName: 'Баланс: минимум наладок',
+          percent: Math.min(55, 35 + Math.round(p.percent * 0.2)),
+        });
+      },
+    };
+    const setupsBatch = runCuttingPipeline(
+      { ...initialState, context: setupsCtx },
+      setupsStrategy
+    );
+    const setupsDurationMs = Number((performance.now() - setupsStart).toFixed(1));
+    const { state: setupsFull, evalCtx: setupsEvalCtx } = await finalizeVariantStateAsync(
+      setupsBatch,
+      setupsCtx,
+      setupsStrategy
+    );
+    const setupsSol = buildSolutionFromFinalState(
+      setupsFull,
+      setupsEvalCtx,
+      stockInput,
+      demandInput,
+      baseSettings,
+      startMemoryMb,
+      setupsStart
+    );
+    totalRunsExecuted++;
+    mSetups = setupsSol.totalStockLength;
+    cSetups = setupsSol.rows.length;
+    probedCaps.add(mSetups);
+    probeHistory.push({ capMm: mSetups, cards: cSetups });
+    candidates.push({ solution: setupsSol, isBaseline: false });
+    timings.push({
+      label: 'Минимум наладок',
+      capMm: mSetups,
+      durationMs: setupsDurationMs,
+      stockMm: mSetups,
+      bars: setupsSol.totalBarsUsed,
+      cards: cSetups,
+    });
+  }
+
+  const totalPassesPlanned =
+    (baseCtx.maxSortZ + 1) * (baseCtx.maxSort + 1) * (baseCtx.maxVar + 1);
+
+  const refineFrontForCap = async (
+    capMm: number,
+    label: string,
+    stageNum: number,
+    pct: number
+  ): Promise<void> => {
+    if (!baseMerged) return;
+    const batchCapMm = toBatchCapMm(capMm);
+    const capStageStart = performance.now();
+    const capCtx: CutContext = {
+      ...baseCtx,
+      materialCapMm: batchCapMm,
+      startTime: capStageStart,
+      onProgress: undefined,
+    };
+    const balStrategy = new MinimizeBalanceStrategy(batchCapMm);
+    const chosenPt = selectFrontPointForCap(baseMerged.front, batchCapMm);
+
+    let refined: CutState;
+    if (chosenPt) {
+      const ptState: CutState = {
+        cards: chosenPt.cards,
+        metrics: chosenPt.metrics,
+        unplacedScaled: chosenPt.unplacedScaled,
+        score: balStrategy.score(chosenPt.cards, chosenPt.metrics, capCtx),
+        context: capCtx,
+        telemetryCounters: {
+          passesEvaluated: baseFinalBatch.telemetryCounters.passesEvaluated,
+          prunedPasses: baseFinalBatch.telemetryCounters.prunedPasses,
+          totalCombinationsChecked: baseFinalBatch.telemetryCounters.totalCombinationsChecked,
+          twoOptSwapIterations: 0,
+          tailConsolidationCardsMerged: 0,
+          initialCardsCount: chosenPt.metrics.uniqueCardsCount,
+          stage1Ms: baseFinalBatch.telemetryCounters.stage1Ms,
+          stage2Ms: baseFinalBatch.telemetryCounters.stage2Ms,
+          stage3Ms: 0,
+          threadsUsed: baseFinalBatch.telemetryCounters.threadsUsed,
+          chunksProcessed: baseFinalBatch.telemetryCounters.chunksProcessed,
+          totalPassesPlanned,
+          abortedDuringSearch: baseFinalBatch.telemetryCounters.abortedDuringSearch,
+        },
+      };
+      refined = runPostGenerationSteps(
+        ptState,
+        balStrategy.buildPipeline(capCtx),
+        balStrategy,
+        true
+      );
+      const baselineScoreUnderCap = balStrategy.score(
+        baseFinalBatch.cards,
+        baseFinalBatch.metrics,
+        capCtx
+      );
+      if (baselineScoreUnderCap > refined.score) {
+        refined = {
+          ...baseFinalBatch,
+          context: capCtx,
+          score: baselineScoreUnderCap,
+        };
+      }
+    } else {
+      refined = {
+        ...baseFinalBatch,
+        context: capCtx,
+        score: balStrategy.score(baseFinalBatch.cards, baseFinalBatch.metrics, capCtx),
+      };
+    }
+
+    const stage3Ms = Math.max(0, Number((performance.now() - capStageStart).toFixed(1)));
+    const withStage3: CutState = {
+      ...refined,
+      telemetryCounters: {
+        ...refined.telemetryCounters,
+        stage3Ms,
+      },
+    };
+
+    const { state: resFull, evalCtx: resEvalCtx } = await finalizeVariantStateAsync(
+      withStage3,
+      capCtx,
+      setupsStrategy
+    );
+    const sol = buildSolutionFromFinalState(
+      resFull,
+      resEvalCtx,
+      stockInput,
+      demandInput,
+      baseSettings,
+      startMemoryMb,
+      capStageStart
+    );
+
+    options?.onProgress?.({
+      stage: stageNum,
+      totalStages: 6,
+      stageName: `Баланс: допуск ${label}`,
+      stageStepName: `Оптимизация карт при допуске ${label}`,
+      percent: pct,
+      placedParts: fullCtx.totalPartsCount,
+      totalParts: fullCtx.totalPartsCount,
+      usedBars: sol.totalBarsUsed,
+      totalBarsEstimate: fullCtx.totalBarsEstimate,
+      bestKIM: sol.overallKIM,
+      uniqueCardsCount: sol.rows.length,
+      elapsedMs: Math.round(performance.now() - suiteStart),
+    });
+
+    probeHistory.push({ capMm, cards: sol.rows.length });
+    timings.push({
+      label,
+      capMm,
+      durationMs: stage3Ms,
+      stockMm: sol.totalStockLength,
+      bars: sol.totalBarsUsed,
+      cards: sol.rows.length,
+    });
+    candidates.push({ solution: sol, isBaseline: false });
+  };
+
+  // 3. Fixed tolerances + adaptive bisection midpoints over merged front OR sequential multi-cap pipeline
+  if (cSetups < c0 && !options?.shouldAbort?.()) {
+    const fixedTolerances: Array<{ p: number; label: string }> = [
+      { p: 0.001, label: '+0,1%' },
+      { p: 0.005, label: '+0,5%' },
+      { p: 0.01, label: '+1%' },
+      { p: 0.02, label: '+2%' },
+    ];
+    const capMap = new Map<number, { capMm: number; label: string }>();
+    for (const def of fixedTolerances) {
+      const delta = Math.max(Math.round(mStar * def.p), primaryStdLen);
+      const capMm = mStar + delta;
+      if (capMm < mSetups && !probedCaps.has(capMm) && !capMap.has(capMm)) {
+        capMap.set(capMm, { capMm, label: def.label });
+      }
+    }
+    const maxFixedAllowed = Math.max(0, 9 - totalRunsExecuted);
+    const fixedEntries = Array.from(capMap.values())
+      .sort((a, b) => a.capMm - b.capMm)
+      .slice(0, maxFixedAllowed);
+
+    if (baseMerged) {
+      for (let idx = 0; idx < fixedEntries.length && !options?.shouldAbort?.(); idx++) {
+        const entry = fixedEntries[idx];
+        probedCaps.add(entry.capMm);
+        const pct = Math.min(82, 56 + Math.round(((idx + 1) / Math.max(1, fixedEntries.length)) * 24));
+        await refineFrontForCap(entry.capMm, entry.label, 4, pct);
+        totalRunsExecuted++;
+      }
+
+      let adaptiveDone = 0;
+      while (adaptiveDone < 4 && totalRunsExecuted < 9 && !options?.shouldAbort?.()) {
+        const frontier = buildParetoFrontier(candidates);
+        let bestCapMid: number | null = null;
+        let bestCardDrop = 1;
+        let bestSpan = 0;
+
+        for (let i = 0; i < frontier.length - 1; i++) {
+          const leftSol = frontier[i].solution;
+          const rightSol = frontier[i + 1].solution;
+          const cardDrop = leftSol.rows.length - rightSol.rows.length;
+          if (cardDrop < 2) continue;
+
+          let effectiveLeft = leftSol.totalStockLength;
+          for (const pr of probeHistory) {
+            if (
+              pr.capMm > effectiveLeft &&
+              pr.capMm < rightSol.totalStockLength &&
+              pr.cards >= leftSol.rows.length
+            ) {
+              effectiveLeft = pr.capMm;
+            }
+          }
+
+          const span = rightSol.totalStockLength - effectiveLeft;
+          if (span < primaryStdLen) continue;
+
+          let capMid =
+            Math.round((effectiveLeft + rightSol.totalStockLength) / 2 / primaryStdLen) *
+            primaryStdLen;
+          if (capMid <= effectiveLeft) capMid = effectiveLeft + primaryStdLen;
+          if (capMid >= rightSol.totalStockLength) capMid = rightSol.totalStockLength - primaryStdLen;
+          if (capMid <= effectiveLeft || capMid >= rightSol.totalStockLength) continue;
+          if (probedCaps.has(capMid)) continue;
+
+          if (cardDrop > bestCardDrop || (cardDrop === bestCardDrop && span > bestSpan)) {
+            bestCardDrop = cardDrop;
+            bestSpan = span;
+            bestCapMid = capMid;
+          }
+        }
+
+        if (bestCapMid === null) break;
+        probedCaps.add(bestCapMid);
+        await refineFrontForCap(
+          bestCapMid,
+          `Бисекция #${adaptiveDone + 1}`,
+          5,
+          Math.min(97, 83 + adaptiveDone * 3)
+        );
+        adaptiveDone++;
+        totalRunsExecuted++;
+      }
+    } else {
+      const balanceCtx: CutContext = {
+        ...baseCtx,
+        startTime: performance.now(),
+        onProgress: (p) => {
+          options?.onProgress?.({
+            ...p,
+            stage: 3,
+            totalStages: 6,
+            stageName: 'Баланс: подбор промежуточных точек',
+            percent: Math.min(72, 55 + Math.round(p.percent * 0.17)),
+          });
+        },
+      };
+      const balanceInitial: CutState = {
+        ...initialState,
+        context: balanceCtx,
+      };
+
+      if (fixedEntries.length > 0 && !options?.shouldAbort?.()) {
+        for (const e of fixedEntries) probedCaps.add(e.capMm);
+        const capsForPipeline = fixedEntries.map((e) => toBatchCapMm(e.capMm));
+        const fixedResults: Array<{ idx: number; resState: CutState; stage3DurationMs: number; capStart: number }> = [];
+        let capStageStart = performance.now();
+        runMultiCapBalancePipelines(
+          balanceInitial,
+          baseFinalBatch,
+          capsForPipeline,
+          (idx) => {
+            capStageStart = performance.now();
+            const pct = Math.min(82, 72 + Math.round(((idx + 0.5) / fixedEntries.length) * 10));
+            options?.onProgress?.({
+              stage: 4,
+              totalStages: 6,
+              stageName: `Баланс: допуск ${fixedEntries[idx].label}`,
+              stageStepName: `Оптимизация карт при допуске ${fixedEntries[idx].label}`,
+              percent: pct,
+              placedParts: fullCtx.totalPartsCount,
+              totalParts: fullCtx.totalPartsCount,
+              usedBars: baseSol.totalBarsUsed,
+              totalBarsEstimate: fullCtx.totalBarsEstimate,
+              bestKIM: baseSol.overallKIM,
+              uniqueCardsCount: c0,
+              elapsedMs: Math.round(performance.now() - suiteStart),
+            });
+          },
+          (idx, _total, resState, stage3DurationMs) => {
+            fixedResults.push({ idx, resState, stage3DurationMs, capStart: capStageStart });
+          }
+        );
+
+        for (const item of fixedResults) {
+          const { state: resFull, evalCtx: resEvalCtx } = await finalizeVariantStateAsync(
+            item.resState,
+            balanceCtx,
+            setupsStrategy
+          );
+          const sol = buildSolutionFromFinalState(
+            resFull,
+            resEvalCtx,
+            stockInput,
+            demandInput,
+            baseSettings,
+            startMemoryMb,
+            item.capStart
+          );
+          const reportedDurationMs =
+            item.idx === 0
+              ? Number((item.resState.telemetryCounters.stage2Ms + item.stage3DurationMs).toFixed(1))
+              : item.stage3DurationMs;
+          const capMm = fixedEntries[item.idx].capMm;
+          probeHistory.push({ capMm, cards: sol.rows.length });
+          timings.push({
+            label: fixedEntries[item.idx].label,
+            capMm,
+            durationMs: reportedDurationMs,
+            stockMm: sol.totalStockLength,
+            bars: sol.totalBarsUsed,
+            cards: sol.rows.length,
+          });
+          candidates.push({ solution: sol, isBaseline: false });
+        }
+        totalRunsExecuted += fixedEntries.length;
+      }
+
+      let adaptiveDone = 0;
+      while (adaptiveDone < 4 && totalRunsExecuted < 9 && !options?.shouldAbort?.()) {
+        const frontier = buildParetoFrontier(candidates);
+        let bestCapMid: number | null = null;
+        let bestCardDrop = 1;
+        let bestSpan = 0;
+
+        for (let i = 0; i < frontier.length - 1; i++) {
+          const leftSol = frontier[i].solution;
+          const rightSol = frontier[i + 1].solution;
+          const cardDrop = leftSol.rows.length - rightSol.rows.length;
+          if (cardDrop < 2) continue;
+
+          let effectiveLeft = leftSol.totalStockLength;
+          for (const pr of probeHistory) {
+            if (
+              pr.capMm > effectiveLeft &&
+              pr.capMm < rightSol.totalStockLength &&
+              pr.cards >= leftSol.rows.length
+            ) {
+              effectiveLeft = pr.capMm;
+            }
+          }
+
+          const span = rightSol.totalStockLength - effectiveLeft;
+          if (span < primaryStdLen) continue;
+
+          let capMid =
+            Math.round((effectiveLeft + rightSol.totalStockLength) / 2 / primaryStdLen) *
+            primaryStdLen;
+          if (capMid <= effectiveLeft) capMid = effectiveLeft + primaryStdLen;
+          if (capMid >= rightSol.totalStockLength) capMid = rightSol.totalStockLength - primaryStdLen;
+          if (capMid <= effectiveLeft || capMid >= rightSol.totalStockLength) continue;
+          if (probedCaps.has(capMid)) continue;
+
+          if (cardDrop > bestCardDrop || (cardDrop === bestCardDrop && span > bestSpan)) {
+            bestCardDrop = cardDrop;
+            bestSpan = span;
+            bestCapMid = capMid;
+          }
+        }
+
+        if (bestCapMid === null) break;
+        probedCaps.add(bestCapMid);
+
+        const midCap = bestCapMid;
+        const midLabel = `Бисекция #${adaptiveDone + 1}`;
+        const capForPipe = toBatchCapMm(midCap);
+        let midStageStart = performance.now();
+        const midCtx: CutContext = {
+          ...balanceCtx,
+          startTime: midStageStart,
+          onProgress: undefined,
+        };
+        let capturedMid: { resState: CutState; stage3DurationMs: number } | null = null;
+
+        runMultiCapBalancePipelines(
+          { ...balanceInitial, context: midCtx },
+          baseFinalBatch,
+          [capForPipe],
+          () => {
+            midStageStart = performance.now();
+            const pct = Math.min(97, 83 + adaptiveDone * 3);
+            options?.onProgress?.({
+              stage: 5,
+              totalStages: 6,
+              stageName: `Баланс: адаптивный поиск (${adaptiveDone + 1}/4)`,
+              stageStepName: `Уточнение границы расхода (${Math.round(midCap / 1000)} м)`,
+              percent: pct,
+              placedParts: fullCtx.totalPartsCount,
+              totalParts: fullCtx.totalPartsCount,
+              usedBars: baseSol.totalBarsUsed,
+              totalBarsEstimate: fullCtx.totalBarsEstimate,
+              bestKIM: baseSol.overallKIM,
+              uniqueCardsCount: c0,
+              elapsedMs: Math.round(performance.now() - suiteStart),
+            });
+          },
+          (_idx, _total, resState, stage3DurationMs) => {
+            capturedMid = { resState, stage3DurationMs };
+          }
+        );
+
+        if (capturedMid) {
+          const midCapture: { resState: CutState; stage3DurationMs: number } = capturedMid;
+          const { state: resFull, evalCtx: resEvalCtx } = await finalizeVariantStateAsync(
+            midCapture.resState,
+            midCtx,
+            setupsStrategy
+          );
+          const sol = buildSolutionFromFinalState(
+            resFull,
+            resEvalCtx,
+            stockInput,
+            demandInput,
+            baseSettings,
+            startMemoryMb,
+            midStageStart
+          );
+          const reportedDurationMs = Number(
+            (midCapture.resState.telemetryCounters.stage2Ms + midCapture.stage3DurationMs).toFixed(1)
+          );
+          probeHistory.push({ capMm: midCap, cards: sol.rows.length });
+          timings.push({
+            label: midLabel,
+            capMm: midCap,
+            durationMs: reportedDurationMs,
+            stockMm: sol.totalStockLength,
+            bars: sol.totalBarsUsed,
+            cards: sol.rows.length,
+          });
+          candidates.push({ solution: sol, isBaseline: false });
+        }
+
+        adaptiveDone++;
+        totalRunsExecuted++;
+      }
+    }
+  }
+
+  const nonDominated = buildParetoFrontier(candidates);
+  const suite: ComprehensiveSuiteItem[] = nonDominated.map((item, idx) => {
+    const cardsCount = item.solution.rows.length;
+    if (nonDominated.length === 1) {
+      return {
+        goal: 'balance',
+        title: 'Баланс',
+        badge: '⚖️ Баланс',
+        description: 'Оптимальный вариант по расходу материала и числу карт раскроя',
+        solution: item.solution,
+      };
+    }
+
+    if (idx === 0) {
+      return {
+        goal: 'balance',
+        title: 'Минимум материала',
+        badge: 'Мин. материал',
+        description: 'Базовый вариант с минимальным расходом материала',
+        solution: item.solution,
+      };
+    }
+
+    const baseVariant = nonDominated[0].solution;
+    const deltaStockMm = item.solution.totalStockLength - baseVariant.totalStockLength;
+    const rawDeltaBars = item.solution.totalBarsUsed - baseVariant.totalBarsUsed;
+    const deltaBars =
+      rawDeltaBars > 0
+        ? rawDeltaBars
+        : Math.max(1, Math.round(deltaStockMm / primaryStdLen));
+    const pct =
+      baseVariant.totalStockLength > 0
+        ? (deltaStockMm / baseVariant.totalStockLength) * 100
+        : 0;
+    const pctStr = formatTolerancePct(pct);
+
+    return {
+      goal: 'balance',
+      title: `+${deltaBars} заготовок (+${pctStr}%), ${cardsCount} карт`,
+      badge: `⚖️ +${deltaBars} загот. (+${pctStr}%)`,
+      description: `Допуск по материалу +${pctStr}% (+${(deltaStockMm / 1000).toFixed(2)} м): сокращение до ${cardsCount} карт раскроя`,
+      solution: item.solution,
+    };
+  });
+
+  const totalDurationMs = Number((performance.now() - suiteStart).toFixed(1));
+  const bestSolution = suite[0]?.solution || baseSol;
+  return { suite, bestSolution, timings, totalDurationMs };
+}
+
+export async function solveLinearCuttingAsync(
+  stockInput: StockItem[],
+  demandInput: DemandItem[],
+  settings: AppSettings,
+  options?: SolveLinearCuttingOptions,
+  parallelExecutor?: ParallelPassExecutor
+): Promise<FullOptimizationSolution> {
+  if (settings.optimizationGoal === 'comprehensive') {
+    const res = await runComprehensiveSuiteAsync(
+      stockInput,
+      demandInput,
+      settings,
+      options,
+      parallelExecutor
+    );
+    return res.bestSolution;
+  }
+  if (settings.optimizationGoal === 'balance') {
+    const res = await runBalanceSuiteAsync(
+      stockInput,
+      demandInput,
+      settings,
+      options,
+      parallelExecutor
+    );
+    return res.bestSolution;
+  }
+
+  const startMemoryMb = getMemoryUsageMb();
+  const isBatchMode = settings.dualProfileCut === true;
+  const effSettings: AppSettings = isBatchMode ? { ...settings, dualProfileCut: false } : settings;
+  const fullCtx = buildCutContext(stockInput, demandInput, effSettings, options);
+
+  if (fullCtx.scaledDemand.length === 0 || fullCtx.scaledStockAll.length === 0) {
+    return {
+      totalStockLength: 0,
+      totalSpentLength: 0,
+      totalBarsUsed: 0,
+      totalWasteLength: 0,
+      totalReusableLength: 0,
+      maxReusableRemnantLength: 0,
+      cuttingIndex: 0,
+      cuttingIndexMaterial: 0,
+      cuttingIndexSetup: 0,
+      overallKIM: 0,
+      netKIM: 0,
+      rows: [],
+      remainingWarehouseStock: [],
+      unplacedDemand: [],
+      calculationTimeMs: 0,
+    };
+  }
+
+  const strategy = getStrategy(settings.optimizationGoal, settings);
+  const stageA = runPrioritizeRemnantsStageA(
+    stockInput,
+    demandInput,
+    effSettings,
+    fullCtx,
+    options
+  );
+  const stageBStock = stageA ? stageA.standardStock : stockInput;
+  const stageBDemand = stageA ? stageA.remainingDemand : demandInput;
+  const stageBSettings = stageA ? stageA.stageBSettings : effSettings;
+  const stageBUserSettings = stageA ? { ...settings, prioritizeRemnants: false } : settings;
+  const baseProfiles = resolveStandardPassProfiles(stageBSettings.searchSpeed);
+
+  let finalState: CutState;
+  const buildCtx: CutContext = fullCtx;
+
+  if (stageA && stageBDemand.length === 0) {
+    const lockedMetrics = calculateMetrics(stageA.lockedCards, fullCtx, []);
+    finalState = {
+      cards: stageA.lockedCards,
+      metrics: lockedMetrics,
+      unplacedScaled: [],
+      score: strategy.score(stageA.lockedCards, lockedMetrics, fullCtx),
+      context: fullCtx,
+      telemetryCounters: {
+        passesEvaluated: stageA.passesEvaluated,
+        prunedPasses: stageA.prunedPasses,
+        totalCombinationsChecked: stageA.totalCombinationsChecked,
+        twoOptSwapIterations: 0,
+        tailConsolidationCardsMerged: 0,
+        initialCardsCount: lockedMetrics.uniqueCardsCount,
+        stage1Ms: stageA.stage1Ms,
+        stage2Ms: stageA.stage2Ms,
+        stage3Ms: 0,
+      },
+    };
+  } else {
+    const stageBFullCtx = stageA
+      ? buildCutContext(stageBStock, stageBDemand, stageBSettings, options)
+      : fullCtx;
+    const batchSplit = isBatchMode
+      ? splitBatchAndTailInputs(
+          stageBStock,
+          stageBDemand,
+          resolveBatchSize(stageBDemand, stageBUserSettings)
+        )
+      : null;
+
+    let stageBState: CutState;
+
+    if (batchSplit) {
+      if (batchSplit.batchDemand.length === 0) {
+        const tailRes = solveTailSingleCards(
+          stageBStock,
+          [],
+          batchSplit.tailDemand,
+          stageBUserSettings,
+          strategy,
+          stageBFullCtx,
+          options?.shouldAbort
+        );
+        const tailCards = groupIdenticalCards(tailRes.cards, stageBFullCtx);
+        const tailMetrics = calculateMetrics(tailCards, stageBFullCtx, tailRes.unplacedScaledFull);
+        stageBState = await applyForcedRemnantShapingAsync(
+          {
+            cards: tailCards,
+            metrics: tailMetrics,
+            unplacedScaled: tailRes.unplacedScaledFull,
+            score: strategy.score(tailCards, tailMetrics, stageBFullCtx),
+            context: stageBFullCtx,
+            telemetryCounters: {
+              passesEvaluated: tailRes.passesEvaluated,
+              prunedPasses: tailRes.prunedPasses,
+              totalCombinationsChecked: tailRes.totalCombinationsChecked,
+              twoOptSwapIterations: 0,
+              tailConsolidationCardsMerged: 0,
+              initialCardsCount: tailMetrics.uniqueCardsCount,
+              stage1Ms: 0,
+              stage2Ms: 0,
+              stage3Ms: 0,
+            },
+          },
+          stageBStock,
+          stageBDemand,
+          stageBUserSettings,
+          stageBFullCtx,
+          strategy,
+          parallelExecutor
+        );
+      } else {
+        const batchCtx = buildCutContext(
+          batchSplit.batchStock,
+          batchSplit.batchDemand,
+          stageBSettings,
+          options
+        );
+        const emptyMetrics = calculateMetrics([], batchCtx, batchCtx.scaledDemand);
+        const batchInitial: CutState = {
+          cards: [],
+          metrics: emptyMetrics,
+          unplacedScaled: batchCtx.scaledDemand,
+          score: -Infinity,
+          context: batchCtx,
+          telemetryCounters: {
+            passesEvaluated: 0,
+            prunedPasses: 0,
+            totalCombinationsChecked: 0,
+            twoOptSwapIterations: 0,
+            tailConsolidationCardsMerged: 0,
+            initialCardsCount: 0,
+            stage1Ms: 0,
+            stage2Ms: 0,
+            stage3Ms: 0,
+          },
+        };
+        const { finalState: batchSolved } = await runStage2AndRefineMaybeParallel(
+          batchInitial,
+          strategy,
+          batchSplit.batchStock,
+          batchSplit.batchDemand,
+          baseProfiles,
+          parallelExecutor,
+          false
+        );
+        stageBState = combineBatchAndTailState(
+          batchSolved,
+          batchSplit.batchSize,
+          batchCtx,
+          stageBFullCtx,
+          stageBStock,
+          batchSplit.tailDemand,
+          stageBUserSettings,
+          strategy
+        );
+        let untouchedBatchHint: readonly CutCard[] | null = null;
+        let hasFillControlWork = false;
+        if (stageBUserSettings.fillControlEnabled) {
+          const fcOutcome = applyBatchFillControl(
+            stageBState,
+            stageBStock,
+            stageBUserSettings,
+            stageBFullCtx,
+            strategy
+          );
+          stageBState = fcOutcome.state;
+          untouchedBatchHint = fcOutcome.untouchedBatchCards;
+          hasFillControlWork = fcOutcome.hasSinglePoolWork;
+        }
+        stageBState = consolidateUnifiedSinglePool(
+          stageBState,
+          batchSplit.batchSize,
+          untouchedBatchHint,
+          hasFillControlWork,
+          stageBStock,
+          stageBUserSettings,
+          stageBFullCtx,
+          strategy
+        );
+        stageBState = await applyForcedRemnantShapingAsync(
+          stageBState,
+          stageBStock,
+          stageBDemand,
+          stageBUserSettings,
+          stageBFullCtx,
+          strategy,
+          parallelExecutor
+        );
+      }
+    } else {
+      const emptyMetrics = calculateMetrics([], stageBFullCtx, stageBFullCtx.scaledDemand);
+      const initialState: CutState = {
+        cards: [],
+        metrics: emptyMetrics,
+        unplacedScaled: stageBFullCtx.scaledDemand,
+        score: -Infinity,
+        context: stageBFullCtx,
+        telemetryCounters: {
+          passesEvaluated: 0,
+          prunedPasses: 0,
+          totalCombinationsChecked: 0,
+          twoOptSwapIterations: 0,
+          tailConsolidationCardsMerged: 0,
+          initialCardsCount: 0,
+          stage1Ms: 0,
+          stage2Ms: 0,
+          stage3Ms: 0,
+        },
+      };
+      const { finalState: solved } = await runStage2AndRefineMaybeParallel(
+        initialState,
+        strategy,
+        stageBStock,
+        stageBDemand,
+        baseProfiles,
+        parallelExecutor,
+        true
+      );
+      stageBState = await applyForcedRemnantShapingAsync(
+        solved,
+        stageBStock,
+        stageBDemand,
+        stageBUserSettings,
+        stageBFullCtx,
+        strategy,
+        parallelExecutor
+      );
+    }
+
+    finalState = stageA
+      ? mergeLockedRemnantsWithStageB(stageA, stageBState, stageBFullCtx, fullCtx, strategy)
+      : stageBState;
+  }
+
+  buildCtx.onProgress?.({
+    stage: 3,
+    totalStages: 3,
+    stageName: 'Формирование финальной раскладки',
+    stageStepName: 'Группировка карт и расчет итогового баланса',
+    percent: 99,
+    placedParts: buildCtx.totalPartsCount - finalState.metrics.unplacedCount,
+    totalParts: buildCtx.totalPartsCount,
+    usedBars: finalState.metrics.totalBarsUsed,
+    totalBarsEstimate: buildCtx.totalBarsEstimate,
+    bestKIM: finalState.metrics.overallKIM,
+    uniqueCardsCount: finalState.metrics.uniqueCardsCount,
+    elapsedMs: Math.round(performance.now() - buildCtx.startTime),
+    hasMeasurableProgress: false,
+  });
+
+  return buildSolutionFromFinalState(
+    finalState,
+    buildCtx,
+    stockInput,
+    demandInput,
+    settings,
+    startMemoryMb,
+    buildCtx.startTime
+  );
+}
+
+/**
  * Fast recalculation when display/remnant thresholds change without needing full re-solve.
- * Updates remnant classification (isReusable, wasteLabel), KIM, and warehouse stock instantly.
  */
 export function recalculateSolutionWithSettings(
   existingSolution: FullOptimizationSolution,
@@ -2419,7 +5087,9 @@ export function recalculateSolutionWithSettings(
     totalReusableLength += reusableRemnant * row.barsCount;
     totalWasteLength += barWaste * row.barsCount;
 
-    const efficiency = Number(((((row.spent + reusableRemnant) / row.barSize)) * 100).toFixed(2));
+    const efficiency = Number(
+      (((row.spent + reusableRemnant) / row.barSize) * 100).toFixed(2)
+    );
 
     const updatedLayout = row.layoutItems.map((item) => {
       if (item.isWaste) {
@@ -2447,7 +5117,13 @@ export function recalculateSolutionWithSettings(
 
   const overallKIM =
     existingSolution.totalStockLength > 0
-      ? Number((((existingSolution.totalStockLength - totalWasteLength) / existingSolution.totalStockLength) * 100).toFixed(2))
+      ? Number(
+          (
+            ((existingSolution.totalStockLength - totalWasteLength) /
+              existingSolution.totalStockLength) *
+            100
+          ).toFixed(2)
+        )
       : 0;
 
   const usedCountByStockLength = new Map<number, number>();
@@ -2459,12 +5135,11 @@ export function recalculateSolutionWithSettings(
   });
 
   const remainingWarehouseStock: RemnantItem[] = [];
-
   stockInput.forEach((s) => {
     if (s.isActive === false) return;
     const isAuto =
       s.isStandardUnlimited ||
-      ((s.length === 6000 || s.length === 12000) && s.quantity <= 0);
+      ((s.length === 6000 || s.length === 12000 || s.length === 11700) && s.quantity <= 0);
     if (isAuto) return;
     const used = usedCountByStockLength.get(s.length) || 0;
     const rem = Math.max(0, s.quantity - used);
@@ -2492,10 +5167,15 @@ export function recalculateSolutionWithSettings(
 
   const netKIM =
     existingSolution.totalStockLength > 0
-      ? Number(((existingSolution.totalSpentLength / existingSolution.totalStockLength) * 100).toFixed(2))
+      ? Number(
+          (
+            (existingSolution.totalSpentLength / existingSolution.totalStockLength) *
+            100
+          ).toFixed(2)
+        )
       : 0;
 
-  return {
+  const updatedPartial = {
     ...existingSolution,
     rows: updatedRows,
     totalReusableLength,
@@ -2504,9 +5184,32 @@ export function recalculateSolutionWithSettings(
     netKIM,
     remainingWarehouseStock,
   };
+  const maxReusableRemnantLength = computeMaxReusableRemnantFromSolution({
+    rows: updatedRows,
+  });
+  const indexBreakdown = computeCuttingIndexFromSolution(
+    {
+      ...updatedPartial,
+      cuttingIndex: undefined,
+      cuttingIndexMaterial: undefined,
+      cuttingIndexSetup: undefined,
+    },
+    stockInput,
+    resolveIndexTargetRemnantLength(settings)
+  );
+
+  return {
+    ...updatedPartial,
+    maxReusableRemnantLength,
+    cuttingIndex: indexBreakdown.cuttingIndex,
+    cuttingIndexMaterial: indexBreakdown.cuttingIndexMaterial,
+    cuttingIndexSetup: indexBreakdown.cuttingIndexSetup,
+  };
 }
 
-// Backward-compatibility wrapper for legacy reports
+/**
+ * Backward-compatibility wrapper for legacy reports
+ */
 export function optimizeLinearCutting(
   demands: PartDemand[],
   stocks: StockBar[],
@@ -2546,12 +5249,12 @@ export function optimizeLinearCutting(
     id: r.id,
     patternIndex: r.barIndex,
     stockBarId: 'stock_1',
-    stockName: `Хлыст ${r.barSize} мм`,
+    stockName: `Профиль ${r.barSize} мм`,
     stockLength: r.barSize,
     trimStart: settings.edgeTrim,
     trimEnd: 0,
     bladeWidth: settings.bladeWidth,
-    cuts: r.pieces.flatMap((p, pIdx) =>
+    cuts: r.pieces.flatMap((p) =>
       Array.from({ length: p.count }).map((_, cIdx) => ({
         id: `${r.id}_${p.length}_${cIdx}`,
         partId: `part_${p.length}`,
@@ -2564,10 +5267,10 @@ export function optimizeLinearCutting(
     ),
     totalPartsLength: r.spent,
     totalKerfLength: r.pieces.reduce((sum, p) => sum + p.count * settings.bladeWidth, 0),
-    wasteLength: r.isReusable ? (r.reusableRemnant || 0) : (r.scrapRemnant || r.waste),
+    wasteLength: r.isReusable ? r.reusableRemnant || 0 : r.scrapRemnant || r.waste,
     isReusableWaste: r.isReusable,
-    reusableLength: r.isReusable ? (r.reusableRemnant || 0) : 0,
-    scrapLength: r.isReusable ? r.waste : (r.scrapRemnant || r.waste),
+    reusableLength: r.isReusable ? r.reusableRemnant || 0 : 0,
+    scrapLength: r.isReusable ? r.waste : r.scrapRemnant || r.waste,
     efficiencyPercent: r.efficiency,
     count: r.barsCount,
   }));
@@ -2579,6 +5282,10 @@ export function optimizeLinearCutting(
     totalPartsLength: sol.totalSpentLength,
     totalWasteLength: sol.totalWasteLength,
     totalReusableLength: sol.totalReusableLength,
+    maxReusableRemnantLength: sol.maxReusableRemnantLength,
+    cuttingIndex: sol.cuttingIndex,
+    cuttingIndexMaterial: sol.cuttingIndexMaterial,
+    cuttingIndexSetup: sol.cuttingIndexSetup,
     totalScrapLength: sol.totalWasteLength,
     totalKerfLoss: sol.totalStockLength - sol.totalSpentLength - sol.totalWasteLength,
     overallEfficiencyPercent: sol.overallKIM,
@@ -2592,14 +5299,12 @@ export function optimizeLinearCutting(
     })),
     calculationTimeMs: sol.calculationTimeMs,
     telemetry: sol.telemetry,
-    algorithmName: 'Excel VBA Exact Port (MyRaskroy.bas: LongSumEl & SortLongArray)',
+    algorithmName: 'CutMaster 1D Pipeline + Strategy Engine',
   };
 }
 
 /**
  * Naive Sequential Cutting (Порезка подряд от самых крупных к мелким без оптимизации)
- * Simulates manual saw operator cutting pieces sequentially in order of descending length with minimal combining.
- * Serves as «Расчет #0» baseline to evaluate economic gain and material savings from optimization.
  */
 export function solveNaiveSequentialCutting(
   stockInput: StockItem[],
@@ -2611,22 +5316,24 @@ export function solveNaiveSequentialCutting(
   const dRez = Math.max(0, settings.bladeWidth || 0);
   const krm = Math.max(0, settings.edgeTrim || 0);
   const delOst = Math.max(0, settings.reusableRemnantMin || 0);
+  const batchSize = settings.dualProfileCut === true ? resolveBatchSize(demandInput, settings) : 1;
   const b2prof = settings.dualProfileCut === true;
   const bGroupe = settings.groupSolutions !== false;
 
-  // 1. Separate demands into paired pieces and odd single pieces if b2prof
   const pairQueue: number[] = [];
   const singleQueue: number[] = [];
 
   for (const d of demandInput) {
     if (d.length <= 0 || d.quantity <= 0) continue;
-    const pairs = b2prof ? Math.floor(d.quantity / 2) : d.quantity;
-    const odd = b2prof ? d.quantity % 2 : 0;
+    const pairs = b2prof ? Math.floor(d.quantity / batchSize) : d.quantity;
+    const odd = b2prof ? d.quantity % batchSize : 0;
     for (let j = 0; j < pairs; j++) {
       pairQueue.push(d.length);
     }
     if (odd > 0) {
-      singleQueue.push(d.length);
+      for (let k = 0; k < odd; k++) {
+        singleQueue.push(d.length);
+      }
     }
   }
 
@@ -2637,6 +5344,10 @@ export function solveNaiveSequentialCutting(
       totalBarsUsed: 0,
       totalWasteLength: 0,
       totalReusableLength: 0,
+      maxReusableRemnantLength: 0,
+      cuttingIndex: 0,
+      cuttingIndexMaterial: 0,
+      cuttingIndexSetup: 0,
       overallKIM: 0,
       netKIM: 0,
       rows: [],
@@ -2646,16 +5357,18 @@ export function solveNaiveSequentialCutting(
     };
   }
 
-  // Sort queues strictly descending by length: largest parts first
   pairQueue.sort((a, b) => b - a);
   singleQueue.sort((a, b) => b - a);
 
-  // 2. Prepare available stock sizes (descending)
   const availableStandardSizes = stockInput
     .filter(
       (st) =>
         st.isActive !== false &&
-        (st.isStandard || st.isStandardUnlimited || st.length === 6000 || st.length === 12000)
+        (st.isStandard ||
+          st.isStandardUnlimited ||
+          st.length === 6000 ||
+          st.length === 12000 ||
+          st.length === 11700)
     )
     .map((st) => st.length)
     .sort((a, b) => b - a);
@@ -2667,7 +5380,6 @@ export function solveNaiveSequentialCutting(
     defaultStandardSize = 12000;
   }
 
-  // Remnant bars pool from warehouse
   interface RemnantPoolItem {
     id: string;
     length: number;
@@ -2685,7 +5397,7 @@ export function solveNaiveSequentialCutting(
     .map((st) => ({
       id: st.id,
       length: st.length,
-      remaining: b2prof ? Math.floor(st.quantity / 2) : st.quantity,
+      remaining: b2prof ? Math.floor(st.quantity / batchSize) * batchSize : st.quantity,
     }))
     .sort((a, b) => b.length - a.length);
 
@@ -2695,20 +5407,19 @@ export function solveNaiveSequentialCutting(
     spent: number;
     pieceLengths: number[];
     spaceLeft: number;
+    isTailSingle: boolean;
   }
 
   const rawBarCuts: RawBarCut[] = [];
 
-  const packQueue = (queue: number[], barCount: number) => {
+  const packQueue = (queue: number[], barCount: number, isTailSingle: boolean) => {
     for (let q = 0; q < queue.length; q++) {
       const pLen = queue[q];
-
-      // Step A: "использовать ранее полученные деловые отходы в расчете для раскроя в случае если деталь помещается на какой-то из них - расчет сразу перерабатывает полученные деловые отходы, полностью или частично"
       let bestIdx = -1;
       let minSlack = Infinity;
 
       for (let b = 0; b < rawBarCuts.length; b++) {
-        if (rawBarCuts[b].barCount !== barCount) continue;
+        if (rawBarCuts[b].barCount !== barCount || rawBarCuts[b].isTailSingle !== isTailSingle) continue;
         const needed = rawBarCuts[b].pieceLengths.length === 0 ? pLen : pLen + dRez;
         if (rawBarCuts[b].spaceLeft >= needed) {
           const slack = rawBarCuts[b].spaceLeft - needed;
@@ -2727,17 +5438,16 @@ export function solveNaiveSequentialCutting(
         continue;
       }
 
-      // Step B: Check warehouse remnants pool
       let chosenRemnant: RemnantPoolItem | null = null;
       for (const rem of remnantPool) {
-        if (rem.remaining > 0 && rem.length - krm >= pLen) {
+        if (rem.remaining >= barCount && rem.length - krm >= pLen) {
           chosenRemnant = rem;
           break;
         }
       }
 
       if (chosenRemnant) {
-        chosenRemnant.remaining--;
+        chosenRemnant.remaining -= barCount;
         const usableLength = chosenRemnant.length - krm;
         rawBarCuts.push({
           barSize: chosenRemnant.length,
@@ -2745,11 +5455,11 @@ export function solveNaiveSequentialCutting(
           spent: pLen,
           pieceLengths: [pLen],
           spaceLeft: usableLength - pLen,
+          isTailSingle,
         });
         continue;
       }
 
-      // Step C: Open a standard bar
       const barSizeToOpen = defaultStandardSize;
       const usableLength = barSizeToOpen - krm;
       rawBarCuts.push({
@@ -2758,25 +5468,24 @@ export function solveNaiveSequentialCutting(
         spent: pLen,
         pieceLengths: [pLen],
         spaceLeft: usableLength - pLen,
+        isTailSingle,
       });
     }
   };
 
-  // Pack paired pieces first
-  packQueue(pairQueue, b2prof ? 2 : 1);
-
-  // If there are odd single pieces (b2prof), pack them (they can also reuse single bars or open 1-bar cuts)
+  packQueue(pairQueue, b2prof ? batchSize : 1, false);
   if (singleQueue.length > 0) {
-    packQueue(singleQueue, 1);
+    packQueue(singleQueue, 1, true);
   }
 
-  // Adaptive downsizing: if parts fit in shorter active standard size (e.g. 6000 mm instead of 12000 mm)
-  // Only apply when forcedStandardSize is not strictly set (so Эталон-12 stays 12м, and Эталон-6 stays 6м)
   if (!forcedStandardSize) {
     rawBarCuts.forEach((cut) => {
       cut.spent = cut.pieceLengths.reduce((a, b) => a + b, 0);
       if (cut.barSize >= 11000 && availableStandardSizes.includes(6000)) {
-        const cutsCount = cut.pieceLengths.length > 0 ? (krm > 0 ? 1 : 0) + cut.pieceLengths.length - 1 : 0;
+        const cutsCount =
+          cut.pieceLengths.length > 0
+            ? (krm > 0 ? 1 : 0) + cut.pieceLengths.length - 1
+            : 0;
         const requiredMm = cut.spent + krm + cutsCount * dRez;
         if (requiredMm <= 6000) {
           cut.barSize = 6000;
@@ -2786,21 +5495,23 @@ export function solveNaiveSequentialCutting(
     });
   }
 
-  // 3. Group identical bars
   interface GroupedRow {
     barSize: number;
     spent: number;
     count: number;
     pieceLengths: number[];
+    isTailSingle: boolean;
   }
 
   const groupedRows: GroupedRow[] = [];
   rawBarCuts.forEach((cut) => {
     cut.pieceLengths.sort((a, b) => b - a);
-    const signature = `${cut.barSize}_${cut.pieceLengths.join(',')}`;
+    const signature = `${cut.barSize}_${cut.pieceLengths.join(',')}_${cut.isTailSingle ? 'S' : 'B'}`;
 
     const existing = bGroupe
-      ? groupedRows.find((r) => `${r.barSize}_${r.pieceLengths.join(',')}` === signature)
+      ? groupedRows.find(
+          (r) => `${r.barSize}_${r.pieceLengths.join(',')}_${r.isTailSingle ? 'S' : 'B'}` === signature
+        )
       : null;
 
     if (existing) {
@@ -2811,17 +5522,17 @@ export function solveNaiveSequentialCutting(
         spent: cut.spent,
         count: cut.barCount,
         pieceLengths: [...cut.pieceLengths],
+        isTailSingle: cut.isTailSingle,
       });
     }
   });
 
-  // Sort grouped rows descending by barSize, then count descending
   groupedRows.sort((a, b) => {
+    if (a.isTailSingle !== b.isTailSingle) return a.isTailSingle ? 1 : -1;
     if (b.barSize !== a.barSize) return b.barSize - a.barSize;
     return b.count - a.count;
   });
 
-  // 4. Build solution rows
   const demandColorMap = new Map<number, string>();
   const demandMarkMap = new Map<number, string>();
   demandInput.forEach((d, dIdx) => {
@@ -2869,7 +5580,8 @@ export function solveNaiveSequentialCutting(
     const barWaste = krm + kerfLoss + scrapRemnant;
 
     const reusableStr = isReusable ? `!<${reusableRemnant}>` : '!<>';
-    const wasteStr = scrapRemnant > 0 ? `(${dRez}х${cutsCount}+${scrapRemnant})` : `(${dRez}х${cutsCount})`;
+    const wasteStr =
+      scrapRemnant > 0 ? `(${dRez}х${cutsCount}+${scrapRemnant})` : `(${dRez}х${cutsCount})`;
     const formulaStr = `${gr.count}х{${trimStr} + <${piecesStr}> + ${reusableStr} + ${wasteStr}}=${gr.barSize}`;
 
     totalStockLength += gr.barSize * gr.count;
@@ -2878,13 +5590,15 @@ export function solveNaiveSequentialCutting(
     totalReusableLength += reusableRemnant * gr.count;
     totalWasteLength += barWaste * gr.count;
 
-    const efficiency = Number(((((totalPartsLength + reusableRemnant) / gr.barSize)) * 100).toFixed(2));
+    const efficiency = Number(
+      (((totalPartsLength + reusableRemnant) / gr.barSize) * 100).toFixed(2)
+    );
 
     const pieces: SolutionPiece[] = sortedUniquePieces.map((p, sIdx) => ({
       id: `p_naive_${idx}_${sIdx}`,
       length: p.length,
       count: p.count,
-      color: demandColorMap.get(p.length) || getColorForLength(p.length, sIdx),
+      color: demandColorMap.get(p.length) || getColorForLength(p.length),
       mark: demandMarkMap.get(p.length),
     }));
 
@@ -2899,7 +5613,7 @@ export function solveNaiveSequentialCutting(
     }
 
     sortedUniquePieces.forEach((p, sIdx) => {
-      const color = demandColorMap.get(p.length) || getColorForLength(p.length, sIdx);
+      const color = demandColorMap.get(p.length) || getColorForLength(p.length);
       const mark = demandMarkMap.get(p.length) || `${p.length}`;
       for (let c = 0; c < p.count; c++) {
         layoutItems.push({
@@ -2939,6 +5653,7 @@ export function solveNaiveSequentialCutting(
       wasteLabel: isReusable ? 'Ост' : 'О',
       efficiency,
       layoutItems,
+      ...(gr.isTailSingle ? { isTailSingle: true } : {}),
     };
   });
 
@@ -2953,7 +5668,7 @@ export function solveNaiveSequentialCutting(
       : 0;
 
   const naiveDurationMs = Number((performance.now() - startTime).toFixed(1));
-  const naivePartsCount = pairQueue.length + singleQueue.length;
+  const naivePartsCount = pairQueue.length * batchSize + singleQueue.length;
   const naiveTelemetry: CalculationTelemetry = {
     calculationId: `naive_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`,
     timestamp: Date.now(),
@@ -2968,15 +5683,35 @@ export function solveNaiveSequentialCutting(
       stage3Refine: 0,
     },
     passesEvaluated: 1,
+    prunedPasses: 0,
     totalCombinationsChecked: naivePartsCount,
     twoOptSwapIterations: 0,
     tailConsolidationCardsMerged: 0,
     throughputPartsPerSecond:
-      naiveDurationMs > 0 ? Number(((naivePartsCount / (naiveDurationMs / 1000))).toFixed(1)) : 0,
+      naiveDurationMs > 0
+        ? Number((naivePartsCount / (naiveDurationMs / 1000)).toFixed(1))
+        : 0,
     memoryUsedMb: getMemoryUsageMb(),
     cpuLoadPercent: 100,
     workerThreadCount: 1,
   };
+
+  const maxReusableRemnantLength = computeMaxReusableRemnantFromSolution({ rows });
+  const naiveIndexBreakdown = computeCuttingIndexFromSolution(
+    {
+      rows,
+      totalStockLength,
+      totalSpentLength,
+      totalReusableLength,
+      totalBarsUsed,
+    },
+    stockInput,
+    resolveIndexTargetRemnantLength(settings)
+  );
+
+  const batchInfo = b2prof
+    ? computeBatchInfoFromCards(groupedRows, demandInput, batchSize)
+    : undefined;
 
   return {
     totalStockLength,
@@ -2984,6 +5719,10 @@ export function solveNaiveSequentialCutting(
     totalBarsUsed,
     totalWasteLength,
     totalReusableLength,
+    maxReusableRemnantLength,
+    cuttingIndex: naiveIndexBreakdown.cuttingIndex,
+    cuttingIndexMaterial: naiveIndexBreakdown.cuttingIndexMaterial,
+    cuttingIndexSetup: naiveIndexBreakdown.cuttingIndexSetup,
     overallKIM,
     netKIM,
     rows,
@@ -2991,21 +5730,21 @@ export function solveNaiveSequentialCutting(
     unplacedDemand: [],
     calculationTimeMs: naiveDurationMs,
     telemetry: naiveTelemetry,
+    ...(batchInfo ? { batchInfo } : {}),
   };
 }
 
 export interface PrimaryStandardSizeInfo {
-  primarySize: number; // 12000 or 6000
-  label: string; // '12 м' | '6 м' | '12 / 6 м'
+  primarySize: number;
+  label: string;
   counts12: number;
   counts6: number;
   totalBars: number;
 }
 
-/**
- * Determines the dominant standard stock size used in a cutting solution.
- */
-export function getPrimaryStandardSize(solution: FullOptimizationSolution): PrimaryStandardSizeInfo {
+export function getPrimaryStandardSize(
+  solution: FullOptimizationSolution
+): PrimaryStandardSizeInfo {
   let counts12 = 0;
   let counts6 = 0;
   let totalBars = 0;
@@ -3026,10 +5765,22 @@ export function getPrimaryStandardSize(solution: FullOptimizationSolution): Prim
     return { primarySize: 6000, label: '6 м', counts12, counts6, totalBars };
   }
   if (counts12 >= counts6 && counts12 > 0) {
-    return { primarySize: 12000, label: counts6 > 0 ? '12 / 6 м' : '12 м', counts12, counts6, totalBars };
+    return {
+      primarySize: 12000,
+      label: counts6 > 0 ? '12 / 6 м' : '12 м',
+      counts12,
+      counts6,
+      totalBars,
+    };
   }
   if (counts6 > 0) {
-    return { primarySize: 6000, label: counts12 > 0 ? '6 / 12 м' : '6 м', counts12, counts6, totalBars };
+    return {
+      primarySize: 6000,
+      label: counts12 > 0 ? '6 / 12 м' : '6 м',
+      counts12,
+      counts6,
+      totalBars,
+    };
   }
   return { primarySize: 12000, label: '12 м', counts12, counts6, totalBars };
 }

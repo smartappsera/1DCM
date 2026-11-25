@@ -73,6 +73,7 @@ export interface SolutionRow {
   wasteLabel: string; // 'О' / 'Ост' / 'Лом'
   efficiency: number; // КИМ хлыста, %
   layoutItems: SolutionBarLayoutItem[];
+  isTailSingle?: boolean;
 }
 
 export interface FullOptimizationSolution {
@@ -81,6 +82,10 @@ export interface FullOptimizationSolution {
   totalBarsUsed: number; // Всего исп. заготовок, шт (82)
   totalWasteLength: number; // Отходы, мм (6 892 или 7 570)
   totalReusableLength: number; // Из них деловой остаток, мм
+  maxReusableRemnantLength?: number; // Макс. длина одного делового остатка (>= reusableRemnantMin), мм
+  cuttingIndex?: number; // Индекс раскроя E_мат * E_нал
+  cuttingIndexMaterial?: number; // Материальная составляющая E_мат
+  cuttingIndexSetup?: number; // Наладочная составляющая E_нал
   overallKIM: number; // Общий (валовый) КИМ, % (с учетом делового остатка)
   netKIM?: number; // Мгновенный (чистый) КИМ, % (отношение длины готовых деталей к расходу материала без учета делового остатка)
   rows: SolutionRow[];
@@ -88,6 +93,16 @@ export interface FullOptimizationSolution {
   unplacedDemand: UnplacedItem[]; // Блок «Не сделано»
   calculationTimeMs: number;
   telemetry?: CalculationTelemetry;
+  abortedInfo?: {
+    viewedPasses: number;
+    totalPasses: number;
+  };
+  batchInfo?: {
+    batchSize: number;
+    batchBarsUsed: number;
+    tailBarsUsed: number;
+    nonMultipleDetails: { length: number; quantity: number; tailQuantity: number }[];
+  };
 }
 
 export interface CalculationTelemetry {
@@ -103,6 +118,7 @@ export interface CalculationTelemetry {
   };
   // Алгоритмическая и вычислительная нагрузка
   passesEvaluated: number;
+  prunedPasses?: number;
   totalCombinationsChecked: number;
   twoOptSwapIterations: number;
   tailConsolidationCardsMerged: number;
@@ -111,7 +127,8 @@ export interface CalculationTelemetry {
   memoryUsedMb?: number;       // JS Heap (performance.memory / Node heapUsed)
   memoryDeltaMb?: number;      // Дельта выделенной памяти
   cpuLoadPercent?: number;     // Загрузка ядра (~100% выделенного ядра Worker во время расчета)
-  workerThreadCount: number;   // Количество потоков (1 для Worker)
+  workerThreadCount: number;   // Количество потоков (1 для Worker, N для пула помощников)
+  chunksProcessed?: number;    // Количество обработанных порций проходов (0 в однопоточном режиме)
 }
 
 export interface CustomStrategyConfig {
@@ -125,34 +142,44 @@ export interface CustomStrategyConfig {
   remnantTargetMinLength: number; // Целевая мин. длина делового остатка, мм, default 1500
 }
 
+export type ReusableRemnantMode = 'manual' | 'weighted' | 'min_part';
+
 export interface AppSettings {
   material: string;
   orderNumber: string;
   bladeWidth: number; // Ширина реза, мм (по умолчанию 3)
   edgeTrim: number; // Кромка (торцовка), мм (по умолчанию 0)
-  reusableRemnantMin: number; // Деловой остат., мм (по умолчанию 0 или 250)
+  reusableRemnantMin: number; // Порог делового остатка, мм (по умолчанию 250)
+  reusableRemnantMode?: ReusableRemnantMode; // Способ задания порога: ручной, средневзвешенное, минимальное
+  shapeRemnantsInSearch?: boolean; // Принудительно доводить обрезки до делового остатка на финальном этапе
+  shapeRemnantsThresholdPct?: number; // Порог отбора карт для доработки в % от порога делового (по умолчанию 50%)
   cutAngle45: boolean; // Рез под 45 градусов
-  dualProfileCut: boolean; // Раскрой в два профиля
-  prioritizeRemnants?: boolean; // Приоритет остатков со склада (чекбокс в блоке пакетного раскроя)
+  dualProfileCut: boolean; // Пакетный рез
+  batchSizeMode?: 'auto' | 'manual'; // Режим выбора размера пакета N (по умолчанию 'auto')
+  batchSizeN?: number; // Размер пакета N >= 2 для ручного режима (по умолчанию 2)
+  prioritizeRemnants?: boolean; // Приоритет остатков со склада
   fillControlEnabled?: boolean; // Контроль заполнения крайней пары
   fillControlThreshold?: number; // Порог КИМ для контроля заполнения, % (по умолчанию 50)
   groupSolutions: boolean; // Группировать решение
   showGraphics: boolean; // Отображать графику
-  searchSpeed: 'fast' | 'standard' | 'deep'; // Быстро / Обычный / Глубокий
+  searchSpeed: 'fast' | 'standard' | 'exact' | 'deep'; // Поверхностный / Стандартный / Точный / Глубокий
   optimizationGoal:
     | 'variants'
-    | 'min_waste'
     | 'min_bars'
-    | 'max_reusable'
-    | 'prioritize_remnants'
+    | 'balance'
     | 'comprehensive'
     | 'custom'; // Оптимизация
   customStrategyConfig?: CustomStrategyConfig; // Параметры пользовательской стратегии
   orderComment?: string; // Комментарий к заказу (цех, примечание)
   isMaterialLocked?: boolean; // Блокировка редактирования наименования материала
   materialLockSource?: 'file' | 'manual' | null; // Источник блокировки (из csv/xml или вручную)
-  targetRemnantKIM?: number; // Целевой КИМ делового остатка (1 - 99%), default: 75%
-  targetRemnantMinLength?: number; // Минимальный целевой размер делового остатка, к которому стремиться (мм), default: 1500
+  remnantMinFillPct?: number; // Минимальное заполнение делового остатка (%) (0 - 100), по умолчанию 75%
+  /** @deprecated Заменён на remnantMinFillPct; оставлено опционально для чтения старых запусков */
+  targetRemnantKIM?: number;
+  /** @deprecated Объединён с reusableRemnantMin; оставлено опционально для совместимости тестов */
+  targetRemnantMinLength?: number;
+  multiThreadEnabled?: boolean; // Многопоточный режим перебора проходов (при deep)
+  exactSolverEnabled?: boolean; // Точный решатель (LP) как дополнительный кандидат для min_bars и Баланса
 }
 
 export interface CalculationProgressInfo {
@@ -168,7 +195,12 @@ export interface CalculationProgressInfo {
   bestKIM: number;
   uniqueCardsCount?: number; // Живой счетчик уникальных карт
   elapsedMs: number;
-  etaSeconds?: number;
+  viewedPasses?: number;
+  totalPasses?: number;
+  workerThreadCount?: number;
+  chunksCompleted?: number;
+  totalChunks?: number;
+  hasMeasurableProgress?: boolean;
 }
 
 export interface ComplexityEstimate {
@@ -216,6 +248,7 @@ export interface CuttingParams {
   reusableRemnantMin?: number;
   cutAngle45?: boolean;
   dualProfileCut?: boolean;
+  groupSolutions?: boolean;
   searchSpeed?: string;
   orderComment?: string;
 }
@@ -249,6 +282,7 @@ export interface BarCuttingPattern {
   scrapLength: number;
   efficiencyPercent: number;
   count: number;
+  isTailSingle?: boolean;
 }
 
 export interface CuttingOptimizationResult {
@@ -258,6 +292,10 @@ export interface CuttingOptimizationResult {
   totalPartsLength: number;
   totalWasteLength: number;
   totalReusableLength: number;
+  maxReusableRemnantLength?: number;
+  cuttingIndex?: number;
+  cuttingIndexMaterial?: number;
+  cuttingIndexSetup?: number;
   totalScrapLength: number;
   totalKerfLoss: number;
   overallEfficiencyPercent: number;
@@ -271,16 +309,6 @@ export interface CuttingOptimizationResult {
   }[];
   calculationTimeMs: number;
   telemetry?: CalculationTelemetry;
+  batchInfo?: FullOptimizationSolution['batchInfo'];
   algorithmName: string;
-}
-
-export interface VbaInspectionResult {
-  fileName: string;
-  moduleType: 'bas' | 'cls' | 'frm' | 'text';
-  subroutines: string[];
-  functions: string[];
-  variablesDetected: string[];
-  sortingDetected: string[];
-  algorithmHints: string[];
-  rawCode: string;
 }
